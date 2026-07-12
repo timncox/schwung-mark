@@ -1,0 +1,142 @@
+{
+  "title": "Mark",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "5-track live looper",
+        "in the style of the",
+        "Boss RC-505.",
+        "",
+        "Each track records,",
+        "plays and overdubs",
+        "Move's input (mic,",
+        "line or USB-C).",
+        "",
+        "Open it from the",
+        "overtake menu",
+        "(Shift+Vol+Jog).",
+        "Back hides the UI;",
+        "audio keeps going.",
+        "Shift+Vol+Jog exits."
+      ]
+    },
+    {
+      "title": "Quick Start",
+      "lines": [
+        "1. Tap a top-row",
+        " pad to record.",
+        "2. Tap again to",
+        " close the loop",
+        " and play.",
+        "3. Tap again to",
+        " overdub layers.",
+        "4. Repeat on the",
+        " other tracks.",
+        "",
+        "Lengths snap to",
+        "whole measures.",
+        "Track 1 sets the",
+        "grid; later tracks",
+        "start in sync."
+      ]
+    },
+    {
+      "title": "Track pads",
+      "lines": [
+        "Columns 1-5 =",
+        "tracks 1-5.",
+        "",
+        "Top row: record /",
+        " play / overdub",
+        " (red / green /",
+        " yellow; white =",
+        " stopped, dim =",
+        " empty, blink =",
+        " waiting for the",
+        " measure).",
+        "Row 3: stop; hold",
+        " to clear.",
+        "Row 2: reverse.",
+        "Bottom: one-shot."
+      ]
+    },
+    {
+      "title": "Right column",
+      "lines": [
+        "Top right corner:",
+        "97 All start/stop",
+        "98 Undo / redo",
+        " (orange = undo,",
+        " cyan = redo)",
+        "99 Monitor on/off",
+        "",
+        "89 Quantize on/off",
+        "90 Rec then: play",
+        " or overdub",
+        "91 Dub mode:",
+        " overdub or",
+        " replace"
+      ]
+    },
+    {
+      "title": "Knobs",
+      "lines": [
+        "Knobs 1-5: track",
+        "levels (0-200).",
+        "Knob 6: master.",
+        "Jog wheel: master.",
+        "",
+        "Hold Shift:",
+        "1-5 track pans,",
+        "6 monitor,",
+        "7 transport follow,",
+        "8 BPM override",
+        " (49 = off)."
+      ]
+    },
+    {
+      "title": "Sync",
+      "lines": [
+        "With Move's MIDI",
+        "Clock set to Out,",
+        "loops lock to the",
+        "transport and set",
+        "Setup > MIDI Sync.",
+        "",
+        "Without clock, the",
+        "first loop defines",
+        "the grid and all",
+        "other tracks snap",
+        "to it.",
+        "",
+        "Move keeps playing",
+        "under Mark - use",
+        "its tracks as the",
+        "rhythm section."
+      ]
+    },
+    {
+      "title": "Tips",
+      "lines": [
+        "Undo removes the",
+        "last overdub or",
+        "recording; press",
+        "again to redo.",
+        "",
+        "Reverse tracks",
+        "cannot overdub",
+        "(RC-505 rule).",
+        "",
+        "One-shot tracks",
+        "play once and",
+        "stop - good for",
+        "phrases and hits.",
+        "",
+        "Presets save the",
+        "mixer settings,",
+        "not the audio."
+      ]
+    }
+  ]
+}

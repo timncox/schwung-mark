@@ -1,0 +1,19 @@
+{
+  "id": "mark",
+  "name": "Mark",
+  "abbrev": "MRK",
+  "version": "0.1.0",
+  "description": "RC-505-style 5-track live looper: per-track record/overdub/stop, quantized loop sync, undo/redo, reverse & one-shot",
+  "dsp": "dsp.so",
+  "ui": "ui.js",
+  "api_version": 2,
+  "component_type": "overtake",
+  "capabilities": {
+    "audio_in": true,
+    "suspend_keeps_js": true,
+    "button_passthrough": [
+      85
+    ]
+  },
+  "author": "timncox"
+}
