@@ -274,6 +274,7 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
       <span class="hwbtn" data-t="Play button" data-d="Passed straight through to Move — transport and clock keep working under the overtake UI. Use Move's own tracks as your rhythm section.">▶ PLAY — passthrough</span>
       <span class="hwbtn" data-t="Jog wheel" data-d="Master level. Same as knob 6.">◎ JOG — master</span>
       <span class="hwbtn" data-t="Shift (hold)" data-d="Layer two: knobs 1–5 become pans, 6 monitor, 7 transport follow, 8 BPM override. Row 4 pads become one-shot toggles. The screen relabels while held.">⇧ SHIFT — layer 2</span>
+      <span class="hwbtn" data-t="Left / Right arrows" data-d="Trim the current track by one quantize-grid unit: left shortens the loop (recorded a bar? trim to 15 eighths for instant polymeter), right restores it — the trimmed audio is kept, and trims survive session save/load.">◀ ▶ — trim loop</span>
     </div>
   </div>
 
@@ -398,6 +399,11 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
       <p><b>Without clock:</b> your <span class="hl">first loop defines the
       grid</span> — every later track quantizes to it. Free tempo, still
       tight.</p>
+      <p><b>Polyrhythms:</b> the Quantize pad cycles measure → beat →
+      8th-note grids. On a fine grid a loop can be 15 eighths against the
+      drums' 16 — or record straight and <span class="hl">trim after</span>
+      with the arrow keys. Either way the measure grid stays anchored for
+      the other tracks.</p>
     </div>
     <div>
       <p><b>Transport follow</b> (<kbd>Shift</kbd>+knob 7) decides what
@@ -478,7 +484,7 @@ const PADS = [
   {c:C.org,l:"UNDO",t:"UNDO / REDO",d:"Takes back the last recording or overdub, on whichever track it happened (orange = undo ready, cyan = redo). Press again to restore it. (The RC-505 calls this MARK BACK.)"},
   {c:C.grn,l:"MON",t:"MONITOR",d:"Input monitoring on (green) / muted (bright red). The feedback guard flips this automatically when the speaker is live with no line-in cable; pressing it overrides the guard."},
   /* row 2 */ stopPad(1),stopPad(2),stopPad(3),stopPad(4),stopPad(5),
-  {c:C.cyn,l:"QNT",t:"QUANTIZE",d:"Measure quantize on (cyan) or off. On: presses land on the grid and record lengths snap to whole measures. Off: everything fires the instant you press — free-length loops."},
+  {c:C.cyn,l:"QNT",t:"QUANTIZE — grid cycle",d:"Cycles the quantize grid: MEASURE (cyan) → BEAT (blue) → 8TH NOTE (purple) → OFF (dim). Finer grids capture polymetric loops — 15 eighths against a 16-eighth drum groove churns beautifully. Off = free-length, fires on press."},
   {c:C.org,l:"R→",t:"REC ACTION — record, then…",d:"What follows a recording: PLAY (default) or straight into OVERDUB (orange) for instant layering, the RC's REC→DUB."},
   {c:C.red2,l:"DUB",t:"DUB MODE — overdub / replace",d:"OVERDUB layers new audio on top (default). REPLACE (red) overwrites as the loop passes — the RC's REPLACE1, great for evolving a phrase."},
   /* row 3 */ revPad(1),revPad(2),revPad(3),revPad(4),revPad(5),

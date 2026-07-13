@@ -29,7 +29,7 @@
  */
 
 import {
-    MoveKnob1, MoveShift, MoveMainKnob,
+    MoveKnob1, MoveShift, MoveMainKnob, MoveLeft, MoveRight,
     Black, White, LightGrey, BrightRed, Blue, Green, BrightGreen,
     Cyan, Purple, YellowGreen, OrangeRed
 } from '/data/UserData/schwung/shared/constants.mjs';
@@ -73,6 +73,11 @@ const ST_SPEECH = ['empty', 'recording', 'playing', 'overdubbing', 'stopped'];
 const FX_NAMES  = ['Off', 'LPF', 'HPF', 'Crush', 'Delay', 'Phasr', 'Ring'];
 const FX_SPEECH = ['off', 'low pass filter', 'high pass filter', 'crush',
                    'delay', 'phaser', 'ring mod'];
+
+/* Quantize grid units (rec_grid in the DSP) */
+const GRID_ABBR   = ['m', 'b', 'e'];
+const GRID_NAMES  = ['measure', 'beat', 'eighth'];
+const GRID_PLURAL = ['measures', 'beats', 'eighths'];
 
 /* Hold a stop pad this long to clear the track (RC long-press clear);
  * hold a session slot this long to SAVE into it (tap = load) */
@@ -121,6 +126,8 @@ let tfxp     = [50, 50, 50, 50, 50];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
+let recGrid   = 0;      /* quantize unit: 0 measure, 1 beat, 2 eighth */
+let tunits    = [0, 0, 0, 0, 0];   /* loop lengths in rec_grid units */
 let recAction = 0;
 let dubMode   = 0;
 let playMode  = 0;      /* 0 multi, 1 single */
@@ -207,6 +214,7 @@ function pollStatus() {
     parseCsv(parts[2], tpos);
     undoAvail = parseInt(parts[3], 10) || 0;
     swapBusy = parseInt(parts[4], 10) || 0;
+    parseCsv(parts[5], tunits);
     anyPending = tpend.some(p => p !== 0);
 
     if (tstates.join(',') !== old) {
@@ -217,7 +225,9 @@ function pollStatus() {
             if (ioWatch) continue;   /* a session load flips every track at
                                         once — one "Loaded" beats 5 shouts */
             if (tstates[i] === ST_PLAY && oldArr[i] === ST_REC)
-                announce(`Track ${i + 1} looping, ${tmeas[i]} measure${tmeas[i] === 1 ? '' : 's'}`);
+                announce(recGrid === 0
+                    ? `Track ${i + 1} looping, ${tmeas[i]} measure${tmeas[i] === 1 ? '' : 's'}`
+                    : `Track ${i + 1} looping, ${tunits[i]} ${tunits[i] === 1 ? GRID_NAMES[recGrid] : GRID_PLURAL[recGrid]}`);
             else
                 announce(`Track ${i + 1} ${ST_SPEECH[tstates[i]]}`);
         }
@@ -253,6 +263,7 @@ function fetchAll() {
     }
     parseCsv(gp('tmeas'), tmeas);
     quantize  = parseInt(gp('quantize') || '1', 10);
+    recGrid   = parseInt(gp('rec_grid') || '0', 10);
     recAction = parseInt(gp('rec_action') || '0', 10);
     dubMode   = parseInt(gp('dub_mode') || '0', 10);
     playMode  = parseInt(gp('play_mode') || '0', 10);
@@ -378,7 +389,8 @@ function paintGlobals(force) {
                               : (undoAvail === 1 ? OrangeRed
                               : (undoAvail === 2 ? Cyan : Black)), force);
     setLED(PAD_MON, monitorOn ? Green : BrightRed, force);
-    setLED(PAD_QUANT, quantize ? Cyan : 0x10, force);
+    setLED(PAD_QUANT, !quantize ? 0x10
+                    : (recGrid === 2 ? Purple : recGrid === 1 ? Blue : Cyan), force);
     setLED(PAD_RECACT, recAction ? OrangeRed : 0x10, force);
     setLED(PAD_DUBMD, dubMode ? BrightRed : 0x10, force);
     setLED(PAD_PMODE, playMode ? Cyan : 0x10, force);
@@ -427,7 +439,8 @@ function drawUI() {
         const x = 2 + i * 25;
         print(x, 13, `${i + 1}${trev[i] ? '<' : ''}${tshot[i] ? '!' : ''}`, 1);
         print(x, 22, tpend[i] ? '...' : ST_NAMES[tstates[i]], 1);
-        print(x, 31, tstates[i] === ST_EMPTY ? '' : `${tmeas[i]}m`, 1);
+        print(x, 31, tstates[i] === ST_EMPTY ? ''
+              : (recGrid === 0 ? `${tmeas[i]}m` : `${tunits[i]}${GRID_ABBR[recGrid]}`), 1);
         print(x, 40, shiftHeld ? knobDisplay(2, i) : knobDisplay(1, i), 1);
     }
 
@@ -442,7 +455,7 @@ function drawUI() {
     } else {
         fLeft = `T${curTrack + 1} ${FX_NAMES[tfx[curTrack]]}` +
                 (tfxon[curTrack] && tfx[curTrack] > 0 ? ` ${tfxp[curTrack]}` : ' off');
-        fRight = `${playMode ? 'SGL' : 'MLT'} ${quantize ? 'Q' : ''}`;
+        fRight = `${playMode ? 'SGL' : 'MLT'} Q:${quantize ? GRID_ABBR[recGrid] : '-'}`;
     }
     drawFooter({ left: fLeft, right: fRight });
     needsRedraw = false;
@@ -585,6 +598,23 @@ globalThis.onMidiMessageInternal = function(data) {
         if (d1 === MoveMainKnob) {
             const delta = decodeDelta(d2);
             if (delta !== 0) adjustKnob(1, 5, delta);
+            return;
+        }
+        /* arrows: trim the current track by one grid unit — shorten a
+         * captured loop into a polymeter (15/16), lengthen to restore */
+        if ((d1 === MoveLeft || d1 === MoveRight) && d2 >= 64) {
+            if (tstates[curTrack] === ST_EMPTY || tstates[curTrack] === ST_REC) {
+                announce('No loop to trim');
+                return;
+            }
+            host_module_set_param(`t${curTrack + 1}_trim`,
+                                  d1 === MoveLeft ? '-1' : '1');
+            const fresh = (gp('tunits') || '').split(',');
+            const u = parseInt(fresh[curTrack], 10) || 0;
+            tunits[curTrack] = u;
+            announce(`Track ${curTrack + 1}, ${u} ${u === 1 ? GRID_NAMES[recGrid] : GRID_PLURAL[recGrid]}`);
+            needsRedraw = true;
+            refreshSoon();
             return;
         }
         if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
@@ -742,9 +772,19 @@ globalThis.onMidiMessageInternal = function(data) {
             return;
         }
         if (d1 === PAD_QUANT) {
-            quantize = quantize ? 0 : 1;
+            /* cycle: measure -> beat -> eighth -> off -> measure. Finer
+             * grids allow polymetric lengths (15/16 against the drums). */
+            if (!quantize) {
+                quantize = 1;
+                recGrid = 0;
+            } else if (recGrid < 2) {
+                recGrid++;
+            } else {
+                quantize = 0;
+            }
             host_module_set_param('quantize', `${quantize}`);
-            announce(quantize ? 'Quantize measure' : 'Quantize off');
+            if (quantize) host_module_set_param('rec_grid', `${recGrid}`);
+            announce(quantize ? `Quantize ${GRID_NAMES[recGrid]}` : 'Quantize off');
             paintGlobals(false);
             needsRedraw = true;
             return;

@@ -103,7 +103,12 @@ then this page syncs live.</div>
     <div class="panel">
       <h2>Modes</h2>
       <div class="row"><span class="k">Quantize</span>
-        <select id="q"><option value="1">Measure</option><option value="0">Off</option></select></div>
+        <select id="q">
+          <option value="m">Measure</option>
+          <option value="b">Beat</option>
+          <option value="e">8th note</option>
+          <option value="off">Off</option>
+        </select></div>
       <div class="row"><span class="k">After record</span>
         <select id="ra"><option value="0">Play</option><option value="1">Overdub</option></select></div>
       <div class="row"><span class="k">Dub mode</span>
@@ -217,6 +222,12 @@ function buildStrips() {
         <button id="fo${i}" style="flex:0 0 40px">On</button>
       </div>
       <input id="fp${i}" type="range" min="0" max="100" step="5">
+      <label>Length <span class="note">(trim)</span></label>
+      <div class="row">
+        <button id="tm${i}" style="flex:0 0 32px">−</button>
+        <span id="lu${i}" class="note" style="flex:1;text-align:center">—</span>
+        <button id="tp${i}" style="flex:0 0 32px">+</button>
+      </div>
     </div>`;
   }
   host.innerHTML = html;
@@ -250,7 +261,11 @@ function wireStrip(i) {
     touched[`fp${i}`] = Date.now();
     send(`t${i}_fxp`, e.target.value);
   };
+  el(`tm${i}`).onclick = () => send(`t${i}_trim`, -1);
+  el(`tp${i}`).onclick = () => send(`t${i}_trim`, 1);
 }
+
+const GRID_ABBR = ["m", "b", "e"];
 
 /* ---- sessions ---- */
 function buildSlots() {
@@ -305,10 +320,12 @@ function render() {
   setIf("mst", "value", num("mst", 100));
   el("mstv").textContent = num("mst", 100);
 
-  ["q", "ra", "dm", "pm", "flw"].forEach(k => setIf(k, "value", num(k, 0)));
+  setIf("q", "value", num("q", 1) ? GRID_ABBR[num("gd", 0)] || "m" : "off");
+  ["ra", "dm", "pm", "flw"].forEach(k => setIf(k, "value", num(k, 0)));
 
   const ts = csv("ts"), ms = csv("ms"), lv = csv("lv"), pn = csv("pn");
   const rv = csv("rv"), sh = csv("sh"), fx = csv("fx"), fo = csv("fo"), fp = csv("fp");
+  const tu = csv("tu"), gd = num("gd", 0);
   for (let i = 1; i <= 5; i++) {
     const s = ts[i - 1] || 0;
     const st = el(`st${i}`);
@@ -327,6 +344,9 @@ function render() {
     setIf(`fx${i}`, "value", fx[i - 1] !== undefined ? fx[i - 1] : 1);
     el(`fo${i}`).className = fo[i - 1] ? "on" : "";
     setIf(`fp${i}`, "value", fp[i - 1] !== undefined ? fp[i - 1] : 50);
+    el(`lu${i}`).textContent = s && tu[i - 1]
+      ? tu[i - 1] + " " + ["measure", "beat", "8th"][gd] + (tu[i - 1] === 1 ? "" : "s")
+      : "—";
   }
 
   const sess = csv("sess");
@@ -346,10 +366,20 @@ window.addEventListener("load", function () {
     send("master", e.target.value);
     el("mstv").textContent = e.target.value;
   };
-  ["q", "ra", "dm", "pm", "flw"].forEach(k => {
+  el("q").onchange = (e) => {
+    touched["q"] = Date.now();
+    const v = e.target.value;
+    if (v === "off") {
+      send("quantize", 0);
+    } else {
+      send("quantize", 1);
+      send("rec_grid", GRID_ABBR.indexOf(v));
+    }
+  };
+  ["ra", "dm", "pm", "flw"].forEach(k => {
     el(k).onchange = (e) => {
       touched[k] = Date.now();
-      send(k === "q" ? "quantize" : k === "ra" ? "rec_action"
+      send(k === "ra" ? "rec_action"
            : k === "dm" ? "dub_mode" : k === "pm" ? "play_mode" : "follow",
            e.target.value);
     };
