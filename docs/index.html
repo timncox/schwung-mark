@@ -180,8 +180,9 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
   effect. Loops snap to whole measures, everything lands in sync, and one
   press of undo takes back the layer you regret. Move keeps playing
   underneath — <em>its tracks are your rhythm section</em>.</p>
-  <p class="lede" style="font-size:14.5px;color:var(--dim)">The name? RC-505
-  <b>mkII</b> → Mark. Its undo function is literally called MARK BACK.</p>
+  <p class="lede" style="font-size:14.5px;color:var(--dim)">Named after
+  <a href="https://marcrebillet.com/">Marc Rebillet</a> — the RC-505's most
+  famous pilot.</p>
 </div></header>
 
 <!-- ============ 01 QUICK START ============ -->
@@ -338,8 +339,8 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
       row becomes the slot grid — green slots hold a session, dim ones are
       empty. <b>Tap a green slot to load</b> (replaces your current loops,
       tracks come back stopped — hit All to start). <b>Hold any slot to
-      save</b> into it. Tap the Sessions pad again to go back to the
-      playhead view.</p>
+      save</b> into it. <b><kbd>Shift</kbd>+tap deletes</b> a saved slot.
+      Tap the Sessions pad again to go back to the playhead view.</p>
     </div>
     <div>
       <p><b>In the web mixer:</b> the Sessions panel shows the same 16 slots
@@ -474,7 +475,7 @@ function fxPad(n){return{
 const PADS = [
   /* row 1 */ trackPad(1),trackPad(2),trackPad(3),trackPad(4),trackPad(5),
   {c:C.grn,l:"ALL",t:"ALL START / STOP",d:"Anything playing? Stops everything at once (and cancels pending actions). All stopped? Starts every non-empty track together from the top — or just the first one in single mode."},
-  {c:C.org,l:"UNDO",t:"UNDO / REDO",d:"Takes back the last recording or overdub, on whichever track it happened (orange = undo ready, cyan = redo). Press again to restore it. The RC's MARK BACK — Mark's namesake."},
+  {c:C.org,l:"UNDO",t:"UNDO / REDO",d:"Takes back the last recording or overdub, on whichever track it happened (orange = undo ready, cyan = redo). Press again to restore it. (The RC-505 calls this MARK BACK.)"},
   {c:C.grn,l:"MON",t:"MONITOR",d:"Input monitoring on (green) / muted (bright red). The feedback guard flips this automatically when the speaker is live with no line-in cable; pressing it overrides the guard."},
   /* row 2 */ stopPad(1),stopPad(2),stopPad(3),stopPad(4),stopPad(5),
   {c:C.cyn,l:"QNT",t:"QUANTIZE",d:"Measure quantize on (cyan) or off. On: presses land on the grid and record lengths snap to whole measures. Off: everything fires the instant you press — free-length loops."},
@@ -521,7 +522,7 @@ function buildSteps(){
       s.style.cursor="pointer";
       s.onclick=()=>{roT.textContent="SLOT "+(i+1)+(savedDemo[i]?" — saved":" — empty");
         roD.textContent=savedDemo[i]
-          ?"Tap to load this session (replaces current loops). Hold ~½ second to overwrite it with the current set."
+          ?"Tap to load this session (replaces current loops). Hold ~½ second to overwrite it with the current set. Shift+tap deletes it."
           :"Empty slot. Hold ~½ second to save the current loop set here.";};
     } else {
       s.onclick=()=>{roT.textContent="STEP BUTTONS — playhead";
@@ -541,7 +542,7 @@ const tabL=document.getElementById("tabLoop"), tabS=document.getElementById("tab
 tabL.onclick=()=>{sessMode=false;tabL.classList.add("on");tabS.classList.remove("on");
   stepsCap.textContent="Step buttons 1–16 — playhead chase of the base loop";buildSteps();};
 tabS.onclick=()=>{sessMode=true;tabS.classList.add("on");tabL.classList.remove("on");
-  stepsCap.textContent="Step buttons 1–16 — session slots · green = saved · tap = load · hold = save";buildSteps();};
+  stepsCap.textContent="Step buttons 1–16 — session slots · green = saved · tap = load · hold = save · shift+tap = delete";buildSteps();};
 buildSteps();
 
 document.querySelectorAll(".hwbtn").forEach(b=>{b.onclick=()=>{

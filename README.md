@@ -11,8 +11,8 @@ and every later track starts and ends in sync. Single-level **undo/redo**
 of the last recording or overdub. Move keeps playing underneath, so its
 own tracks are your rhythm section.
 
-The name: RC-505 **mkII** → Mark. (Its undo feature is literally called
-MARK BACK.)
+Named after [Marc Rebillet](https://marcrebillet.com/), whose instrument
+of choice is the RC-505.
 
 **📖 Operation manual: https://timncox.github.io/schwung-mark/**
 

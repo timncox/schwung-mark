@@ -626,9 +626,22 @@ globalThis.onMidiMessageInternal = function(data) {
     }
 
     if (status === 0x90 && d2 > 0) {
-        /* session mode: step pads are the save slots */
+        /* session mode: step pads are the save slots.
+         * Tap = load, hold = save, Shift+tap = delete. */
         if (sessionMode && d1 >= STEP_FIRST && d1 < STEP_FIRST + STEP_COUNT) {
-            sessHeld = { slot: d1 - STEP_FIRST, at: Date.now(), fired: false };
+            const slot = d1 - STEP_FIRST;
+            if (shiftHeld) {
+                if (sessSlots[slot]) {
+                    host_module_set_param('delete_session', `${slot + 1}`);
+                    announce(`Slot ${slot + 1} deleted`);
+                    fetchSlots();
+                    paintSteps(true);
+                } else {
+                    announce(`Slot ${slot + 1} already empty`);
+                }
+                return;
+            }
+            sessHeld = { slot, at: Date.now(), fired: false };
             paintSteps(true);
             return;
         }
@@ -687,7 +700,7 @@ globalThis.onMidiMessageInternal = function(data) {
             if (sessionMode) {
                 fetchSlots();
                 const n = sessSlots.filter(s => s).length;
-                announce(`Sessions, ${n} saved. Tap a step to load, hold to save.`);
+                announce(`Sessions, ${n} saved. Tap a step to load, hold to save, shift tap to delete.`);
             } else {
                 sessHeld = null;
                 announce('Session mode off');

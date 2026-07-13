@@ -260,6 +260,7 @@ function buildSlots() {
     html += `<div class="slot">
       <button id="sl${i}">${i}</button>
       <button id="sv${i}" class="save">save</button>
+      <button id="dl${i}" class="save">del</button>
     </div>`;
   }
   host.innerHTML = html;
@@ -273,6 +274,12 @@ function buildSlots() {
     el(`sv${i}`).onclick = () => {
       const have = csv("sess")[i - 1];
       if (!have || confirm(`Overwrite slot ${i}?`)) send("save_session", i);
+    };
+    el(`dl${i}`).onclick = () => {
+      const have = csv("sess")[i - 1];
+      if (!have) return;
+      if (confirm(`Delete slot ${i}? The saved session is gone for good.`))
+        send("delete_session", i);
     };
   }
 }
