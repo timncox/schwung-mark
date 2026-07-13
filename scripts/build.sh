@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-
 EOF
 fi
 
+rm -rf build/modules/overtake/mark
 mkdir -p build/modules/overtake/mark
 cp modules/overtake/mark/module.json build/modules/overtake/mark/
 cp src/ui_overtake.js build/modules/overtake/mark/ui.js
