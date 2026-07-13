@@ -1145,6 +1145,27 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         if (slot >= 1) session_start(m, slot, 2);
         return;
     }
+    if (!strcmp(key, "delete_session")) {
+        /* deletion is a handful of unlinks — safe synchronously on the UI
+         * thread, but never while a save/load worker owns the directory */
+        int slot = atoi(val);
+        if (slot < 1 || slot > MARK_SESSION_SLOTS || m->io_busy ||
+            !m->session_dir[0])
+            return;
+        char path[320];
+        session_path(m, slot, "session.json", path, sizeof(path));
+        unlink(path);
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            char wname[16];
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, slot, wname, path, sizeof(path));
+            unlink(path);
+        }
+        session_path(m, slot, NULL, path, sizeof(path));
+        rmdir(path);
+        m->edit_rev++;
+        return;
+    }
 
     if (!strcmp(key, "state")) {
         /* settings-only preset blob; loop audio is never saved. Display

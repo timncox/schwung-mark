@@ -9,7 +9,9 @@ RC-505mkII-style **5-track live looper** for the Ableton Move, as a
 schwung overtake module. Modeled on the Boss RC-505's workflow: per-track
 record → play → overdub cycle, stop/clear, level/pan/reverse/one-shot,
 measure-quantized loop sync, single-level undo/redo, All Start/Stop.
-Named for the RC-505 **mkII** (whose undo is called MARK BACK).
+Named after **Marc Rebillet**, whose instrument is the RC-505 (Tim's
+naming, 2026-07-13 — an earlier "mkII → Mark" etymology in old docs was
+a wrong guess, since corrected).
 
 Schwung = charlesvestal/schwung, the Shadow-UI sidecar framework for the
 Move (LD_PRELOAD shim + QuickJS shadow UI + native ARM DSP modules).

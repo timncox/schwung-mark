@@ -530,6 +530,15 @@ static void test_sessions(void) {
     gp_str(m, "session_status", buf, sizeof(buf));
     assert(strcmp(buf, "error") == 0);
 
+    /* delete: slot 3 disappears from the bitmap and won't load */
+    mark_set_param(m, "delete_session", "3");
+    gp_str(m, "session_slots", buf, sizeof(buf));
+    assert(strncmp(buf, "0,0,0", 5) == 0);
+    mark_set_param(m, "load_session", "3");
+    wait_io(m);
+    gp_str(m, "session_status", buf, sizeof(buf));
+    assert(strcmp(buf, "error") == 0);
+
     mark_destroy(m);
     printf("ok: session save/load\n");
 }
