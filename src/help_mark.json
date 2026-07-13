@@ -128,6 +128,32 @@
       ]
     },
     {
+      "title": "Polyrhythms",
+      "lines": [
+        "The Quantize pad",
+        "cycles the grid:",
+        "measure (cyan) >",
+        "beat (blue) >",
+        "8th note (purple)",
+        "> off (dim).",
+        "",
+        "Finer grids let a",
+        "loop be 15 eighths",
+        "against 16 - it",
+        "churns against",
+        "the drums.",
+        "",
+        "Arrows trim the",
+        "current track by",
+        "one grid unit:",
+        "left = shorter,",
+        "right = restore.",
+        "Trims are undone",
+        "by lengthening -",
+        "audio is kept."
+      ]
+    },
+    {
       "title": "Single mode",
       "lines": [
         "Play-mode pad (row",

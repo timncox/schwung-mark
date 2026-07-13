@@ -75,7 +75,8 @@ static void bq_set(mk_bq_t *q, float freq, int highpass, float Q) {
 
 typedef struct {
     int16_t *buf;          /* track_frames * 2, interleaved */
-    uint32_t len;          /* finalized loop frames, 0 = empty */
+    uint32_t len;          /* current loop frames, 0 = empty */
+    uint32_t full_len;     /* frames as finalized — trim can't exceed this */
     uint32_t rec_len;      /* frames recorded so far while MK_REC */
     uint32_t rec_target;   /* 0 = none; keep recording until this length */
     int      rec_end;      /* state to enter when recording finalizes */
@@ -140,7 +141,10 @@ struct mark {
     double   grid_unit;
 
     /* Params */
-    int   quantize;              /* 0 off, 1 measure (default) */
+    int   quantize;              /* 0 off, 1 on (default) */
+    int   rec_grid;              /* quantize unit: 0 measure (default),
+                                    1 beat, 2 eighth — finer grids allow
+                                    polymetric loops (15/16 against drums) */
     int   rec_action;            /* 0 rec->play (default), 1 rec->dub */
     int   dub_mode;              /* 0 overdub (default), 1 replace */
     int   play_mode;             /* 0 multi (default); 1 single: starting a
@@ -236,6 +240,22 @@ static double effective_grid(const mark_t *m) {
     if (m->clock_seen && m->clock_running) return frames_per_measure(m);
     if (m->grid_unit > 0.0) return m->grid_unit;
     return frames_per_measure(m);
+}
+
+/* rec_grid divisor: units per measure (4/4) */
+static int grid_div(const mark_t *m) {
+    return m->rec_grid == 2 ? 8 : (m->rec_grid == 1 ? 4 : 1);
+}
+
+/* Record-length rounding unit, from the live grid. */
+static double live_unit(const mark_t *m) {
+    return effective_grid(m) / (double)grid_div(m);
+}
+
+/* Trim unit, locked to the session grid so edits are audio-exact. */
+static double locked_unit(const mark_t *m) {
+    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+    return g / (double)grid_div(m);
 }
 
 /* Lowest-numbered track currently playing or overdubbing — its position
@@ -424,12 +444,15 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
         t->st = MK_EMPTY;
         return;
     }
-    /* first finalized loop anchors the session grid for free-run sync */
+    t->full_len = final_len;
+    /* first finalized loop anchors the session grid for free-run sync.
+     * Derive the MEASURE from the rounding unit actually used, so a
+     * 15/16 polymetric first loop still anchors a true measure grid. */
     if (m->grid_unit <= 0.0) {
-        double g = frames_per_measure(m);
-        double k = floor(((double)final_len / g) + 0.5);
+        double u = frames_per_measure(m) / (double)grid_div(m);
+        double k = floor(((double)final_len / u) + 0.5);
         if (k < 1.0) k = 1.0;
-        m->grid_unit = (double)final_len / k;
+        m->grid_unit = ((double)final_len / k) * (double)grid_div(m);
     }
     /* undo of a first recording = clear it (redo restores) */
     m->undo_track = ti;
@@ -457,8 +480,8 @@ static void request_finish(mark_t *m, int ti, int end_state) {
     mk_track_t *t = &m->t[ti];
     uint32_t target = t->rec_len;
     if (m->quantize) {
-        double g = effective_grid(m);
-        if (g >= 256.0) {
+        double g = live_unit(m);
+        if (g >= 32.0) {
             double k = floor(((double)t->rec_len / g) + 0.5);
             if (k < 1.0) k = 1.0;
             double f = k * g;
@@ -543,12 +566,41 @@ static void track_stop(mark_t *m, int ti) {
     }
 }
 
+/* Post-record loop trim ("effectively shortening the loop"): grow or
+ * shrink len by one rec_grid unit, locked to the session grid. Trims
+ * never exceed the finalized length; re-lengthening restores audio. */
+static void track_trim(mark_t *m, int ti, int delta) {
+    mk_track_t *t = &m->t[ti];
+    if (m->io_busy || m->swap_track == ti) return;
+    if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
+    double u = locked_unit(m);
+    if (u < 32.0) return;
+    int cur = (int)floor((double)t->len / u + 0.5);
+    int full = (int)floor((double)t->full_len / u + 0.5);
+    if (cur < 1) cur = 1;
+    if (full < 1) full = 1;
+    int nu = clampi(cur + delta, 1, full);
+    if (nu == cur) return;
+    uint32_t nl = (uint32_t)((double)nu * u + 0.5);
+    if (nl > t->full_len) nl = t->full_len;
+    if (nl < 64) nl = 64;
+    if (t->st == MK_DUB) {   /* dub write head would cross the new edge */
+        t->st = MK_PLAY;
+        m->undo_capturing = 0;
+    }
+    if (m->undo_track == ti) reset_undo(m);   /* indexes tied to old len */
+    t->len = nl;
+    if (t->pos >= (double)nl) t->pos = fmod(t->pos, (double)nl);
+    m->edit_rev++;
+}
+
 static void track_clear(mark_t *m, int ti) {
     mk_track_t *t = &m->t[ti];
     if (m->io_busy) return;
     if (m->swap_track == ti) m->swap_track = -1;
     t->st = MK_EMPTY;
     t->len = 0;
+    t->full_len = 0;
     t->rec_len = 0;
     t->rec_target = 0;
     t->pending = 0;
@@ -729,17 +781,19 @@ static void *io_worker(void *arg) {
         if (!f) {
             err = 1;
         } else {
-            fprintf(f, "{\"v\":1,\"gu\":%ld,\"q\":%d,\"ra\":%d,\"dm\":%d,"
-                       "\"pm\":%d,\"mst\":%d,\"flw\":%d",
-                    (long)(m->grid_unit + 0.5), m->quantize, m->rec_action,
-                    m->dub_mode, m->play_mode, m->master, m->follow);
+            fprintf(f, "{\"v\":1,\"gu\":%ld,\"q\":%d,\"gd\":%d,\"ra\":%d,"
+                       "\"dm\":%d,\"pm\":%d,\"mst\":%d,\"flw\":%d",
+                    (long)(m->grid_unit + 0.5), m->quantize, m->rec_grid,
+                    m->rec_action, m->dub_mode, m->play_mode, m->master,
+                    m->follow);
             for (int i = 0; i < MARK_TRACKS; i++) {
                 const mk_track_t *t = &m->t[i];
-                fprintf(f, ",\"l%d\":%u,\"v%d\":%d,\"p%d\":%d,\"r%d\":%d,"
-                           "\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,\"g%d\":%d",
-                        i + 1, t->len, i + 1, t->level, i + 1, t->pan,
-                        i + 1, t->rev, i + 1, t->shot, i + 1, t->fx,
-                        i + 1, t->fx_on, i + 1, t->fxp);
+                fprintf(f, ",\"l%d\":%u,\"F%d\":%u,\"v%d\":%d,\"p%d\":%d,"
+                           "\"r%d\":%d,\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,"
+                           "\"g%d\":%d",
+                        i + 1, t->len, i + 1, t->full_len, i + 1, t->level,
+                        i + 1, t->pan, i + 1, t->rev, i + 1, t->shot,
+                        i + 1, t->fx, i + 1, t->fx_on, i + 1, t->fxp);
             }
             fprintf(f, "}");
             if (fclose(f) != 0) err = 1;
@@ -748,7 +802,11 @@ static void *io_worker(void *arg) {
                 snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
                 session_path(m, job->slot, wname, path, sizeof(path));
                 if (m->t[i].len > 0) {
-                    if (wav_write(path, m->t[i].buf, m->t[i].len) != 0) err = 1;
+                    /* write the FULL finalized loop — a trim is metadata,
+                     * so re-lengthening still works after a reload */
+                    uint32_t wf = m->t[i].full_len > m->t[i].len
+                                    ? m->t[i].full_len : m->t[i].len;
+                    if (wav_write(path, m->t[i].buf, wf) != 0) err = 1;
                 } else {
                     unlink(path);   /* drop a stale wav from an older save */
                 }
@@ -766,6 +824,7 @@ static void *io_worker(void *arg) {
             fclose(f);
             long gu = json_int(js, "gu", 0);
             m->quantize   = json_int(js, "q", 1) ? 1 : 0;
+            m->rec_grid   = clampi(json_int(js, "gd", 0), 0, 2);
             m->rec_action = json_int(js, "ra", 0) ? 1 : 0;
             m->dub_mode   = json_int(js, "dm", 0) ? 1 : 0;
             m->play_mode  = json_int(js, "pm", 0) ? 1 : 0;
@@ -793,7 +852,10 @@ static void *io_worker(void *arg) {
                 t->fx_dirty = 1;
 
                 snprintf(k, sizeof(k), "l%d", i + 1);
-                long want = json_int(js, k, 0);
+                long lval = json_int(js, k, 0);
+                snprintf(k, sizeof(k), "F%d", i + 1);
+                long want = json_int(js, k, lval);   /* full loop in the wav */
+                if (want < lval) want = lval;
                 if (want > (long)m->track_frames) want = (long)m->track_frames;
                 if (want > 0) {
                     char wname[16];
@@ -801,7 +863,9 @@ static void *io_worker(void *arg) {
                     session_path(m, job->slot, wname, path, sizeof(path));
                     long got = wav_read(path, t->buf, (uint32_t)want);
                     if (got > 0) {
-                        t->len = (uint32_t)got;
+                        t->full_len = (uint32_t)got;
+                        t->len = (lval > 0 && lval <= got) ? (uint32_t)lval
+                                                           : (uint32_t)got;
                         t->pos = 0.0;
                         t->st = MK_STOP;   /* set last: render gates on it */
                     }
@@ -1009,8 +1073,8 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                 } else if (t->rec_len >= m->track_frames) {
                     /* buffer full: keep whole grid multiples if we have any */
                     uint32_t final_len = m->track_frames;
-                    double g = effective_grid(m);
-                    if (m->quantize && g >= 256.0 && (double)final_len >= g)
+                    double g = live_unit(m);
+                    if (m->quantize && g >= 32.0 && (double)final_len >= g)
                         final_len = (uint32_t)(floor((double)final_len / g) * g);
                     finalize_record(m, i, final_len, m->rec_action ? MK_DUB : MK_PLAY);
                 }
@@ -1085,6 +1149,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         if (!strcmp(k, "btn"))   { if (trig_active(val)) track_button(m, ti); return; }
         if (!strcmp(k, "stop"))  { if (trig_active(val)) track_stop(m, ti);   return; }
         if (!strcmp(k, "clear")) { if (trig_active(val)) track_clear(m, ti);  return; }
+        if (!strcmp(k, "trim"))  { track_trim(m, ti, atoi(val)); return; }
         if (!strcmp(k, "level")) { t->level = clampi(atoi(val), 0, 200); m->edit_rev++; return; }
         if (!strcmp(k, "pan"))   { t->pan = clampi(atoi(val), 0, 100); update_track_gains(t); m->edit_rev++; return; }
         if (!strcmp(k, "rev")) {
@@ -1111,6 +1176,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!strcmp(key, "all_btn"))  { if (trig_active(val)) all_button(m); return; }
     if (!strcmp(key, "undo"))     { if (trig_active(val)) undo_press(m); return; }
     if (!strcmp(key, "quantize")) { m->quantize = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "rec_grid")) { m->rec_grid = clampi(atoi(val), 0, 2); m->edit_rev++; return; }
     if (!strcmp(key, "rec_action")) { m->rec_action = atoi(val) ? 1 : 0; m->edit_rev++; return; }
     if (!strcmp(key, "dub_mode")) { m->dub_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
     if (!strcmp(key, "play_mode")) { m->play_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
@@ -1172,6 +1238,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
          * fields the getter emits (run/ts/ms/un/sess/bpm/sec) are ignored
          * here on purpose. */
         m->quantize   = json_int(val, "q",  m->quantize) ? 1 : 0;
+        m->rec_grid   = clampi(json_int(val, "gd", m->rec_grid), 0, 2);
         m->rec_action = json_int(val, "ra", m->rec_action) ? 1 : 0;
         m->dub_mode   = json_int(val, "dm", m->dub_mode) ? 1 : 0;
         m->play_mode  = json_int(val, "pm", m->play_mode) ? 1 : 0;
@@ -1298,8 +1365,12 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         int undo_avail = 0;
         if (m->undo_track >= 0 && m->swap_track < 0)
             undo_avail = m->undo_redo ? 2 : 1;
-        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|%d|%d",
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|%d|%d|",
                                 undo_avail, m->swap_track >= 0 ? 1 : 0), buf_len);
+        if (n < buf_len - 16) {
+            int w = mark_get_param(m, "tunits", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
         return n;
     }
 
@@ -1313,6 +1384,22 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         return snprintf(buf, (size_t)buf_len, "%d", rs);
     }
     if (!strcmp(key, "quantize"))   return snprintf(buf, (size_t)buf_len, "%d", m->quantize);
+    if (!strcmp(key, "rec_grid"))   return snprintf(buf, (size_t)buf_len, "%d", m->rec_grid);
+    if (!strcmp(key, "tunits")) {
+        /* per-track length in current rec_grid units (0 = empty) */
+        double u = locked_unit(m);
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int v = 0;
+            if (m->t[i].len > 0 && u >= 32.0) {
+                v = (int)floor((double)m->t[i].len / u + 0.5);
+                if (v < 1) v = 1;
+            }
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        return n;
+    }
     if (!strcmp(key, "rec_action")) return snprintf(buf, (size_t)buf_len, "%d", m->rec_action);
     if (!strcmp(key, "dub_mode"))   return snprintf(buf, (size_t)buf_len, "%d", m->dub_mode);
     if (!strcmp(key, "play_mode"))  return snprintf(buf, (size_t)buf_len, "%d", m->play_mode);
@@ -1383,10 +1470,11 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
          * ignores them). The manager flattens this JSON into M.* keys. */
         int n = 0;
         n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
-                                "{\"q\":%d,\"ra\":%d,\"dm\":%d,\"pm\":%d,"
+                                "{\"q\":%d,\"gd\":%d,\"ra\":%d,\"dm\":%d,\"pm\":%d,"
                                 "\"mst\":%d,\"flw\":%d",
-                                m->quantize, m->rec_action, m->dub_mode,
-                                m->play_mode, m->master, m->follow), buf_len);
+                                m->quantize, m->rec_grid, m->rec_action,
+                                m->dub_mode, m->play_mode, m->master,
+                                m->follow), buf_len);
         struct { const char *key; int (*get)(const mk_track_t *); } arrs[] = {
             { "lv", g_level }, { "pn", g_pan }, { "rv", g_rev }, { "sh", g_shot },
             { "fx", g_fx }, { "fo", g_fxon }, { "fp", g_fxp }, { "ts", g_state },
@@ -1400,6 +1488,11 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), ",\"ms\":\""), buf_len);
         if (n < buf_len - 24) {
             int w = mark_get_param(m, "tmeas", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\",\"tu\":\""), buf_len);
+        if (n < buf_len - 24) {
+            int w = mark_get_param(m, "tunits", buf + n, buf_len - n);
             if (w > 0) n = nclamp(n + w, buf_len);
         }
         int run = 0;

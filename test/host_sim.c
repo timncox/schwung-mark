@@ -573,6 +573,87 @@ static void test_rui_poll(void) {
     printf("ok: rui_poll + display state\n");
 }
 
+static void test_grid_and_trim(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+
+    /* eighth-note grid at 120 BPM: one eighth = 11025 frames.
+     * Record ~15.2 eighths; stop must round to exactly 15 (a 15/16 loop
+     * against a 16/16 drum groove — Bigbee's polyrhythm case). */
+    mark_set_param(m, "rec_grid", "2");
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 167000, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 2 * FPM, 0, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tlen(m, 0) == 15 * 11025);
+    char buf[64];
+    gp_str(m, "tunits", buf, sizeof(buf));
+    assert(strncmp(buf, "15,", 3) == 0);
+
+    /* the session grid must still be a true MEASURE despite the 15/16
+     * first loop: a second measure-grid recording rounds to 88200 */
+    mark_set_param(m, "rec_grid", "0");
+    mark_set_param(m, "quantize", "0");     /* immediate start for math */
+    mark_set_param(m, "quantize", "1");
+    mark_set_param(m, "t2_btn", "1");
+    run(m, 15 * 11025, 0, NULL);            /* wait out one t1 pass */
+    run(m, 70000, 0, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    run(m, 2 * FPM, 0, NULL);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tlen(m, 1) % FPM == 0);          /* whole measures */
+
+    /* trim: eighth grid again — shorten t2 (8 eighths per measure) */
+    mark_set_param(m, "rec_grid", "2");
+    uint32_t full = tlen(m, 1);
+    uint32_t units_full = full / 11025;
+    mark_set_param(m, "t2_trim", "-1");
+    assert(tlen(m, 1) == full - 11025);
+    mark_set_param(m, "t2_trim", "-1");
+    assert(tlen(m, 1) == full - 2 * 11025);
+    /* re-lengthen past full clamps at full */
+    mark_set_param(m, "t2_trim", "3");
+    assert(tlen(m, 1) == full);
+    gp_str(m, "tunits", buf, sizeof(buf));
+    int u1, u2;
+    sscanf(buf, "%d,%d", &u1, &u2);
+    assert(u1 == 15 && u2 == (int)units_full);
+
+    mark_destroy(m);
+    printf("ok: rec grid + trim\n");
+}
+
+static void test_trim_session_roundtrip(void) {
+    char dir[] = "/tmp/mark-trim-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "session_dir", dir);
+
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 2 * FPM - 1000, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 2000, 0, NULL);
+    assert(tlen(m, 0) == 2 * FPM);
+
+    /* trim to 13 eighths, save, wipe, load: trim AND full length survive */
+    mark_set_param(m, "rec_grid", "2");
+    mark_set_param(m, "t1_trim", "-3");
+    assert(tlen(m, 0) == 13 * 11025);
+    mark_set_param(m, "save_session", "1");
+    wait_io(m);
+    mark_set_param(m, "t1_clear", "1");
+    mark_set_param(m, "load_session", "1");
+    wait_io(m);
+    assert(tlen(m, 0) == 13 * 11025);
+    mark_set_param(m, "t1_trim", "3");      /* re-lengthen: audio was kept */
+    assert(tlen(m, 0) == 2 * FPM);
+
+    mark_destroy(m);
+    printf("ok: trim survives session round-trip\n");
+}
+
 int main(void) {
     test_record_quantize();
     test_second_track_aligned();
@@ -586,6 +667,8 @@ int main(void) {
     test_track_fx();
     test_sessions();
     test_rui_poll();
+    test_grid_and_trim();
+    test_trim_session_roundtrip();
     printf("all mark sim tests passed\n");
     return 0;
 }
