@@ -624,6 +624,35 @@ static void test_grid_and_trim(void) {
     printf("ok: rec grid + trim\n");
 }
 
+static void test_len16_and_16th_grid(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+
+    /* 16th grid: one unit = 5512.5 frames at 120 BPM */
+    mark_set_param(m, "rec_grid", "3");
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 84000, 0, NULL);                  /* ~15.2 sixteenths */
+    mark_set_param(m, "t1_btn", "1");
+    run(m, FPM, 0, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    uint32_t l15 = tlen(m, 0);
+    assert(l15 == (uint32_t)(15.0 * 88200.0 / 16.0 + 0.5));
+
+    /* step-button length set: 5 -> a 5/16 loop; 16 caps at full */
+    mark_set_param(m, "t1_len16", "5");
+    assert(tlen(m, 0) == (uint32_t)(5.0 * 88200.0 / 16.0 + 0.5));
+    char buf[64];
+    gp_str(m, "tlen16", buf, sizeof(buf));
+    assert(strncmp(buf, "5,", 2) == 0);
+    mark_set_param(m, "t1_len16", "16");     /* full is 15 -> clamps */
+    assert(tlen(m, 0) == l15);
+    mark_set_param(m, "t1_len16", "0");      /* out of range: no-op */
+    assert(tlen(m, 0) == l15);
+
+    mark_destroy(m);
+    printf("ok: len16 step-button lengths\n");
+}
+
 static void test_trim_session_roundtrip(void) {
     char dir[] = "/tmp/mark-trim-XXXXXX";
     assert(mkdtemp(dir) != NULL);
@@ -669,6 +698,7 @@ int main(void) {
     test_rui_poll();
     test_grid_and_trim();
     test_trim_session_roundtrip();
+    test_len16_and_16th_grid();
     printf("all mark sim tests passed\n");
     return 0;
 }

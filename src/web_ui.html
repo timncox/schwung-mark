@@ -107,6 +107,7 @@ then this page syncs live.</div>
           <option value="m">Measure</option>
           <option value="b">Beat</option>
           <option value="e">8th note</option>
+          <option value="s">16th note</option>
           <option value="off">Off</option>
         </select></div>
       <div class="row"><span class="k">After record</span>
@@ -265,7 +266,7 @@ function wireStrip(i) {
   el(`tp${i}`).onclick = () => send(`t${i}_trim`, 1);
 }
 
-const GRID_ABBR = ["m", "b", "e"];
+const GRID_ABBR = ["m", "b", "e", "s"];
 
 /* ---- sessions ---- */
 function buildSlots() {
@@ -345,7 +346,7 @@ function render() {
     el(`fo${i}`).className = fo[i - 1] ? "on" : "";
     setIf(`fp${i}`, "value", fp[i - 1] !== undefined ? fp[i - 1] : 50);
     el(`lu${i}`).textContent = s && tu[i - 1]
-      ? tu[i - 1] + " " + ["measure", "beat", "8th"][gd] + (tu[i - 1] === 1 ? "" : "s")
+      ? tu[i - 1] + " " + ["measure", "beat", "8th", "16th"][gd] + (tu[i - 1] === 1 ? "" : "s")
       : "—";
   }
 
