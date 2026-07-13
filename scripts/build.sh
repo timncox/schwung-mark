@@ -23,6 +23,9 @@ mkdir -p build/modules/overtake/mark
 cp modules/overtake/mark/module.json build/modules/overtake/mark/
 cp src/ui_overtake.js build/modules/overtake/mark/ui.js
 cp src/help_mark.json build/modules/overtake/mark/help.json
+# Browser mixer: schwung-manager serves web_ui.html from the module dir
+# (Tool tab for overtake tools; needs manager > v0.11.4 / main build).
+cp src/web_ui.html build/modules/overtake/mark/web_ui.html
 
 # Compile AND tar inside the container: macOS bsdtar embeds AppleDouble
 # (._*) xattr entries that Linux tar extracts as real files — the schwung
@@ -31,7 +34,7 @@ cp src/help_mark.json build/modules/overtake/mark/help.json
 docker run --rm -v "$PWD":/w -w /w "$IMAGE" bash -c "
     set -e
     aarch64-linux-gnu-gcc $CFLAGS src/mark_core.c src/mark_gen.c \
-        -o build/modules/overtake/mark/dsp.so -lm
+        -o build/modules/overtake/mark/dsp.so -lm -lpthread
     file build/modules/overtake/mark/dsp.so
     tar --owner=0 --group=0 -czf build/mark-module.tar.gz -C build/modules/overtake mark
     echo 'tarball contents:'

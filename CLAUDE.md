@@ -28,6 +28,7 @@ Distribution repo: github.com/timncox/schwung-mark.
   screen-reader). Strict-mode module: EVERY assigned identifier must be
   declared (smack lesson — the old host swallowed ReferenceErrors,
   schwung main treats them as fatal and exits the tool).
+- `src/web_ui.html` — browser mixer (Remote UI Tool tab).
 - `modules/overtake/mark/module.json` — the only build (overtake).
 
 ## Key conventions (inherited from smack, verified on hardware there)
@@ -60,8 +61,24 @@ Distribution repo: github.com/timncox/schwung-mark.
   captured copy-before-write; undo = incremental swap ~32k frames/block
   with the track muted ~0.24 s max, so undo IS redo).
 - Reversed tracks refuse overdub (RC rule). One-shot stops at loop end.
-- v1 limitations: speed 1.0 only (no time-stretch/varispeed); presets
-  save settings, not audio; no per-track FX; no web editor yet.
+- Track FX (v0.2.0): one insert per track — LPF/HPF/Crush/Delay(8th
+  sync)/Phaser/RingMod; params `t<i>_fx` (type), `t<i>_fx_on`, `t<i>_fxp`
+  (0-100); applied post-read/pre-fader; filter coeffs recompute lazily on
+  the render thread (`fx_dirty`).
+- SINGLE play mode (v0.2.0): `play_mode` 1 = starting a track stops the
+  others (song sections); starts remain measure-quantized.
+- Sessions (v0.2.0): `save_session`/`load_session` <slot 1-16>; per-slot
+  tN.wav + flat session.json under `session_dir`
+  (/data/UserData/schwung/mark-sessions on device — OUTSIDE the module
+  dir so reinstalls keep them). Detached pthread worker; `io_busy` gates
+  every state-mutating action; `session_status`/`session_slots` getters.
+  Load silences+detaches all tracks first, sets `len`/`st` last.
+- Web mixer (v0.2.0): src/web_ui.html on the schwungRemote protocol
+  (state-JSON seeding, `rui_poll` "rev:on:tick:bpm", rui_play pushes;
+  `edit_rev` bumps on every state-visible change). Tool tab needs
+  manager > v0.11.4 (Tim's Move runs a main build — fine).
+- v1 limitations still open: speed 1.0 only (no time-stretch/varispeed);
+  presets (`state`) save settings, not audio — sessions cover audio.
 
 ## Build / test / deploy
 
@@ -85,4 +102,6 @@ download_url. Not in the schwung catalog yet (add after hardware test).
 Everything — first hardware pass pending: pad map / LED colors, blink
 pacing, undo-swap mute audibility, measure alignment against Move's
 clock, allocation ladder on-device, help.json rendering, screen-reader
-output.
+output. v0.2.0 additions also unverified: session save/load timing on
+eMMC, FX CPU headroom at 5 tracks, session-mode step UX, web mixer
+end-to-end (Tool tab), single-mode section switching feel.

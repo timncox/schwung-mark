@@ -1,19 +1,25 @@
 /*
  * Mark — RC-505-style 5-track live looper, full-surface overtake UI.
  *
- * Surface map (pad columns 1-5 = tracks 1-5):
- *   Top row    92-96  track REC/PLAY/DUB button (the RC's [>/o]):
- *                     empty=dim, recording=red, playing=green,
- *                     overdubbing=yellow-green, stopped=white,
- *                     pending action blinks
- *              97     ALL START/STOP   98 UNDO/REDO   99 MONITOR
- *   Row 3      84-88  track STOP (tap = stop, hold = clear)
- *              89 QUANTIZE  90 REC ACTION (rec->play / rec->dub)
- *              91 DUB MODE (overdub / replace)
- *   Row 2      76-80  track REVERSE toggles
- *   Bottom row 68-72  track ONE-SHOT toggles
- *   Steps 1-16        playhead chase of the current base loop
+ * Surface map (pad columns 1-5 = tracks 1-5; rows numbered TOP-DOWN as
+ * you look at the device — hardware-confirmed 2026-07-13):
+ *   Row 1 (top) 92-96  track REC/PLAY/DUB button (the RC's [>/o]):
+ *                      empty=dim, recording=red, playing=green,
+ *                      overdubbing=yellow-green, stopped=white,
+ *                      pending action blinks
+ *               97     ALL START/STOP   98 UNDO/REDO   99 MONITOR
+ *   Row 2       84-88  track STOP (tap = stop, hold = clear)
+ *               89 QUANTIZE  90 REC ACTION (rec->play / rec->dub)
+ *               91 DUB MODE (overdub / replace)
+ *   Row 3       76-80  track REVERSE toggles
+ *               81 PLAY MODE (multi / single = song sections)
+ *               82 SESSION MODE: steps become save slots 1-16
+ *                  (tap a slot = load, hold = save)
+ *   Row 4 (btm) 68-72  track FX on/off; Shift+tap = one-shot toggle
+ *   Steps 1-16        playhead chase of the base loop; session slots
+ *                     while session mode is on
  *   Knobs 1-5         track levels     Knob 6 master
+ *   Knob 7            current track's FX type   Knob 8 its FX amount
  *   Shift+Knobs 1-5   track pans       6 monitor  7 follow  8 BPM override
  *   Jog wheel         master level
  *   Play button       passed through to Move (transport + clock keep working)
@@ -50,8 +56,10 @@ const PAD_QUANT = 89;
 const PAD_RECACT = 90;
 const PAD_DUBMD = 91;
 const PAD_REV   = [76, 77, 78, 79, 80];
-const PAD_SHOT  = [68, 69, 70, 71, 72];
-const PADS_DARK = [81, 82, 83, 73, 74, 75];
+const PAD_PMODE = 81;    /* multi / single play mode */
+const PAD_SESS  = 82;    /* session mode: steps = save slots */
+const PAD_FX    = [68, 69, 70, 71, 72];   /* FX on/off; Shift = one-shot */
+const PADS_DARK = [83, 73, 74, 75];
 
 const STEP_FIRST = 16;
 const STEP_COUNT = 16;
@@ -61,8 +69,15 @@ const ST_EMPTY = 0, ST_REC = 1, ST_PLAY = 2, ST_DUB = 3, ST_STOP = 4;
 const ST_NAMES  = ['-', 'REC', 'PLAY', 'DUB', 'STOP'];
 const ST_SPEECH = ['empty', 'recording', 'playing', 'overdubbing', 'stopped'];
 
-/* Hold a stop pad this long to clear the track (RC long-press clear) */
+/* Track FX types (tfx_t in the DSP) */
+const FX_NAMES  = ['Off', 'LPF', 'HPF', 'Crush', 'Delay', 'Phasr', 'Ring'];
+const FX_SPEECH = ['off', 'low pass filter', 'high pass filter', 'crush',
+                   'delay', 'phaser', 'ring mod'];
+
+/* Hold a stop pad this long to clear the track (RC long-press clear);
+ * hold a session slot this long to SAVE into it (tap = load) */
 const CLEAR_HOLD_MS = 600;
+const SAVE_HOLD_MS = 600;
 
 /* Knobs 1-8, page 1 */
 const KNOBS = [
@@ -100,11 +115,15 @@ let tpos     = [0, 0, 0, 0, 0];
 let tmeas    = [0, 0, 0, 0, 0];
 let trev     = [0, 0, 0, 0, 0];
 let tshot    = [0, 0, 0, 0, 0];
+let tfx      = [1, 1, 1, 1, 1];
+let tfxon    = [0, 0, 0, 0, 0];
+let tfxp     = [50, 50, 50, 50, 50];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
 let recAction = 0;
 let dubMode   = 0;
+let playMode  = 0;      /* 0 multi, 1 single */
 let gridBpm   = 120;
 let monitorOn = true;
 let bpmOverride = 0;
@@ -115,6 +134,14 @@ let needsRedraw = true;
 let dspReady = false;
 let chaseStep = -1;
 let anyPending = false;
+let curTrack = 0;       /* target of the FX knobs: last track pad touched */
+
+/* Session mode: steps show the 16 save slots */
+let sessionMode = false;
+let sessSlots = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+let sessHeld = null;    /* { slot, at, fired } while a slot pad is down */
+let ioWatch = false;    /* watch session_status until the worker finishes */
+let ioWasBusy = '';     /* 'saving' | 'loading' while in flight */
 
 /* stop-pad hold tracking: { at, fired } per track, null when up */
 let stopHeld = [null, null, null, null, null];
@@ -187,6 +214,8 @@ function pollStatus() {
         const oldArr = old.split(',').map(Number);
         for (let i = 0; i < TRACKS; i++) {
             if (tstates[i] === oldArr[i]) continue;
+            if (ioWatch) continue;   /* a session load flips every track at
+                                        once — one "Loaded" beats 5 shouts */
             if (tstates[i] === ST_PLAY && oldArr[i] === ST_REC)
                 announce(`Track ${i + 1} looping, ${tmeas[i]} measure${tmeas[i] === 1 ? '' : 's'}`);
             else
@@ -218,16 +247,26 @@ function fetchAll() {
     for (let i = 0; i < TRACKS; i++) {
         trev[i]  = parseInt(gp(`t${i + 1}_rev`) || '0', 10);
         tshot[i] = parseInt(gp(`t${i + 1}_shot`) || '0', 10);
+        tfx[i]   = parseInt(gp(`t${i + 1}_fx`) || '1', 10);
+        tfxon[i] = parseInt(gp(`t${i + 1}_fx_on`) || '0', 10);
+        tfxp[i]  = parseInt(gp(`t${i + 1}_fxp`) || '50', 10);
     }
     parseCsv(gp('tmeas'), tmeas);
     quantize  = parseInt(gp('quantize') || '1', 10);
     recAction = parseInt(gp('rec_action') || '0', 10);
     dubMode   = parseInt(gp('dub_mode') || '0', 10);
+    playMode  = parseInt(gp('play_mode') || '0', 10);
     gridBpm   = parseInt(gp('grid_bpm') || '120', 10);
     monitorOn = (gp('monitor') || '1') !== '0';
     bpmOverride = parseFloat(gp('bpm_override')) || 0;
+    if (sessionMode) fetchSlots();
     pollStatus();
     return true;
+}
+
+function fetchSlots() {
+    const v = (gp('session_slots') || '').split(',');
+    for (let i = 0; i < 16; i++) sessSlots[i] = parseInt(v[i], 10) || 0;
 }
 
 /* ---- knobs ---- */
@@ -277,6 +316,25 @@ function adjustKnob(bank, i, delta) {
     needsRedraw = true;
 }
 
+/* Knobs 7/8: FX type + amount for the current track */
+function adjustFxType(delta) {
+    const v = Math.max(0, Math.min(FX_NAMES.length - 1, tfx[curTrack] + (delta > 0 ? 1 : -1)));
+    if (v === tfx[curTrack]) return;
+    tfx[curTrack] = v;
+    host_module_set_param(`t${curTrack + 1}_fx`, `${v}`);
+    announceParameter(`Track ${curTrack + 1} effect`, FX_SPEECH[v]);
+    needsRedraw = true;
+}
+
+function adjustFxParam(delta) {
+    const v = Math.max(0, Math.min(100, tfxp[curTrack] + delta * 5));
+    if (v === tfxp[curTrack]) return;
+    tfxp[curTrack] = v;
+    host_module_set_param(`t${curTrack + 1}_fxp`, `${v}`);
+    announceParameter(`Track ${curTrack + 1} effect amount`, `${v}`);
+    needsRedraw = true;
+}
+
 /* ---- LEDs ---- */
 
 function trackColor(i) {
@@ -304,7 +362,11 @@ function paintTracks(force) {
             stopColor = White;
         setLED(PAD_STOP[i], stopColor, force);
         setLED(PAD_REV[i], trev[i] ? Blue : 0x10, force);
-        setLED(PAD_SHOT[i], tshot[i] ? Purple : 0x10, force);
+        /* bottom row: FX on/off; Shift reveals the one-shot layer */
+        setLED(PAD_FX[i],
+               shiftHeld ? (tshot[i] ? Purple : 0x10)
+                         : (tfxon[i] && tfx[i] > 0 ? OrangeRed : 0x10),
+               force);
     }
 }
 
@@ -319,10 +381,22 @@ function paintGlobals(force) {
     setLED(PAD_QUANT, quantize ? Cyan : 0x10, force);
     setLED(PAD_RECACT, recAction ? OrangeRed : 0x10, force);
     setLED(PAD_DUBMD, dubMode ? BrightRed : 0x10, force);
+    setLED(PAD_PMODE, playMode ? Cyan : 0x10, force);
+    setLED(PAD_SESS, sessionMode ? White : 0x10, force);
     for (let i = 0; i < PADS_DARK.length; i++) setLED(PADS_DARK[i], Black, force);
 }
 
 function paintSteps(force) {
+    if (sessionMode) {
+        /* the 16 save slots: green = has a session, dim = empty */
+        for (let i = 0; i < STEP_COUNT; i++) {
+            let c = sessSlots[i] ? Green : 0x10;
+            if (sessHeld && sessHeld.slot === i) c = White;
+            setLED(STEP_FIRST + i, c, force);
+        }
+        chaseStep = -2;
+        return;
+    }
     /* chase the base loop: lowest-numbered playing track */
     let ref = -1;
     for (let i = 0; i < TRACKS; i++)
@@ -359,12 +433,16 @@ function drawUI() {
 
     /* footer: ~20 chars budget, one hint set at a time (smack lesson) */
     let fLeft, fRight;
-    if (shiftHeld) {
+    if (sessionMode) {
+        fLeft = 'tap load · hold save';
+        fRight = '';
+    } else if (shiftHeld) {
         fLeft = 'Pans · Mon · BPM';
         fRight = '';
     } else {
-        fLeft = quantize ? `Q:meas` : 'Q:off';
-        fRight = `${recAction ? 'R→D' : 'R→P'} ${dubMode ? 'Repl' : 'Over'}`;
+        fLeft = `T${curTrack + 1} ${FX_NAMES[tfx[curTrack]]}` +
+                (tfxon[curTrack] && tfx[curTrack] > 0 ? ` ${tfxp[curTrack]}` : ' off');
+        fRight = `${playMode ? 'SGL' : 'MLT'} ${quantize ? 'Q' : ''}`;
     }
     drawFooter({ left: fLeft, right: fRight });
     needsRedraw = false;
@@ -428,21 +506,57 @@ globalThis.tick = function() {
         }
     }
 
+    /* session-slot hold: long-press SAVES into the slot (tap = load) */
+    if (sessHeld && !sessHeld.fired &&
+        Date.now() - sessHeld.at >= SAVE_HOLD_MS) {
+        sessHeld.fired = true;
+        host_module_set_param('save_session', `${sessHeld.slot + 1}`);
+        announce(`Saving slot ${sessHeld.slot + 1}`);
+        ioWatch = true;
+        ioWasBusy = 'saving';
+    }
+
+    /* watch the session worker until it settles, then report */
+    if (ioWatch && tickCount % 6 === 0) {
+        const s = gp('session_status') || 'idle';
+        if (s !== 'saving' && s !== 'loading') {
+            ioWatch = false;
+            if (s === 'error') {
+                announce('Session error');
+            } else if (ioWasBusy === 'saving') {
+                announce('Saved');
+            } else {
+                pollStatus();   /* pick up the loaded tracks quietly */
+                const n = tstates.filter(t => t !== ST_EMPTY).length;
+                announce(`Loaded, ${n} track${n === 1 ? '' : 's'}. All pad to start.`);
+                paintTracks(false);
+                paintGlobals(false);
+            }
+            ioWasBusy = '';
+            fetchSlots();
+            paintSteps(true);
+            refreshSoon();
+        }
+    }
+
     /* per-tick status poll drives blink, chase and async transitions */
     pollStatus();
     if (anyPending && tickCount % 4 === 0) paintTracks(false);
     paintSteps(false);
 
-    /* periodic full refresh: knob edits, toggles, measures */
+    /* periodic full refresh: knob edits, toggles, measures — including
+     * changes arriving from the web editor */
     if (tickCount % 12 === 0) {
         const oldKnobs = knobValues.join(',') + knob2Values.join(',');
-        const oldFlags = `${quantize}${recAction}${dubMode}${monitorOn}` +
-                         trev.join('') + tshot.join('');
+        const oldFlags = `${quantize}${recAction}${dubMode}${monitorOn}${playMode}` +
+                         trev.join('') + tshot.join('') +
+                         tfx.join('') + tfxon.join('') + tfxp.join(',');
         fetchAll();
         if (knobValues.join(',') + knob2Values.join(',') !== oldKnobs)
             needsRedraw = true;
-        if (`${quantize}${recAction}${dubMode}${monitorOn}` +
-            trev.join('') + tshot.join('') !== oldFlags) {
+        if (`${quantize}${recAction}${dubMode}${monitorOn}${playMode}` +
+            trev.join('') + tshot.join('') +
+            tfx.join('') + tfxon.join('') + tfxp.join(',') !== oldFlags) {
             paintTracks(false);
             paintGlobals(false);
             needsRedraw = true;
@@ -461,7 +575,10 @@ globalThis.onMidiMessageInternal = function(data) {
         if (d1 === MoveShift) {
             const was = shiftHeld;
             shiftHeld = d2 >= 64;
-            if (was !== shiftHeld) needsRedraw = true;
+            if (was !== shiftHeld) {
+                paintTracks(false);   /* bottom row swaps FX <-> one-shot */
+                needsRedraw = true;
+            }
             return;
         }
         /* jog wheel: master level */
@@ -473,13 +590,16 @@ globalThis.onMidiMessageInternal = function(data) {
         if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
             const delta = decodeDelta(d2);
             if (delta === 0) return;
-            adjustKnob(shiftHeld ? 2 : 1, d1 - MoveKnob1, delta);
+            const k = d1 - MoveKnob1;
+            if (!shiftHeld && k === 6) { adjustFxType(delta); return; }
+            if (!shiftHeld && k === 7) { adjustFxParam(delta); return; }
+            adjustKnob(shiftHeld ? 2 : 1, k, delta);
             return;
         }
         return;
     }
 
-    /* pad releases: end stop-hold windows */
+    /* pad releases: end hold windows; a short session-slot tap = LOAD */
     if (status === 0x80 || (status === 0x90 && d2 === 0)) {
         for (let i = 0; i < TRACKS; i++) {
             if (stopHeld[i] && d1 === PAD_STOP[i]) {
@@ -487,18 +607,41 @@ globalThis.onMidiMessageInternal = function(data) {
                 return;
             }
         }
+        if (sessHeld && d1 === STEP_FIRST + sessHeld.slot) {
+            if (!sessHeld.fired) {
+                if (sessSlots[sessHeld.slot]) {
+                    host_module_set_param('load_session', `${sessHeld.slot + 1}`);
+                    announce(`Loading slot ${sessHeld.slot + 1}`);
+                    ioWatch = true;
+                    ioWasBusy = 'loading';
+                } else {
+                    announce(`Slot ${sessHeld.slot + 1} empty. Hold to save.`);
+                }
+            }
+            sessHeld = null;
+            paintSteps(true);
+            return;
+        }
         return;
     }
 
     if (status === 0x90 && d2 > 0) {
+        /* session mode: step pads are the save slots */
+        if (sessionMode && d1 >= STEP_FIRST && d1 < STEP_FIRST + STEP_COUNT) {
+            sessHeld = { slot: d1 - STEP_FIRST, at: Date.now(), fired: false };
+            paintSteps(true);
+            return;
+        }
         for (let i = 0; i < TRACKS; i++) {
             if (d1 === PAD_TRACK[i]) {
+                curTrack = i;
                 host_module_set_param(`t${i + 1}_btn`, '1');
                 refreshSoon();
                 return;
             }
             if (d1 === PAD_STOP[i]) {
                 /* stop fires on press (RC behavior); keep holding to clear */
+                curTrack = i;
                 host_module_set_param(`t${i + 1}_stop`, '1');
                 if (tstates[i] !== ST_EMPTY) announce(`Track ${i + 1} stop`);
                 stopHeld[i] = { at: Date.now(), fired: false };
@@ -506,6 +649,7 @@ globalThis.onMidiMessageInternal = function(data) {
                 return;
             }
             if (d1 === PAD_REV[i]) {
+                curTrack = i;
                 trev[i] = trev[i] ? 0 : 1;
                 host_module_set_param(`t${i + 1}_rev`, `${trev[i]}`);
                 announce(`Track ${i + 1} reverse ${trev[i] ? 'on' : 'off'}`);
@@ -513,14 +657,45 @@ globalThis.onMidiMessageInternal = function(data) {
                 needsRedraw = true;
                 return;
             }
-            if (d1 === PAD_SHOT[i]) {
-                tshot[i] = tshot[i] ? 0 : 1;
-                host_module_set_param(`t${i + 1}_shot`, `${tshot[i]}`);
-                announce(`Track ${i + 1} one-shot ${tshot[i] ? 'on' : 'off'}`);
+            if (d1 === PAD_FX[i]) {
+                curTrack = i;
+                if (shiftHeld) {   /* Shift layer: one-shot toggle */
+                    tshot[i] = tshot[i] ? 0 : 1;
+                    host_module_set_param(`t${i + 1}_shot`, `${tshot[i]}`);
+                    announce(`Track ${i + 1} one-shot ${tshot[i] ? 'on' : 'off'}`);
+                } else {
+                    tfxon[i] = tfxon[i] ? 0 : 1;
+                    host_module_set_param(`t${i + 1}_fx_on`, `${tfxon[i]}`);
+                    announce(`Track ${i + 1} ${FX_SPEECH[tfx[i]]} ${tfxon[i] ? 'on' : 'off'}`);
+                }
                 paintTracks(false);
                 needsRedraw = true;
                 return;
             }
+        }
+        if (d1 === PAD_PMODE) {
+            playMode = playMode ? 0 : 1;
+            host_module_set_param('play_mode', `${playMode}`);
+            announce(playMode ? 'Single mode: tracks are song sections'
+                              : 'Multi mode');
+            paintGlobals(false);
+            needsRedraw = true;
+            return;
+        }
+        if (d1 === PAD_SESS) {
+            sessionMode = !sessionMode;
+            if (sessionMode) {
+                fetchSlots();
+                const n = sessSlots.filter(s => s).length;
+                announce(`Sessions, ${n} saved. Tap a step to load, hold to save.`);
+            } else {
+                sessHeld = null;
+                announce('Session mode off');
+            }
+            paintGlobals(false);
+            paintSteps(true);
+            needsRedraw = true;
+            return;
         }
         if (d1 === PAD_ALL) {
             host_module_set_param('all_btn', '1');

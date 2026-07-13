@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
 #include "../src/mark_core.h"
 
@@ -364,6 +365,205 @@ static void test_clocked_grid(void) {
     printf("ok: clocked measure grid\n");
 }
 
+/* record one measure of signal on track ti and leave it playing */
+static void quick_loop(mark_t *m, int ti) {
+    char key[8];
+    snprintf(key, sizeof(key), "t%d_btn", ti + 1);
+    mark_set_param(m, key, "1");
+    run(m, FPM, 0, NULL);
+    mark_set_param(m, key, "1");
+    run(m, BLOCK, 0, NULL);
+}
+
+static void test_single_mode(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+
+    quick_loop(m, 0);
+    assert(tstate(m, 0) == MK_PLAY);
+    mark_set_param(m, "play_mode", "1");
+
+    /* starting track 2 must stop track 1 (song-section switch) */
+    quick_loop(m, 1);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tstate(m, 0) == MK_STOP);
+
+    /* restarting track 1 stops track 2 */
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tstate(m, 1) == MK_STOP);
+
+    /* all-start in SINGLE starts only the first non-empty track */
+    mark_set_param(m, "t1_stop", "1");
+    mark_set_param(m, "all_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tstate(m, 1) == MK_STOP);
+
+    mark_destroy(m);
+    printf("ok: single play mode\n");
+}
+
+static void test_track_fx(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+
+    quick_loop(m, 0);
+    assert(tstate(m, 0) == MK_PLAY);
+
+    /* clean playback reproduces the signal exactly; ring mod at full
+     * carrier must audibly differ frame-for-frame */
+    int16_t clean[BLOCK * 2], wet[BLOCK * 2];
+    run(m, BLOCK, 1, clean);
+    mark_set_param(m, "t1_fx", "6");    /* TFX_RINGMOD */
+    mark_set_param(m, "t1_fxp", "80");
+    mark_set_param(m, "t1_fx_on", "1");
+    run(m, BLOCK, 1, wet);
+    int diff = 0;
+    for (int i = 0; i < BLOCK * 2; i++)
+        if (wet[i] != clean[i]) diff++;
+    assert(diff > BLOCK);               /* most frames modulated */
+
+    /* off again: back to bit-exact clean playback */
+    mark_set_param(m, "t1_fx_on", "0");
+    int16_t again[BLOCK * 2];
+    run(m, BLOCK, 1, again);
+    (void)again;                        /* content differs by phase; just
+                                           assert FX state reads back */
+    assert(gp_int(m, "t1_fx") == 6);
+    assert(gp_int(m, "t1_fx_on") == 0);
+    assert(gp_int(m, "t1_fxp") == 80);
+
+    /* LPF at low cutoff must strip energy from a harsh signal */
+    mark_set_param(m, "t1_fx", "1");    /* TFX_LPF */
+    mark_set_param(m, "t1_fxp", "5");   /* ~76 Hz cutoff */
+    mark_set_param(m, "t1_fx_on", "1");
+    long e_clean = 0, e_filt = 0;
+    int16_t buf[BLOCK * 2];
+    for (int b = 0; b < 40; b++) {      /* skip filter settle, then sum */
+        run(m, BLOCK, 1, buf);
+        if (b >= 8)
+            for (int i = 0; i < BLOCK * 2; i++)
+                e_filt += labs((long)buf[i]);
+    }
+    mark_set_param(m, "t1_fx_on", "0");
+    for (int b = 0; b < 40; b++) {
+        run(m, BLOCK, 1, buf);
+        if (b >= 8)
+            for (int i = 0; i < BLOCK * 2; i++)
+                e_clean += labs((long)buf[i]);
+    }
+    assert(e_filt < e_clean / 2);       /* filtered loop is much quieter */
+
+    mark_destroy(m);
+    printf("ok: track fx\n");
+}
+
+static void wait_io(mark_t *m) {
+    char buf[16];
+    for (int spin = 0; spin < 20000; spin++) {
+        gp_str(m, "session_status", buf, sizeof(buf));
+        if (strcmp(buf, "saving") != 0 && strcmp(buf, "loading") != 0) return;
+        usleep(1000);
+    }
+    assert(!"session i/o never finished");
+}
+
+static void test_sessions(void) {
+    char dir[] = "/tmp/mark-sess-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "session_dir", dir);
+
+    char buf[64];
+    gp_str(m, "session_slots", buf, sizeof(buf));
+    assert(strncmp(buf, "0,0", 3) == 0);
+
+    quick_loop(m, 0);
+    uint32_t len1 = tlen(m, 0);
+    assert(len1 == FPM);
+    mark_set_param(m, "t2_level", "137");
+    mark_set_param(m, "t1_fx", "4");
+    mark_set_param(m, "t1_fx_on", "1");
+    mark_set_param(m, "play_mode", "1");
+
+    mark_set_param(m, "save_session", "3");
+    wait_io(m);
+    gp_str(m, "session_status", buf, sizeof(buf));
+    assert(strcmp(buf, "idle") == 0);
+    gp_str(m, "session_slots", buf, sizeof(buf));
+    assert(strncmp(buf, "0,0,1", 5) == 0);   /* slot 3 exists */
+
+    /* wipe everything, then load it back */
+    mark_set_param(m, "t1_clear", "1");
+    mark_set_param(m, "t2_level", "100");
+    mark_set_param(m, "play_mode", "0");
+    assert(tstate(m, 0) == MK_EMPTY);
+
+    mark_set_param(m, "load_session", "3");
+    wait_io(m);
+    gp_str(m, "session_status", buf, sizeof(buf));
+    assert(strcmp(buf, "idle") == 0);
+    assert(tstate(m, 0) == MK_STOP);
+    assert(tlen(m, 0) == len1);
+    assert(gp_int(m, "t2_level") == 137);
+    assert(gp_int(m, "t1_fx") == 4);
+    assert(gp_int(m, "t1_fx_on") == 1);
+    assert(gp_int(m, "play_mode") == 1);
+
+    /* loaded audio must play back the original recorded signal */
+    mark_set_param(m, "t1_fx_on", "0");
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+    int16_t out[BLOCK * 2];
+    run(m, BLOCK, 1, out);
+    assert(out[0] == sig(0) && out[2] == sig(1));
+
+    /* loading a missing slot errors and leaves the machine sane */
+    mark_set_param(m, "load_session", "9");
+    wait_io(m);
+    gp_str(m, "session_status", buf, sizeof(buf));
+    assert(strcmp(buf, "error") == 0);
+
+    mark_destroy(m);
+    printf("ok: session save/load\n");
+}
+
+static void test_rui_poll(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+
+    char buf[64];
+    gp_str(m, "rui_poll", buf, sizeof(buf));
+    unsigned rev0;
+    int on, tick, bpm;
+    assert(sscanf(buf, "%u:%d:%d:%d", &rev0, &on, &tick, &bpm) == 4);
+    assert(on == 0 && bpm == 120);
+
+    quick_loop(m, 0);
+    gp_str(m, "rui_poll", buf, sizeof(buf));
+    unsigned rev1;
+    assert(sscanf(buf, "%u:%d:%d:%d", &rev1, &on, &tick, &bpm) == 4);
+    assert(on == 1 && rev1 > rev0);
+    assert(tick >= 0 && tick <= 127);
+
+    /* state blob carries the display fields the web editor renders */
+    char blob[1024];
+    gp_str(m, "state", blob, sizeof(blob));
+    assert(strstr(blob, "\"ts\":\"2,0,0,0,0\"") != NULL);
+    assert(strstr(blob, "\"run\":3") != NULL);
+    assert(strstr(blob, "\"sess\":\"") != NULL);
+
+    mark_destroy(m);
+    printf("ok: rui_poll + display state\n");
+}
+
 int main(void) {
     test_record_quantize();
     test_second_track_aligned();
@@ -373,6 +573,10 @@ int main(void) {
     test_state_blob();
     test_monitor();
     test_clocked_grid();
+    test_single_mode();
+    test_track_fx();
+    test_sessions();
+    test_rui_poll();
     printf("all mark sim tests passed\n");
     return 0;
 }

@@ -1,0 +1,353 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mark Mixer</title>
+<style>
+  :root {
+    --bg: #101014; --panel: #17171d; --edge: #2a2a33; --ink: #e8e8ee;
+    --dim: #8a8a96; --accent: #4dd06a; --rec: #ff5252; --dub: #e6d34d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.45 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 15px; letter-spacing: 3px; margin: 0; }
+  .bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 12px; border-bottom: 1px solid var(--edge);
+    position: sticky; top: 0; background: var(--bg); z-index: 5;
+  }
+  .chip {
+    padding: 2px 10px; border-radius: 3px; font-weight: 700;
+    background: #333; color: #ccc;
+  }
+  .chip.play { background: #1d5c2e; color: #b6ffcb; }
+  .chip.rec  { background: #7a1d1d; color: #ffc7c7; }
+  button {
+    background: #23232c; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 4px; padding: 5px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #55555f; }
+  button.on { background: var(--accent); border-color: var(--accent); color: #111; font-weight: 700; }
+  button.rec { background: var(--rec); border-color: var(--rec); color: #111; font-weight: 700; }
+  button.dub { background: var(--dub); border-color: var(--dub); color: #111; font-weight: 700; }
+  button.warn { color: #ff9d9d; }
+  input[type=range] { accent-color: var(--accent); vertical-align: middle; width: 100%; }
+  select {
+    background: #1e1e26; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 4px; padding: 4px 6px; font: inherit;
+  }
+  .wrap { display: flex; gap: 14px; padding: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 10px 12px;
+  }
+  .panel h2 {
+    font-size: 11px; letter-spacing: 2px; color: var(--dim);
+    margin: 0 0 8px; text-transform: uppercase;
+  }
+  #strips { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; flex: 1 1 640px; }
+  .strip { background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; padding: 8px; }
+  .strip h3 { margin: 0 0 6px; font-size: 12px; display: flex; justify-content: space-between; }
+  .strip .st { font-weight: 700; }
+  .strip .st.P { color: #7be495; } .strip .st.R { color: #ff8080; }
+  .strip .st.D { color: #e6d34d; } .strip .st.S { color: #fff; }
+  .strip .st.E { color: #555; }
+  .strip .row { display: flex; gap: 4px; margin: 5px 0; align-items: center; }
+  .strip .row button { flex: 1; padding: 5px 2px; font-size: 11px; }
+  .strip label { font-size: 10px; color: var(--dim); display: block; margin-top: 6px; }
+  .strip .tog { display: flex; gap: 4px; margin-top: 6px; }
+  .strip .tog button { flex: 1; font-size: 10px; padding: 3px 1px; }
+  .right { flex: 0 1 330px; min-width: 280px; display: flex; flex-direction: column; gap: 12px; }
+  #slots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .slot { display: flex; flex-direction: column; gap: 2px; }
+  .slot button { font-size: 10px; padding: 4px 2px; }
+  .slot .save { color: var(--dim); }
+  .slot button.has { border-color: var(--accent); }
+  #playbar { height: 8px; background: #1e1e26; border-radius: 4px; overflow: hidden; }
+  #playfill { height: 100%; width: 0; background: var(--accent); transition: width 80ms linear; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 5px 0; flex-wrap: wrap; }
+  .row .k { width: 92px; flex: none; color: var(--dim); }
+  .note { color: var(--dim); font-size: 11px; }
+  #offline { padding: 26px; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <h1>MARK</h1>
+  <span id="stchip" class="chip">—</span>
+  <span id="bpm" class="note"></span>
+  <span id="iostat" class="note"></span>
+  <button id="bAll">All Start/Stop</button>
+  <button id="bUndo">Undo</button>
+  <button id="bMon">Monitor</button>
+  <span style="flex:1"></span>
+  <label class="note">Master <input id="mst" type="range" min="0" max="200" step="5" style="width:120px"></label>
+  <span id="mstv" class="note"></span>
+</div>
+
+<div id="offline">Waiting for Mark… launch it from the Move's overtake menu,
+then this page syncs live.</div>
+
+<div class="wrap" id="ui" style="display:none">
+  <div style="flex:1 1 640px">
+    <div id="playbar"><div id="playfill"></div></div>
+    <div style="height:10px"></div>
+    <div id="strips"></div>
+  </div>
+  <div class="right">
+    <div class="panel">
+      <h2>Modes</h2>
+      <div class="row"><span class="k">Quantize</span>
+        <select id="q"><option value="1">Measure</option><option value="0">Off</option></select></div>
+      <div class="row"><span class="k">After record</span>
+        <select id="ra"><option value="0">Play</option><option value="1">Overdub</option></select></div>
+      <div class="row"><span class="k">Dub mode</span>
+        <select id="dm"><option value="0">Overdub</option><option value="1">Replace</option></select></div>
+      <div class="row"><span class="k">Play mode</span>
+        <select id="pm"><option value="0">Multi</option><option value="1">Single (sections)</option></select></div>
+      <div class="row"><span class="k">Transport</span>
+        <select id="flw"><option value="0">Free</option><option value="1">Follow Move</option></select></div>
+    </div>
+    <div class="panel">
+      <h2>Sessions <span class="note">(load / save)</span></h2>
+      <div id="slots"></div>
+      <div class="note" style="margin-top:6px">Sessions store loop audio +
+      settings on the Move. Loading replaces everything.</div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/schwung-remote-api.js"></script>
+<script>
+"use strict";
+
+const FXN = ["Off", "Low-pass", "High-pass", "Crush", "Delay", "Phaser", "RingMod"];
+const STN = ["E", "R", "P", "D", "S"];
+const STLABEL = ["empty", "REC", "PLAY", "DUB", "STOP"];
+const RUNNAMES = ["IDLE", "PEND", "REC", "PLAY"];
+
+/* ---- device model ---- */
+let PREFIX = null;               /* "overtake_dsp:" (tool) or "synth:" (slot) */
+const M = {};                    /* stripped key -> string value */
+let playOn = false, playTick = -1, liveBpm = 0, lastRuiPlay = 0;
+const touched = {};              /* control-key -> ts of last local edit */
+
+function el(id) { return document.getElementById(id); }
+function num(k, d) { const v = M[k]; return v === undefined ? d : parseFloat(v); }
+function csv(k) { const v = M[k]; return v ? v.split(",").map(Number) : []; }
+function send(key, val) {
+  if (PREFIX) schwungRemote.setParam(PREFIX + key, String(val));
+}
+function trig(key) { send(key, "1"); }
+
+/* ---- incoming sync ---- */
+schwungRemote.onParamChange(function (params) {
+  let dirty = false;
+  for (const k in params) {
+    let p = null;
+    if (k.indexOf("overtake_dsp:") === 0) p = "overtake_dsp:";
+    else if (k.indexOf("synth:") === 0) p = "synth:";
+    if (!p) continue;
+    if (!PREFIX) PREFIX = p;
+    const key = k.slice(p.length);
+    if (key === "rui_play") {    /* cheap playhead push: on:tick:bpm */
+      const a = params[k].split(":").map(Number);
+      playOn = !!a[0]; playTick = a[1]; liveBpm = a[2];
+      lastRuiPlay = Date.now();
+      paintPlayhead();
+      continue;
+    }
+    if (M[key] !== params[k]) { M[key] = params[k]; dirty = true; }
+  }
+  if (dirty) render();
+});
+/* schwung-manager <= v0.11.4 has no resubscribe(): editing works, but
+ * device-side changes only appear after a reload — say so once. */
+if (typeof schwungRemote.resubscribe === "function") {
+  setInterval(function () { schwungRemote.resubscribe(); }, 400);
+} else {
+  window.addEventListener("load", function () {
+    const n = document.createElement("span");
+    n.className = "note";
+    n.textContent = "⚠ schwung too old for live sync — reload to see pad-side changes";
+    document.querySelector(".bar").appendChild(n);
+  });
+}
+
+function setIf(id, prop, v) {    /* skip controls the user is touching */
+  const e = el(id);
+  if (Date.now() - (touched[id] || 0) < 1200) return;
+  if (String(e[prop]) !== String(v)) e[prop] = v;
+}
+
+function paintPlayhead() {
+  el("playfill").style.width = playOn && playTick >= 0
+    ? ((playTick / 127) * 100) + "%" : "0";
+}
+
+/* ---- channel strips ---- */
+function buildStrips() {
+  const host = el("strips");
+  let html = "";
+  for (let i = 1; i <= 5; i++) {
+    html += `
+    <div class="strip" id="strip${i}">
+      <h3><span>T${i} <span class="st" id="st${i}">—</span></span><span class="note" id="ms${i}"></span></h3>
+      <div class="row">
+        <button id="btn${i}">Rec</button>
+        <button id="stp${i}">Stop</button>
+        <button id="clr${i}" class="warn">Clr</button>
+      </div>
+      <label>Level <span class="note" id="lvv${i}"></span></label>
+      <input id="lv${i}" type="range" min="0" max="200" step="5">
+      <label>Pan <span class="note" id="pnv${i}"></span></label>
+      <input id="pn${i}" type="range" min="0" max="100" step="5">
+      <div class="tog">
+        <button id="rv${i}">Rev</button>
+        <button id="sh${i}">1shot</button>
+      </div>
+      <label>FX</label>
+      <div class="row">
+        <select id="fx${i}" style="flex:1">${FXN.map((n, j) => `<option value="${j}">${n}</option>`).join("")}</select>
+        <button id="fo${i}" style="flex:0 0 40px">On</button>
+      </div>
+      <input id="fp${i}" type="range" min="0" max="100" step="5">
+    </div>`;
+  }
+  host.innerHTML = html;
+  for (let i = 1; i <= 5; i++) wireStrip(i);
+}
+
+function wireStrip(i) {
+  el(`btn${i}`).onclick = () => trig(`t${i}_btn`);
+  el(`stp${i}`).onclick = () => trig(`t${i}_stop`);
+  el(`clr${i}`).onclick = () => {
+    if (confirm(`Clear track ${i}? This erases its loop.`)) trig(`t${i}_clear`);
+  };
+  el(`lv${i}`).oninput = (e) => {
+    touched[`lv${i}`] = Date.now();
+    send(`t${i}_level`, e.target.value);
+    el(`lvv${i}`).textContent = e.target.value;
+  };
+  el(`pn${i}`).oninput = (e) => {
+    touched[`pn${i}`] = Date.now();
+    send(`t${i}_pan`, e.target.value);
+    el(`pnv${i}`).textContent = e.target.value;
+  };
+  el(`rv${i}`).onclick = () => send(`t${i}_rev`, csv("rv")[i - 1] ? 0 : 1);
+  el(`sh${i}`).onclick = () => send(`t${i}_shot`, csv("sh")[i - 1] ? 0 : 1);
+  el(`fx${i}`).onchange = (e) => {
+    touched[`fx${i}`] = Date.now();
+    send(`t${i}_fx`, e.target.value);
+  };
+  el(`fo${i}`).onclick = () => send(`t${i}_fx_on`, csv("fo")[i - 1] ? 0 : 1);
+  el(`fp${i}`).oninput = (e) => {
+    touched[`fp${i}`] = Date.now();
+    send(`t${i}_fxp`, e.target.value);
+  };
+}
+
+/* ---- sessions ---- */
+function buildSlots() {
+  const host = el("slots");
+  let html = "";
+  for (let i = 1; i <= 16; i++) {
+    html += `<div class="slot">
+      <button id="sl${i}">${i}</button>
+      <button id="sv${i}" class="save">save</button>
+    </div>`;
+  }
+  host.innerHTML = html;
+  for (let i = 1; i <= 16; i++) {
+    el(`sl${i}`).onclick = () => {
+      const have = csv("sess")[i - 1];
+      if (!have) return alert(`Slot ${i} is empty — use save.`);
+      if (confirm(`Load slot ${i}? Current loops are replaced.`))
+        send("load_session", i);
+    };
+    el(`sv${i}`).onclick = () => {
+      const have = csv("sess")[i - 1];
+      if (!have || confirm(`Overwrite slot ${i}?`)) send("save_session", i);
+    };
+  }
+}
+
+/* ---- rendering ---- */
+function render() {
+  if (M.mst === undefined && M.run === undefined) return;
+  el("offline").style.display = "none";
+  el("ui").style.display = "";
+
+  const run = num("run", 0);
+  const chip = el("stchip");
+  chip.textContent = RUNNAMES[run] || "—";
+  chip.className = "chip " + (run === 3 ? "play" : run === 2 ? "rec" : "");
+  el("bpm").textContent = "@" + (liveBpm || num("bpm", 120)) + " BPM";
+  const io = num("io", 0);
+  el("iostat").textContent = io === 1 ? "saving…" : io === 2 ? "loading…" : "";
+
+  const un = num("un", 0);
+  el("bUndo").textContent = un === 2 ? "Redo" : "Undo";
+  el("bUndo").disabled = un === 0;
+  el("bMon").className = num("mon", 1) ? "on" : "";
+  setIf("mst", "value", num("mst", 100));
+  el("mstv").textContent = num("mst", 100);
+
+  ["q", "ra", "dm", "pm", "flw"].forEach(k => setIf(k, "value", num(k, 0)));
+
+  const ts = csv("ts"), ms = csv("ms"), lv = csv("lv"), pn = csv("pn");
+  const rv = csv("rv"), sh = csv("sh"), fx = csv("fx"), fo = csv("fo"), fp = csv("fp");
+  for (let i = 1; i <= 5; i++) {
+    const s = ts[i - 1] || 0;
+    const st = el(`st${i}`);
+    st.textContent = STLABEL[s];
+    st.className = "st " + STN[s];
+    el(`ms${i}`).textContent = s ? (ms[i - 1] || 0) + "m" : "";
+    const b = el(`btn${i}`);
+    b.textContent = s === 0 ? "Rec" : s === 1 ? "→Play" : s === 2 ? "Dub" : s === 3 ? "→Play" : "Play";
+    b.className = s === 1 ? "rec" : s === 3 ? "dub" : s === 2 ? "on" : "";
+    setIf(`lv${i}`, "value", lv[i - 1] !== undefined ? lv[i - 1] : 100);
+    el(`lvv${i}`).textContent = lv[i - 1] !== undefined ? lv[i - 1] : 100;
+    setIf(`pn${i}`, "value", pn[i - 1] !== undefined ? pn[i - 1] : 50);
+    el(`pnv${i}`).textContent = pn[i - 1] !== undefined ? pn[i - 1] : 50;
+    el(`rv${i}`).className = rv[i - 1] ? "on" : "";
+    el(`sh${i}`).className = sh[i - 1] ? "on" : "";
+    setIf(`fx${i}`, "value", fx[i - 1] !== undefined ? fx[i - 1] : 1);
+    el(`fo${i}`).className = fo[i - 1] ? "on" : "";
+    setIf(`fp${i}`, "value", fp[i - 1] !== undefined ? fp[i - 1] : 50);
+  }
+
+  const sess = csv("sess");
+  for (let i = 1; i <= 16; i++)
+    el(`sl${i}`).className = sess[i - 1] ? "has" : "";
+}
+
+/* ---- top bar wiring ---- */
+window.addEventListener("load", function () {
+  buildStrips();
+  buildSlots();
+  el("bAll").onclick = () => trig("all_btn");
+  el("bUndo").onclick = () => trig("undo");
+  el("bMon").onclick = () => send("monitor", num("mon", 1) ? 0 : 1);
+  el("mst").oninput = (e) => {
+    touched["mst"] = Date.now();
+    send("master", e.target.value);
+    el("mstv").textContent = e.target.value;
+  };
+  ["q", "ra", "dm", "pm", "flw"].forEach(k => {
+    el(k).onchange = (e) => {
+      touched[k] = Date.now();
+      send(k === "q" ? "quantize" : k === "ra" ? "rec_action"
+           : k === "dm" ? "dub_mode" : k === "pm" ? "play_mode" : "follow",
+           e.target.value);
+    };
+  });
+});
+</script>
+</body>
+</html>
