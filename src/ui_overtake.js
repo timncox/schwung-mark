@@ -214,6 +214,8 @@ function pollStatus() {
         const oldArr = old.split(',').map(Number);
         for (let i = 0; i < TRACKS; i++) {
             if (tstates[i] === oldArr[i]) continue;
+            if (ioWatch) continue;   /* a session load flips every track at
+                                        once — one "Loaded" beats 5 shouts */
             if (tstates[i] === ST_PLAY && oldArr[i] === ST_REC)
                 announce(`Track ${i + 1} looping, ${tmeas[i]} measure${tmeas[i] === 1 ? '' : 's'}`);
             else
@@ -519,8 +521,17 @@ globalThis.tick = function() {
         const s = gp('session_status') || 'idle';
         if (s !== 'saving' && s !== 'loading') {
             ioWatch = false;
-            if (s === 'error') announce('Session error');
-            else announce(ioWasBusy === 'saving' ? 'Saved' : 'Loaded');
+            if (s === 'error') {
+                announce('Session error');
+            } else if (ioWasBusy === 'saving') {
+                announce('Saved');
+            } else {
+                pollStatus();   /* pick up the loaded tracks quietly */
+                const n = tstates.filter(t => t !== ST_EMPTY).length;
+                announce(`Loaded, ${n} track${n === 1 ? '' : 's'}. All pad to start.`);
+                paintTracks(false);
+                paintGlobals(false);
+            }
             ioWasBusy = '';
             fetchSlots();
             paintSteps(true);
@@ -675,7 +686,8 @@ globalThis.onMidiMessageInternal = function(data) {
             sessionMode = !sessionMode;
             if (sessionMode) {
                 fetchSlots();
-                announce('Sessions. Tap a step to load, hold to save.');
+                const n = sessSlots.filter(s => s).length;
+                announce(`Sessions, ${n} saved. Tap a step to load, hold to save.`);
             } else {
                 sessHeld = null;
                 announce('Session mode off');

@@ -14,6 +14,8 @@ own tracks are your rhythm section.
 The name: RC-505 **mkII** → Mark. (Its undo feature is literally called
 MARK BACK.)
 
+**📖 Operation manual: https://timncox.github.io/schwung-mark/**
+
 ## Install
 
 In schwung-manager, choose **Install Custom Module** and give it this

@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MARK — Operation Manual</title>
+<meta name="description" content="Operation manual for Mark, a schwung module for the Ableton Move: an RC-505-style 5-track live loop station with sessions, track FX, and a web mixer.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔁</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@500;700;900&family=Archivo:wght@400;500;600;700&family=Martian+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a0d0a; --panel:#111511; --panel2:#151a15; --ink:#e2e8e0; --dim:#8a967f;
+  --line:rgba(226,232,224,.13); --line2:rgba(226,232,224,.06);
+  --acc:#4dd06a;             /* looper green — the PLAY state */
+  --rec:#ff3b3b; --dub:#d9d34d; --stp:#f0f0f0; --blu:#4da6ff; --pur:#b366ff;
+  --cyn:#33cccc; --org:#ff7733;
+  --disp:"Big Shoulders Display",Impact,sans-serif;
+  --mono:"Martian Mono","SFMono-Regular",Consolas,monospace;
+  --body:"Archivo","Helvetica Neue",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);
+  font-size:16px;line-height:1.6;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:
+    repeating-linear-gradient(0deg,var(--line2) 0 1px,transparent 1px 64px),
+    repeating-linear-gradient(90deg,var(--line2) 0 1px,transparent 1px 64px);
+  mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 0%,transparent 75%)}
+body::after{content:"";position:fixed;inset:0;z-index:99;pointer-events:none;opacity:.05;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E")}
+a{color:var(--acc);text-decoration:none;border-bottom:1px solid rgba(77,208,106,.35)}
+a:hover{border-bottom-color:var(--acc)}
+code,kbd{font-family:var(--mono);font-size:.82em;background:var(--panel2);
+  border:1px solid var(--line);border-radius:4px;padding:.1em .4em;white-space:nowrap}
+kbd{border-bottom-width:2px}
+.wrap{max-width:1100px;margin:0 auto;padding:0 24px;position:relative;z-index:1}
+nav{position:sticky;top:0;z-index:50;background:rgba(10,13,10,.88);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;gap:18px;height:52px;overflow-x:auto;scrollbar-width:none}
+nav .wrap::-webkit-scrollbar{display:none}
+nav .logo{font-family:var(--disp);font-weight:900;font-size:22px;letter-spacing:.04em;color:var(--ink);border:none;flex:none}
+nav .logo em{color:var(--acc);font-style:normal}
+nav a.s{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;color:var(--dim);
+  border:none;flex:none;text-transform:uppercase;padding:4px 0}
+nav a.s:hover{color:var(--ink)}
+nav a.s b{color:var(--acc);font-weight:400;margin-right:4px}
+header{padding:72px 0 56px}
+.kicker{font-family:var(--mono);font-size:12px;letter-spacing:.28em;color:var(--acc);
+  text-transform:uppercase;margin-bottom:10px}
+h1.title{font-family:var(--disp);font-weight:900;line-height:.85;
+  font-size:clamp(88px,17vw,220px);letter-spacing:.01em;text-transform:uppercase}
+.subtitle{display:flex;flex-wrap:wrap;align-items:baseline;gap:14px;margin-top:14px}
+.subtitle h2{font-family:var(--disp);font-weight:500;font-size:clamp(22px,3.5vw,34px);
+  letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+.chip{font-family:var(--mono);font-size:11px;letter-spacing:.05em;padding:5px 10px;
+  border:1px solid var(--line);border-radius:999px;color:var(--dim)}
+.chip b{color:var(--ink);font-weight:400}
+.lede{max-width:660px;margin-top:28px;font-size:18px}
+.lede em{color:var(--acc);font-style:normal}
+section{padding:56px 0;border-top:1px solid var(--line)}
+.snum{font-family:var(--mono);font-size:11px;letter-spacing:.24em;color:var(--acc);
+  text-transform:uppercase;margin-bottom:8px}
+h2.sh{font-family:var(--disp);font-weight:900;font-size:clamp(34px,6vw,58px);
+  letter-spacing:.02em;text-transform:uppercase;line-height:.95;margin-bottom:18px}
+h3.klayer{font-family:var(--mono);font-size:12px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--dim);margin:34px 0 4px}
+p{max-width:720px;margin:10px 0}
+p b{color:var(--ink)}
+.hl{color:var(--acc)}
+.note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--acc);
+  border-radius:6px;padding:14px 16px;margin:22px 0;max-width:760px;font-size:14.5px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:36px}
+@media(max-width:820px){.cols{grid-template-columns:1fr}}
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:28px 0 8px}
+@media(max-width:820px){.flow{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){.flow{grid-template-columns:1fr}}
+.fstep{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}
+.fstep .n{font-family:var(--disp);font-weight:900;font-size:34px;color:var(--acc);line-height:1}
+.fstep .t{font-weight:700;margin:6px 0 4px}
+.fstep .d{font-size:13.5px;color:var(--dim)}
+/* state cycle */
+.cycle{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:26px 0 6px;
+  font-family:var(--mono);font-size:12px}
+.stbox{padding:8px 14px;border-radius:6px;border:1px solid var(--line);letter-spacing:.08em}
+.cycle .arr{color:var(--dim)}
+/* surface */
+.surface{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:20px;margin-top:26px}
+.mode-tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.mode-tabs button{font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  background:var(--panel2);color:var(--dim);border:1px solid var(--line);
+  border-radius:6px;padding:8px 14px;cursor:pointer;text-transform:uppercase}
+.mode-tabs button.on{color:var(--bg);background:var(--acc);border-color:var(--acc);font-weight:700}
+.gridscroll{overflow-x:auto;margin:0 -6px;padding:0 6px;-webkit-overflow-scrolling:touch}
+.gridpane{min-width:620px}
+.steps-row{display:grid;grid-template-columns:repeat(16,1fr);gap:4px;margin-bottom:6px}
+.stepbtn{height:22px;border-radius:3px;border:1px solid var(--line);background:#181d18;cursor:pointer}
+.steps-cap{font-family:var(--mono);font-size:10px;color:var(--dim);margin:2px 0 14px;letter-spacing:.04em}
+.padgrid{display:grid;grid-template-columns:repeat(8,1fr);gap:6px}
+.pad{position:relative;aspect-ratio:1.55/1;border-radius:6px;border:1px solid var(--line);
+  cursor:pointer;background:#181d18;transition:transform .08s}
+.pad:hover{transform:translateY(-2px)}
+.pad.sel{outline:2px solid var(--ink)}
+.pad .lbl{position:absolute;inset:auto 4px 3px 5px;font-family:var(--mono);
+  font-size:9px;letter-spacing:.02em;color:rgba(0,0,0,.75);font-weight:700;
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.pad.dimpad .lbl{color:var(--dim)}
+.readout{margin-top:18px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:8px;padding:14px 16px;min-height:86px}
+.readout .rt{font-family:var(--mono);font-size:12px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--acc);margin-bottom:6px}
+.readout .rd{font-size:14px;color:var(--ink);max-width:none}
+.hwrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.hwbtn{font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;color:var(--dim);
+  border:1px solid var(--line);border-radius:6px;padding:7px 11px;cursor:pointer}
+.hwbtn:hover,.hwbtn.sel{color:var(--ink);border-color:var(--acc)}
+/* knobs */
+.knobs{display:grid;grid-template-columns:repeat(8,1fr);gap:10px;margin-top:26px}
+@media(max-width:820px){.knobs{grid-template-columns:repeat(4,1fr)}}
+.knob{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:14px 8px;text-align:center}
+.dial{width:38px;height:38px;margin:0 auto 8px;border-radius:50%;
+  border:2px solid var(--dim);position:relative}
+.dial::after{content:"";position:absolute;left:50%;top:2px;width:2px;height:12px;
+  background:var(--acc);transform-origin:50% 16px;transform:translateX(-50%) rotate(var(--r,0deg))}
+.knob .kn{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--ink)}
+.knob .kv{font-size:10.5px;color:var(--dim);line-height:1.35;margin-top:3px}
+/* fx cards */
+.fxgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:26px}
+.fxcard{background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--fc,var(--acc));
+  border-radius:8px;padding:14px 16px;transition:transform .1s}
+.fxcard:hover{transform:translateY(-3px)}
+.fxcard .fn{font-family:var(--disp);font-weight:700;font-size:20px;letter-spacing:.05em;text-transform:uppercase}
+.fxcard .fd{font-size:13.5px;color:var(--dim);margin-top:4px}
+.fxcard .fp{font-family:var(--mono);font-size:10.5px;color:var(--acc);margin-top:8px}
+/* spec table */
+.spec{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-top:26px}
+.spec div{background:var(--panel);padding:12px 16px}
+.spec .k{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
+.spec .v{font-size:14px;margin-top:3px}
+footer{border-top:1px solid var(--line);padding:40px 0 60px;color:var(--dim);font-size:13.5px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="logo" href="#top">MARK<em>.</em></a>
+  <a class="s" href="#quick"><b>01</b>Quick start</a>
+  <a class="s" href="#cycle"><b>02</b>Track cycle</a>
+  <a class="s" href="#surface"><b>03</b>Surface</a>
+  <a class="s" href="#fx"><b>04</b>Track FX</a>
+  <a class="s" href="#sessions"><b>05</b>Sessions</a>
+  <a class="s" href="#single"><b>06</b>Single mode</a>
+  <a class="s" href="#mixer"><b>07</b>Web mixer</a>
+  <a class="s" href="#sync"><b>08</b>Sync</a>
+  <a class="s" href="#install"><b>09</b>Install</a>
+</div></nav>
+
+<header id="top"><div class="wrap">
+  <div class="kicker">A schwung module for the Ableton Move</div>
+  <h1 class="title">Mark</h1>
+  <div class="subtitle"><h2>Five-track loop station</h2></div>
+  <div class="chips">
+    <span class="chip"><b>5</b> stereo loop tracks</span>
+    <span class="chip">record · play · overdub</span>
+    <span class="chip"><b>16</b> save sessions</span>
+    <span class="chip">track FX</span>
+    <span class="chip">web mixer</span>
+    <span class="chip">RC-505 workflow</span>
+  </div>
+  <p class="lede">Mark turns the Move into a <em>performance looper</em> in the
+  spirit of the Boss RC-505: five independent stereo tracks, each with its own
+  record → play → overdub cycle, level, pan, reverse, one-shot and insert
+  effect. Loops snap to whole measures, everything lands in sync, and one
+  press of undo takes back the layer you regret. Move keeps playing
+  underneath — <em>its tracks are your rhythm section</em>.</p>
+  <p class="lede" style="font-size:14.5px;color:var(--dim)">The name? RC-505
+  <b>mkII</b> → Mark. Its undo function is literally called MARK BACK.</p>
+</div></header>
+
+<!-- ============ 01 QUICK START ============ -->
+<section id="quick"><div class="wrap">
+  <div class="snum">01 · Quick start</div>
+  <h2 class="sh">Loop in four presses</h2>
+  <div class="flow">
+    <div class="fstep"><div class="n">1</div><div class="t">Tap a top-row pad</div>
+      <div class="d">The track starts <b style="color:var(--rec)">recording</b>
+      whatever Move is listening to — mic, line-in, or USB-C.</div></div>
+    <div class="fstep"><div class="n">2</div><div class="t">Tap it again</div>
+      <div class="d">The loop closes on the measure and
+      <b style="color:var(--acc)">plays</b>. Your first loop sets the grid.</div></div>
+    <div class="fstep"><div class="n">3</div><div class="t">Tap once more</div>
+      <div class="d"><b style="color:var(--dub)">Overdub</b> — layer on top as
+      it loops. Tap again to drop back to play.</div></div>
+    <div class="fstep"><div class="n">4</div><div class="t">Next column</div>
+      <div class="d">Record track 2 — it waits for the measure and lands in
+      time. Build all five.</div></div>
+  </div>
+  <div class="note"><b>Launching Mark:</b> open the overtake menu with
+  <kbd>Shift</kbd>+<kbd>Vol</kbd>+<kbd>jog-click</kbd> and pick Mark.
+  <kbd>Back</kbd> hides the UI while the audio keeps running;
+  <kbd>Shift</kbd>+<kbd>Vol</kbd>+<kbd>jog-click</kbd> exits for real.</div>
+</div></section>
+
+<!-- ============ 02 TRACK CYCLE ============ -->
+<section id="cycle"><div class="wrap">
+  <div class="snum">02 · The track cycle</div>
+  <h2 class="sh">One pad, five states</h2>
+  <p>Each track's top-row pad walks the RC-505 cycle. The pad's color always
+  tells you where you are:</p>
+  <div class="cycle">
+    <span class="stbox" style="color:#666">EMPTY · dim</span><span class="arr">→</span>
+    <span class="stbox" style="color:var(--rec);border-color:var(--rec)">REC · red</span><span class="arr">→</span>
+    <span class="stbox" style="color:var(--acc);border-color:var(--acc)">PLAY · green</span><span class="arr">⇄</span>
+    <span class="stbox" style="color:var(--dub);border-color:var(--dub)">DUB · yellow</span>
+    <span class="arr">·</span>
+    <span class="stbox" style="color:var(--stp)">STOP · white</span>
+  </div>
+  <div class="cols" style="margin-top:22px">
+    <div>
+      <p><b>Blinking pad = scheduled.</b> With quantize on, presses land on the
+      next measure boundary — the pad blinks red (record coming) or green
+      (play coming) until it fires. Press again to cancel.</p>
+      <p><b>Stop</b> (row 2) stops the track on the spot; it restarts from the
+      top, on the grid. <b>Hold stop</b> to clear the track entirely.</p>
+      <p><b>Record length is quantized to the nearest measure.</b> Stop a hair
+      late and it trims back; stop early and Mark keeps recording to the
+      measure — exactly how the RC does it.</p>
+    </div>
+    <div>
+      <p><b>Undo / redo</b> (top right) takes back the last recording or
+      overdub. Press again to bring it back. One level, always the most
+      recent gesture, on any track.</p>
+      <p><b>Reverse</b> (row 3) flips playback; reversed tracks refuse
+      overdub (RC rule). <b>One-shot</b> (<kbd>Shift</kbd>+row 4) plays the
+      loop once and stops — phrases, risers, hits.</p>
+      <p><b>All start/stop</b> fires every non-empty track together from the
+      top, or stops everything at once.</p>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 03 SURFACE ============ -->
+<section id="surface"><div class="wrap">
+  <div class="snum">03 · The surface</div>
+  <h2 class="sh">Every pad, mapped</h2>
+  <p>Columns 1–5 are the five tracks; the right three columns are global.
+  Tap any pad below to see what it does. Rows are counted from the top,
+  the way you actually look at the device.</p>
+
+  <div class="surface">
+    <div class="mode-tabs">
+      <button id="tabLoop" class="on">Loop view</button>
+      <button id="tabSess">Session mode</button>
+    </div>
+    <div class="gridscroll"><div class="gridpane">
+      <div class="steps-row" id="stepsRow"></div>
+      <div class="steps-cap" id="stepsCap">Step buttons 1–16 — playhead chase of the base loop</div>
+      <div class="padgrid" id="padGrid"></div>
+    </div></div>
+    <div class="readout">
+      <div class="rt" id="roT">— tap a pad —</div>
+      <div class="rd" id="roD">Pad colors match the device: red records, green plays,
+      yellow overdubs, white is stopped, dim is empty or off.</div>
+    </div>
+    <div class="hwrow">
+      <span class="hwbtn" data-t="Play button" data-d="Passed straight through to Move — transport and clock keep working under the overtake UI. Use Move's own tracks as your rhythm section.">▶ PLAY — passthrough</span>
+      <span class="hwbtn" data-t="Jog wheel" data-d="Master level. Same as knob 6.">◎ JOG — master</span>
+      <span class="hwbtn" data-t="Shift (hold)" data-d="Layer two: knobs 1–5 become pans, 6 monitor, 7 transport follow, 8 BPM override. Row 4 pads become one-shot toggles. The screen relabels while held.">⇧ SHIFT — layer 2</span>
+    </div>
+  </div>
+
+  <h3 class="klayer">Knobs 1–8</h3>
+  <div class="knobs">
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T1</div><div class="kv">track 1 level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T2</div><div class="kv">track 2 level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T3</div><div class="kv">track 3 level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T4</div><div class="kv">track 4 level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T5</div><div class="kv">track 5 level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">MST</div><div class="kv">master level<br>0–200</div></div>
+    <div class="knob"><div class="dial" style="--r:-45deg"></div><div class="kn">FX</div><div class="kv">FX type<br>current track</div></div>
+    <div class="knob"><div class="dial" style="--r:45deg"></div><div class="kn">AMT</div><div class="kv">FX amount<br>0–100</div></div>
+  </div>
+  <p class="klayer">Hold <b>SHIFT</b> — <b>Pan 1–5 · Monitor · Transport follow · BPM override</b> (49 = off, project tempo)</p>
+  <div class="note"><b>"Current track"</b> for the FX knobs is simply the last
+  track whose pads you touched — shown in the screen footer as
+  <code>T3 LPF 40</code>.</div>
+</div></section>
+
+<!-- ============ 04 TRACK FX ============ -->
+<section id="fx"><div class="wrap">
+  <div class="snum">04 · Track FX</div>
+  <h2 class="sh">One insert per track</h2>
+  <p>Each track carries one insert effect, toggled from the row-4 pad and
+  shaped by knobs 7–8. Type and amount are saved with sessions. Full control —
+  including while other tracks record — lives in the <a href="#mixer">web
+  mixer</a>.</p>
+  <div class="fxgrid">
+    <div class="fxcard" style="--fc:#33cc66"><div class="fn">Low-pass</div>
+      <div class="fd">Darkens the track; resonant sweepable cutoff.</div>
+      <div class="fp">AMT = cutoff · 60 Hz → 11 kHz</div></div>
+    <div class="fxcard" style="--fc:#33cc66"><div class="fn">High-pass</div>
+      <div class="fd">Thins the track — make room for the next layer.</div>
+      <div class="fp">AMT = cutoff · 40 Hz → 10 kHz</div></div>
+    <div class="fxcard" style="--fc:#b3e600"><div class="fn">Crush</div>
+      <div class="fd">Sample-rate + bit mangling, gets nastier as it rises.</div>
+      <div class="fp">AMT = destruction depth</div></div>
+    <div class="fxcard" style="--fc:#33cccc"><div class="fn">Delay</div>
+      <div class="fd">Tempo-synced 8th-note echo riding the loop's grid.</div>
+      <div class="fp">AMT = feedback + mix</div></div>
+    <div class="fxcard" style="--fc:#b366ff"><div class="fn">Phaser</div>
+      <div class="fd">4-stage swirl, slow tape-warble to fast wobble.</div>
+      <div class="fp">AMT = LFO rate · 0.05 → 2.5 Hz</div></div>
+    <div class="fxcard" style="--fc:#ff7733"><div class="fn">Ring mod</div>
+      <div class="fd">Metallic carrier from sub-thump to alien bell.</div>
+      <div class="fp">AMT = carrier · 30 Hz → 1 kHz</div></div>
+  </div>
+</div></section>
+
+<!-- ============ 05 SESSIONS ============ -->
+<section id="sessions"><div class="wrap">
+  <div class="snum">05 · Sessions</div>
+  <h2 class="sh">Save the whole loop set</h2>
+  <div class="cols">
+    <div>
+      <p>The RC-505 has 99 memories; Mark has <b>16 session slots</b> stored on
+      the Move itself — <span class="hl">loop audio and all</span>. Levels,
+      pans, reverse and one-shot flags, FX assignments, modes: everything
+      comes back exactly as saved. Power-cycles, module updates, reinstalls —
+      sessions survive them all.</p>
+      <p><b>On the pads:</b> tap the Sessions pad (row 3, column 7). The step
+      row becomes the slot grid — green slots hold a session, dim ones are
+      empty. <b>Tap a green slot to load</b> (replaces your current loops,
+      tracks come back stopped — hit All to start). <b>Hold any slot to
+      save</b> into it. Tap the Sessions pad again to go back to the
+      playhead view.</p>
+    </div>
+    <div>
+      <p><b>In the web mixer:</b> the Sessions panel shows the same 16 slots
+      with explicit load/save buttons and overwrite confirmations.</p>
+      <p><b>While saving or loading</b> (a couple of seconds for big sets),
+      playback keeps running and Mark simply refuses new recordings until the
+      files settle — you can't corrupt a take by grabbing a pad too soon.</p>
+      <div class="note" style="margin-top:16px"><b>Where they live:</b>
+      <code>/data/UserData/schwung/mark-sessions/</code> — one folder per
+      slot with a WAV per track. Copy them off over SSH for safekeeping or
+      DAW work.</div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 06 SINGLE MODE ============ -->
+<section id="single"><div class="wrap">
+  <div class="snum">06 · Single mode</div>
+  <h2 class="sh">Tracks become song sections</h2>
+  <p>Tap the Play-mode pad (row 3, column 6) and the five tracks turn
+  <span class="hl">mutually exclusive</span>: starting one stops the others,
+  quantized to the measure. Verse on track 1, chorus on track 2, bridge on
+  track 3 — one pad per section, transitions always on the grid. The RC-505
+  calls this PLAY MODE: SINGLE.</p>
+  <p>All-start in single mode starts just the first non-empty track; tap your
+  way through the arrangement from there. Tap the pad again for normal
+  multi-track layering.</p>
+</div></section>
+
+<!-- ============ 07 WEB MIXER ============ -->
+<section id="mixer"><div class="wrap">
+  <div class="snum">07 · Web mixer</div>
+  <h2 class="sh">A desk in the browser</h2>
+  <p>With Mark running, open <code>move.local</code> on any device on the same
+  network → <b>Remote UI</b> → <b>Tool</b> tab. Five channel strips with
+  faders, pans, reverse/one-shot, FX selectors and amounts; the mode
+  switches; a live playhead; and the full session grid. Edits sync both ways
+  — turn a knob on the Move and the browser follows.</p>
+  <div class="note"><b>Manager version:</b> the Tool tab needs schwung-manager
+  newer than v0.11.4 (the last tagged release predates it). If you don't see
+  a Tool tab, update schwung — the mixer degrades gracefully to a warning
+  otherwise.</div>
+</div></section>
+
+<!-- ============ 08 SYNC ============ -->
+<section id="sync"><div class="wrap">
+  <div class="snum">08 · Sync</div>
+  <h2 class="sh">Who owns the grid</h2>
+  <div class="cols">
+    <div>
+      <p><b>With Move's clock</b> (Settings → MIDI Sync → Out): Mark locks to
+      the transport. Records start on Move's measures; your loops and Move's
+      sequencer breathe together. Ableton Link tempo changes follow
+      automatically.</p>
+      <p><b>Without clock:</b> your <span class="hl">first loop defines the
+      grid</span> — every later track quantizes to it. Free tempo, still
+      tight.</p>
+    </div>
+    <div>
+      <p><b>Transport follow</b> (<kbd>Shift</kbd>+knob 7) decides what
+      happens when Move's transport stops: <b>Free</b> (default) keeps loops
+      running — Mark is its own transport; <b>Follow</b> pauses with Move and
+      restarts loops from their top on play.</p>
+      <p><b>BPM override</b> (<kbd>Shift</kbd>+knob 8) pins the free-run grid
+      to a tempo when you're not sending clock. 49 = off.</p>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 09 INSTALL ============ -->
+<section id="install"><div class="wrap">
+  <div class="snum">09 · Install & spec</div>
+  <h2 class="sh">Get it on your Move</h2>
+  <p>In <b>schwung-manager</b>: Install Custom Module → paste
+  <code>https://github.com/timncox/schwung-mark</code> — or upload
+  <code>mark-module.tar.gz</code> from the
+  <a href="https://github.com/timncox/schwung-mark/releases">latest release</a>.
+  Requires <a href="https://github.com/charlesvestal/schwung">schwung</a> on
+  your Move.</p>
+  <div class="spec">
+    <div><div class="k">Tracks</div><div class="v">5 stereo, 44.1 kHz</div></div>
+    <div><div class="k">Capacity</div><div class="v">60 s per track (auto-shrinks on low RAM)</div></div>
+    <div><div class="k">Input</div><div class="v">mic / line / USB-C — whatever Move selects</div></div>
+    <div><div class="k">Undo</div><div class="v">1 level, any track, redo included</div></div>
+    <div><div class="k">Sessions</div><div class="v">16 slots, audio + settings, on-device</div></div>
+    <div><div class="k">Quantize</div><div class="v">measure grid · clock or first loop</div></div>
+    <div><div class="k">Dub modes</div><div class="v">overdub (layer) · replace</div></div>
+    <div><div class="k">Module type</div><div class="v">overtake · full surface</div></div>
+  </div>
+  <div class="note"><b>After updating the module:</b> a suspended Mark session
+  resumes the <i>old</i> code. Fully exit
+  (<kbd>Shift</kbd>+<kbd>Vol</kbd>+<kbd>jog-click</kbd> from inside) and
+  relaunch to load the new version — check Help → Modules for the number.</div>
+  <div class="note"><b>Feedback guard:</b> if the speaker is live with no
+  line-in cable, Mark mutes input monitoring so the mic can't howl (loops
+  stay audible). The Monitor pad (top right) overrides when you know what
+  you're doing; plugging in headphones clears the risk entirely.</div>
+</div></section>
+
+<footer><div class="wrap">
+  <div>MARK — a <a href="https://github.com/charlesvestal/schwung">schwung</a> module
+  by <a href="https://github.com/timncox">timncox</a> · MIT</div>
+  <div><a href="https://github.com/timncox/schwung-mark">source & releases</a>
+  · sibling module: <a href="https://timncox.github.io/schwung-smack/">SMACK</a></div>
+</div></footer>
+
+<script>
+"use strict";
+/* device colors */
+const C = {
+  rec:"#ff3b3b", grn:"#4dd06a", dub:"#d9d34d", wht:"#f0f0f0", dim:"#232823",
+  blu:"#4da6ff", pur:"#b366ff", cyn:"#33cccc", org:"#ff7733", red2:"#ff1a1a",
+  off:"#181d18"
+};
+/* pads, row 1 (top) to row 4, 8 columns each */
+function trackPad(n){return{
+  c:C.grn, l:"T"+n,
+  t:"TRACK "+n+" — record / play / overdub",
+  d:"The RC-505 cycle: empty→record (red), record→play (green, loop closes on the measure), play→overdub (yellow), overdub→play. Blinks while waiting for the grid; press again to cancel. This is also how a stopped track restarts."};}
+function stopPad(n){return{
+  c:C.wht, l:"STOP",
+  t:"TRACK "+n+" — stop · hold to clear",
+  d:"Stops the track now (white = stopped, holding content). Restart lands on the measure, from the top. Hold ~½ second to CLEAR the track completely. Stopping a recording finalizes the loop first."};}
+function revPad(n){return{
+  c:C.blu, l:"REV",
+  t:"TRACK "+n+" — reverse",
+  d:"Flips playback direction (blue when on). Reversed tracks refuse overdub — the RC-505 rule — so drop reverse before layering."};}
+function fxPad(n){return{
+  c:C.org, l:"FX",
+  t:"TRACK "+n+" — FX on/off · Shift = one-shot",
+  d:"Toggles the track's insert effect (orange when on) — pick the type with knob 7, shape it with knob 8. Hold SHIFT and tap instead to toggle ONE-SHOT (purple): the loop plays once and stops."};}
+const PADS = [
+  /* row 1 */ trackPad(1),trackPad(2),trackPad(3),trackPad(4),trackPad(5),
+  {c:C.grn,l:"ALL",t:"ALL START / STOP",d:"Anything playing? Stops everything at once (and cancels pending actions). All stopped? Starts every non-empty track together from the top — or just the first one in single mode."},
+  {c:C.org,l:"UNDO",t:"UNDO / REDO",d:"Takes back the last recording or overdub, on whichever track it happened (orange = undo ready, cyan = redo). Press again to restore it. The RC's MARK BACK — Mark's namesake."},
+  {c:C.grn,l:"MON",t:"MONITOR",d:"Input monitoring on (green) / muted (bright red). The feedback guard flips this automatically when the speaker is live with no line-in cable; pressing it overrides the guard."},
+  /* row 2 */ stopPad(1),stopPad(2),stopPad(3),stopPad(4),stopPad(5),
+  {c:C.cyn,l:"QNT",t:"QUANTIZE",d:"Measure quantize on (cyan) or off. On: presses land on the grid and record lengths snap to whole measures. Off: everything fires the instant you press — free-length loops."},
+  {c:C.org,l:"R→",t:"REC ACTION — record, then…",d:"What follows a recording: PLAY (default) or straight into OVERDUB (orange) for instant layering, the RC's REC→DUB."},
+  {c:C.red2,l:"DUB",t:"DUB MODE — overdub / replace",d:"OVERDUB layers new audio on top (default). REPLACE (red) overwrites as the loop passes — the RC's REPLACE1, great for evolving a phrase."},
+  /* row 3 */ revPad(1),revPad(2),revPad(3),revPad(4),revPad(5),
+  {c:C.cyn,l:"MODE",t:"PLAY MODE — multi / single",d:"MULTI layers all five tracks. SINGLE (cyan) makes them exclusive song sections: starting one stops the rest, on the measure. Verse, chorus, bridge — one pad each."},
+  {c:C.wht,l:"SESS",t:"SESSIONS",d:"Turns the 16 step buttons into save slots (green = saved). Tap a slot to LOAD (replaces current loops; tracks return stopped). HOLD a slot to SAVE. Audio + settings, stored on the Move, survives everything."},
+  {c:C.dim,l:"",t:"unused",d:"Reserved for future ideas."},
+  /* row 4 */ fxPad(1),fxPad(2),fxPad(3),fxPad(4),fxPad(5),
+  {c:C.dim,l:"",t:"unused",d:"Reserved for future ideas."},
+  {c:C.dim,l:"",t:"unused",d:"Reserved for future ideas."},
+  {c:C.dim,l:"",t:"unused",d:"Reserved for future ideas."}
+];
+
+const grid = document.getElementById("padGrid");
+const roT = document.getElementById("roT"), roD = document.getElementById("roD");
+PADS.forEach(p=>{
+  const d=document.createElement("div");
+  d.className="pad"+(p.c===C.dim?" dimpad":"");
+  d.style.background=p.c===C.dim?C.off:p.c;
+  d.innerHTML='<span class="lbl">'+p.l+'</span>';
+  d.onclick=()=>{
+    grid.querySelectorAll(".pad").forEach(q=>q.classList.remove("sel"));
+    document.querySelectorAll(".hwbtn").forEach(q=>q.classList.remove("sel"));
+    d.classList.add("sel");
+    roT.textContent=p.t; roD.textContent=p.d;
+  };
+  grid.appendChild(d);
+});
+
+/* step row: loop view = playhead chase; session view = slot grid */
+const stepsRow=document.getElementById("stepsRow");
+const stepsCap=document.getElementById("stepsCap");
+let sessMode=false, chase=0;
+const savedDemo=[1,1,0,1,0,0,0,0,1,0,0,0,0,0,0,0];
+function buildSteps(){
+  stepsRow.innerHTML="";
+  for(let i=0;i<16;i++){
+    const s=document.createElement("div");
+    s.className="stepbtn";
+    if(sessMode){
+      s.style.background=savedDemo[i]?C.grn:C.off;
+      s.style.cursor="pointer";
+      s.onclick=()=>{roT.textContent="SLOT "+(i+1)+(savedDemo[i]?" — saved":" — empty");
+        roD.textContent=savedDemo[i]
+          ?"Tap to load this session (replaces current loops). Hold ~½ second to overwrite it with the current set."
+          :"Empty slot. Hold ~½ second to save the current loop set here.";};
+    } else {
+      s.onclick=()=>{roT.textContent="STEP BUTTONS — playhead";
+        roD.textContent="In loop view the 16 steps chase the base loop's playhead (white head, dim tail). Toggle the Sessions pad and they become the 16 save slots.";};
+    }
+    stepsRow.appendChild(s);
+  }
+}
+setInterval(()=>{
+  if(sessMode)return;
+  chase=(chase+1)%16;
+  const kids=stepsRow.children;
+  for(let i=0;i<16;i++)
+    kids[i].style.background = i===chase?C.wht:(i<chase?"#2a302a":C.off);
+},140);
+const tabL=document.getElementById("tabLoop"), tabS=document.getElementById("tabSess");
+tabL.onclick=()=>{sessMode=false;tabL.classList.add("on");tabS.classList.remove("on");
+  stepsCap.textContent="Step buttons 1–16 — playhead chase of the base loop";buildSteps();};
+tabS.onclick=()=>{sessMode=true;tabS.classList.add("on");tabL.classList.remove("on");
+  stepsCap.textContent="Step buttons 1–16 — session slots · green = saved · tap = load · hold = save";buildSteps();};
+buildSteps();
+
+document.querySelectorAll(".hwbtn").forEach(b=>{b.onclick=()=>{
+  document.querySelectorAll(".hwbtn").forEach(q=>q.classList.remove("sel"));
+  grid.querySelectorAll(".pad").forEach(q=>q.classList.remove("sel"));
+  b.classList.add("sel");
+  roT.textContent=b.dataset.t; roD.textContent=b.dataset.d;
+};});
+</script>
+</body>
+</html>
