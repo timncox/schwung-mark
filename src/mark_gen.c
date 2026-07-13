@@ -20,7 +20,12 @@ static void *gen_create(const char *module_dir, const char *json_defaults) {
     mark_t *m = mark_create(g_host);
     /* this build reads the hardware input directly — the UI keys its
      * feedback guard off this flag */
-    if (m) mark_set_param(m, "hw_input", "1");
+    if (m) {
+        mark_set_param(m, "hw_input", "1");
+        /* sessions live OUTSIDE the module dir so reinstalls keep them */
+        mark_set_param(m, "session_dir",
+                       "/data/UserData/schwung/mark-sessions");
+    }
     return m;
 }
 

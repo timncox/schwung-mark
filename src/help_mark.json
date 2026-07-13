@@ -58,25 +58,87 @@
         "Row 3: stop; hold",
         " to clear.",
         "Row 2: reverse.",
-        "Bottom: one-shot."
+        "Bottom: FX on/off;",
+        " Shift+tap =",
+        " one-shot."
       ]
     },
     {
       "title": "Right column",
       "lines": [
         "Top right corner:",
-        "97 All start/stop",
-        "98 Undo / redo",
+        "All start/stop,",
+        "Undo / redo",
         " (orange = undo,",
-        " cyan = redo)",
-        "99 Monitor on/off",
+        " cyan = redo),",
+        "Monitor on/off.",
         "",
-        "89 Quantize on/off",
-        "90 Rec then: play",
-        " or overdub",
-        "91 Dub mode:",
-        " overdub or",
-        " replace"
+        "Row 3: Quantize,",
+        "Rec then play or",
+        "overdub, Dub mode",
+        "(overdub/replace).",
+        "Row 2: Play mode",
+        "(multi/single),",
+        "Sessions."
+      ]
+    },
+    {
+      "title": "Track FX",
+      "lines": [
+        "One insert per",
+        "track: low pass,",
+        "high pass, crush,",
+        "delay (8th sync),",
+        "phaser, ring mod.",
+        "",
+        "Bottom-row pad",
+        "toggles it.",
+        "Knob 7: FX type",
+        "Knob 8: FX amount",
+        "for the last track",
+        "you touched.",
+        "",
+        "Full control in",
+        "the web mixer."
+      ]
+    },
+    {
+      "title": "Sessions",
+      "lines": [
+        "Save loops + mixer",
+        "to the Move, recall",
+        "them anytime - the",
+        "RC's 99 memories.",
+        "",
+        "Session pad (row 2",
+        "col 7): steps show",
+        "16 slots. Green =",
+        "saved, dim = empty.",
+        "Tap = load, hold",
+        "= save.",
+        "",
+        "Loading replaces",
+        "current loops!",
+        "Survives module",
+        "updates + reboots."
+      ]
+    },
+    {
+      "title": "Single mode",
+      "lines": [
+        "Play-mode pad (row",
+        "2 col 6): tracks",
+        "become exclusive",
+        "song sections -",
+        "starting one stops",
+        "the others, on the",
+        "measure.",
+        "",
+        "Verse on T1,",
+        "chorus on T2,",
+        "bridge on T3:",
+        "one pad per",
+        "section."
       ]
     },
     {
@@ -85,6 +147,8 @@
         "Knobs 1-5: track",
         "levels (0-200).",
         "Knob 6: master.",
+        "Knob 7: FX type.",
+        "Knob 8: FX amount.",
         "Jog wheel: master.",
         "",
         "Hold Shift:",
@@ -93,6 +157,21 @@
         "7 transport follow,",
         "8 BPM override",
         " (49 = off)."
+      ]
+    },
+    {
+      "title": "Web mixer",
+      "lines": [
+        "Open move.local in",
+        "a browser, Remote",
+        "UI, Tool tab: full",
+        "mixer with faders,",
+        "pans, FX, modes,",
+        "and session slots.",
+        "",
+        "Needs the schwung",
+        "manager newer than",
+        "v0.11.4 (Tool tab)."
       ]
     },
     {
