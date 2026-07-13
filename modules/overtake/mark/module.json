@@ -2,7 +2,7 @@
   "id": "mark",
   "name": "Mark",
   "abbrev": "MRK",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "RC-505-style 5-track live looper: per-track record/overdub/stop + FX, quantized loop sync, undo/redo, sessions, single mode, web mixer",
   "dsp": "dsp.so",
   "ui": "ui.js",

@@ -75,9 +75,9 @@ const FX_SPEECH = ['off', 'low pass filter', 'high pass filter', 'crush',
                    'delay', 'phaser', 'ring mod'];
 
 /* Quantize grid units (rec_grid in the DSP) */
-const GRID_ABBR   = ['m', 'b', 'e'];
-const GRID_NAMES  = ['measure', 'beat', 'eighth'];
-const GRID_PLURAL = ['measures', 'beats', 'eighths'];
+const GRID_ABBR   = ['m', 'b', '8', '16'];
+const GRID_NAMES  = ['measure', 'beat', 'eighth', 'sixteenth'];
+const GRID_PLURAL = ['measures', 'beats', 'eighths', 'sixteenths'];
 
 /* Hold a stop pad this long to clear the track (RC long-press clear);
  * hold a session slot this long to SAVE into it (tap = load) */
@@ -126,8 +126,9 @@ let tfxp     = [50, 50, 50, 50, 50];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
-let recGrid   = 0;      /* quantize unit: 0 measure, 1 beat, 2 eighth */
+let recGrid   = 0;      /* quantize unit: 0 measure, 1 beat, 2 8th, 3 16th */
 let tunits    = [0, 0, 0, 0, 0];   /* loop lengths in rec_grid units */
+let tlen16    = [0, 0, 0, 0, 0];   /* loop lengths in 16ths of a measure */
 let recAction = 0;
 let dubMode   = 0;
 let playMode  = 0;      /* 0 multi, 1 single */
@@ -139,7 +140,6 @@ let shiftHeld = false;
 let tickCount = 0;
 let needsRedraw = true;
 let dspReady = false;
-let chaseStep = -1;
 let anyPending = false;
 let curTrack = 0;       /* target of the FX knobs: last track pad touched */
 
@@ -215,6 +215,7 @@ function pollStatus() {
     undoAvail = parseInt(parts[3], 10) || 0;
     swapBusy = parseInt(parts[4], 10) || 0;
     parseCsv(parts[5], tunits);
+    parseCsv(parts[6], tlen16);
     anyPending = tpend.some(p => p !== 0);
 
     if (tstates.join(',') !== old) {
@@ -390,13 +391,16 @@ function paintGlobals(force) {
                               : (undoAvail === 2 ? Cyan : Black)), force);
     setLED(PAD_MON, monitorOn ? Green : BrightRed, force);
     setLED(PAD_QUANT, !quantize ? 0x10
-                    : (recGrid === 2 ? Purple : recGrid === 1 ? Blue : Cyan), force);
+                    : (recGrid === 3 ? OrangeRed : recGrid === 2 ? Purple
+                     : recGrid === 1 ? Blue : Cyan), force);
     setLED(PAD_RECACT, recAction ? OrangeRed : 0x10, force);
     setLED(PAD_DUBMD, dubMode ? BrightRed : 0x10, force);
     setLED(PAD_PMODE, playMode ? Cyan : 0x10, force);
     setLED(PAD_SESS, sessionMode ? White : 0x10, force);
     for (let i = 0; i < PADS_DARK.length; i++) setLED(PADS_DARK[i], Black, force);
 }
+
+let stepsSig = '';   /* last-painted composite, avoids redundant LED writes */
 
 function paintSteps(force) {
     if (sessionMode) {
@@ -406,18 +410,31 @@ function paintSteps(force) {
             if (sessHeld && sessHeld.slot === i) c = White;
             setLED(STEP_FIRST + i, c, force);
         }
-        chaseStep = -2;
+        stepsSig = 'sess';
         return;
     }
-    /* chase the base loop: lowest-numbered playing track */
-    let ref = -1;
-    for (let i = 0; i < TRACKS; i++)
-        if (tstates[i] === ST_PLAY || tstates[i] === ST_DUB) { ref = i; break; }
+    /* Loop view: the steps ARE the current track's length (green bar,
+     * one step = 1/16 of a measure — tap a step to set it) with a white
+     * playhead chasing over it. Falls back to the base loop's chase
+     * when the current track is empty. */
+    const curHas = tstates[curTrack] !== ST_EMPTY && tstates[curTrack] !== ST_REC;
+    let ref = curHas && (tstates[curTrack] === ST_PLAY || tstates[curTrack] === ST_DUB)
+        ? curTrack : -1;
+    if (ref < 0)
+        for (let i = 0; i < TRACKS; i++)
+            if (tstates[i] === ST_PLAY || tstates[i] === ST_DUB) { ref = i; break; }
+    const bar = curHas ? Math.min(16, tlen16[curTrack]) : 0;
     const step = ref >= 0 ? Math.min(15, Math.floor(tpos[ref] / 8)) : -1;
-    if (step === chaseStep && !force) return;
-    chaseStep = step;
-    for (let i = 0; i < STEP_COUNT; i++)
-        setLED(STEP_FIRST + i, i === step ? White : (i < step ? 0x10 : Black), force);
+    const sig = `${bar}:${step}:${curTrack}`;
+    if (sig === stepsSig && !force) return;
+    stepsSig = sig;
+    for (let i = 0; i < STEP_COUNT; i++) {
+        let c = Black;
+        if (i < bar) c = Green;
+        if (i === step) c = White;
+        else if (bar === 0 && i < step) c = 0x10;
+        setLED(STEP_FIRST + i, c, force);
+    }
 }
 
 function paintAll(force) {
@@ -656,6 +673,25 @@ globalThis.onMidiMessageInternal = function(data) {
     }
 
     if (status === 0x90 && d2 > 0) {
+        /* loop view: step N sets the current track's length to N/16 of a
+         * measure — Discord feedback: "if sequencer button 5 then it will
+         * loop on 5/16". Lost length comes back by tapping a later step. */
+        if (!sessionMode && d1 >= STEP_FIRST && d1 < STEP_FIRST + STEP_COUNT) {
+            const n = d1 - STEP_FIRST + 1;
+            if (tstates[curTrack] === ST_EMPTY || tstates[curTrack] === ST_REC) {
+                announce('No loop on this track yet');
+                return;
+            }
+            host_module_set_param(`t${curTrack + 1}_len16`, `${n}`);
+            const fresh = (gp('tlen16') || '').split(',');
+            const u = parseInt(fresh[curTrack], 10) || 0;
+            tlen16[curTrack] = u;
+            announce(`Track ${curTrack + 1}, ${u} sixteenth${u === 1 ? '' : 's'}`);
+            paintSteps(false);
+            needsRedraw = true;
+            refreshSoon();
+            return;
+        }
         /* session mode: step pads are the save slots.
          * Tap = load, hold = save, Shift+tap = delete. */
         if (sessionMode && d1 >= STEP_FIRST && d1 < STEP_FIRST + STEP_COUNT) {
@@ -772,19 +808,21 @@ globalThis.onMidiMessageInternal = function(data) {
             return;
         }
         if (d1 === PAD_QUANT) {
-            /* cycle: measure -> beat -> eighth -> off -> measure. Finer
-             * grids allow polymetric lengths (15/16 against the drums). */
-            if (!quantize) {
+            /* one tap = on/off (grid remembered); Shift+tap cycles the
+             * grid unit: measure -> beat -> 8th -> 16th. Discord feedback:
+             * the old 4-state cycle took too many taps just to toggle. */
+            if (shiftHeld) {
+                recGrid = (recGrid + 1) % 4;
                 quantize = 1;
-                recGrid = 0;
-            } else if (recGrid < 2) {
-                recGrid++;
+                host_module_set_param('rec_grid', `${recGrid}`);
+                host_module_set_param('quantize', '1');
+                announce(`Grid ${GRID_NAMES[recGrid]}`);
             } else {
-                quantize = 0;
+                quantize = quantize ? 0 : 1;
+                host_module_set_param('quantize', `${quantize}`);
+                announce(quantize ? `Quantize on, ${GRID_NAMES[recGrid]}`
+                                  : 'Quantize off');
             }
-            host_module_set_param('quantize', `${quantize}`);
-            if (quantize) host_module_set_param('rec_grid', `${recGrid}`);
-            announce(quantize ? `Quantize ${GRID_NAMES[recGrid]}` : 'Quantize off');
             paintGlobals(false);
             needsRedraw = true;
             return;

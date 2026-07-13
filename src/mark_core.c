@@ -143,8 +143,8 @@ struct mark {
     /* Params */
     int   quantize;              /* 0 off, 1 on (default) */
     int   rec_grid;              /* quantize unit: 0 measure (default),
-                                    1 beat, 2 eighth — finer grids allow
-                                    polymetric loops (15/16 against drums) */
+                                    1 beat, 2 eighth, 3 sixteenth — finer
+                                    grids allow polymetric loops (15/16) */
     int   rec_action;            /* 0 rec->play (default), 1 rec->dub */
     int   dub_mode;              /* 0 overdub (default), 1 replace */
     int   play_mode;             /* 0 multi (default); 1 single: starting a
@@ -244,7 +244,8 @@ static double effective_grid(const mark_t *m) {
 
 /* rec_grid divisor: units per measure (4/4) */
 static int grid_div(const mark_t *m) {
-    return m->rec_grid == 2 ? 8 : (m->rec_grid == 1 ? 4 : 1);
+    static const int div[4] = { 1, 4, 8, 16 };
+    return div[m->rec_grid & 3];
 }
 
 /* Record-length rounding unit, from the live grid. */
@@ -486,7 +487,7 @@ static void request_finish(mark_t *m, int ti, int end_state) {
             if (k < 1.0) k = 1.0;
             double f = k * g;
             while (f > (double)m->track_frames && k > 1.0) { k -= 1.0; f = k * g; }
-            target = (uint32_t)f;
+            target = (uint32_t)(f + 0.5);   /* round: units can be x.5 frames */
         }
     }
     if (target > m->track_frames) target = m->track_frames;
@@ -589,6 +590,30 @@ static void track_trim(mark_t *m, int ti, int delta) {
         m->undo_capturing = 0;
     }
     if (m->undo_track == ti) reset_undo(m);   /* indexes tied to old len */
+    t->len = nl;
+    if (t->pos >= (double)nl) t->pos = fmod(t->pos, (double)nl);
+    m->edit_rev++;
+}
+
+/* Absolute length set in SIXTEENTHS of a measure — the step buttons'
+ * unit (step 5 = a 5/16 loop), independent of rec_grid. */
+static void track_setlen16(mark_t *m, int ti, int n16) {
+    mk_track_t *t = &m->t[ti];
+    if (m->io_busy || m->swap_track == ti) return;
+    if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
+    if (n16 < 1 || n16 > 16) return;
+    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+    double u = g / 16.0;
+    if (u < 32.0) return;
+    uint32_t nl = (uint32_t)((double)n16 * u + 0.5);
+    if (nl > t->full_len) nl = t->full_len;
+    if (nl < 64) nl = 64;
+    if (nl == t->len) return;
+    if (t->st == MK_DUB) {
+        t->st = MK_PLAY;
+        m->undo_capturing = 0;
+    }
+    if (m->undo_track == ti) reset_undo(m);
     t->len = nl;
     if (t->pos >= (double)nl) t->pos = fmod(t->pos, (double)nl);
     m->edit_rev++;
@@ -824,7 +849,7 @@ static void *io_worker(void *arg) {
             fclose(f);
             long gu = json_int(js, "gu", 0);
             m->quantize   = json_int(js, "q", 1) ? 1 : 0;
-            m->rec_grid   = clampi(json_int(js, "gd", 0), 0, 2);
+            m->rec_grid   = clampi(json_int(js, "gd", 0), 0, 3);
             m->rec_action = json_int(js, "ra", 0) ? 1 : 0;
             m->dub_mode   = json_int(js, "dm", 0) ? 1 : 0;
             m->play_mode  = json_int(js, "pm", 0) ? 1 : 0;
@@ -1150,6 +1175,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         if (!strcmp(k, "stop"))  { if (trig_active(val)) track_stop(m, ti);   return; }
         if (!strcmp(k, "clear")) { if (trig_active(val)) track_clear(m, ti);  return; }
         if (!strcmp(k, "trim"))  { track_trim(m, ti, atoi(val)); return; }
+        if (!strcmp(k, "len16")) { track_setlen16(m, ti, atoi(val)); return; }
         if (!strcmp(k, "level")) { t->level = clampi(atoi(val), 0, 200); m->edit_rev++; return; }
         if (!strcmp(k, "pan"))   { t->pan = clampi(atoi(val), 0, 100); update_track_gains(t); m->edit_rev++; return; }
         if (!strcmp(k, "rev")) {
@@ -1176,7 +1202,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!strcmp(key, "all_btn"))  { if (trig_active(val)) all_button(m); return; }
     if (!strcmp(key, "undo"))     { if (trig_active(val)) undo_press(m); return; }
     if (!strcmp(key, "quantize")) { m->quantize = atoi(val) ? 1 : 0; m->edit_rev++; return; }
-    if (!strcmp(key, "rec_grid")) { m->rec_grid = clampi(atoi(val), 0, 2); m->edit_rev++; return; }
+    if (!strcmp(key, "rec_grid")) { m->rec_grid = clampi(atoi(val), 0, 3); m->edit_rev++; return; }
     if (!strcmp(key, "rec_action")) { m->rec_action = atoi(val) ? 1 : 0; m->edit_rev++; return; }
     if (!strcmp(key, "dub_mode")) { m->dub_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
     if (!strcmp(key, "play_mode")) { m->play_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
@@ -1238,7 +1264,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
          * fields the getter emits (run/ts/ms/un/sess/bpm/sec) are ignored
          * here on purpose. */
         m->quantize   = json_int(val, "q",  m->quantize) ? 1 : 0;
-        m->rec_grid   = clampi(json_int(val, "gd", m->rec_grid), 0, 2);
+        m->rec_grid   = clampi(json_int(val, "gd", m->rec_grid), 0, 3);
         m->rec_action = json_int(val, "ra", m->rec_action) ? 1 : 0;
         m->dub_mode   = json_int(val, "dm", m->dub_mode) ? 1 : 0;
         m->play_mode  = json_int(val, "pm", m->play_mode) ? 1 : 0;
@@ -1371,6 +1397,11 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
             int w = mark_get_param(m, "tunits", buf + n, buf_len - n);
             if (w > 0) n = nclamp(n + w, buf_len);
         }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|"), buf_len);
+        if (n < buf_len - 16) {
+            int w = mark_get_param(m, "tlen16", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
         return n;
     }
 
@@ -1394,6 +1425,23 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
             if (m->t[i].len > 0 && u >= 32.0) {
                 v = (int)floor((double)m->t[i].len / u + 0.5);
                 if (v < 1) v = 1;
+            }
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        return n;
+    }
+    if (!strcmp(key, "tlen16")) {
+        /* per-track length in 16ths of a measure — the step buttons' unit */
+        double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+        double u = g / 16.0;
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int v = 0;
+            if (m->t[i].len > 0 && u >= 32.0) {
+                v = (int)floor((double)m->t[i].len / u + 0.5);
+                if (v < 1) v = 1;
+                if (v > 999) v = 999;
             }
             n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
                                     i ? "," : "", v), buf_len);
