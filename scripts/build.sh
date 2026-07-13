@@ -42,4 +42,12 @@ docker run --rm -v "$PWD":/w -w /w "$IMAGE" bash -c "
     tar -tzf build/mark-module.tar.gz
 "
 
+for member in mark/module.json mark/dsp.so mark/ui.js mark/help.json mark/web_ui.html; do
+    tar -tzf build/mark-module.tar.gz "$member" >/dev/null
+done
+if tar -tzf build/mark-module.tar.gz | grep -Eq '(^|/)(\._|\.DS_Store)'; then
+    echo "Unexpected macOS metadata in build/mark-module.tar.gz" >&2
+    exit 1
+fi
+
 echo "Built: build/mark-module.tar.gz"
