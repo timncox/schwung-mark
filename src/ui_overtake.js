@@ -1,20 +1,21 @@
 /*
  * Mark — RC-505-style 5-track live looper, full-surface overtake UI.
  *
- * Surface map (pad columns 1-5 = tracks 1-5):
- *   Top row    92-96  track REC/PLAY/DUB button (the RC's [>/o]):
- *                     empty=dim, recording=red, playing=green,
- *                     overdubbing=yellow-green, stopped=white,
- *                     pending action blinks
- *              97     ALL START/STOP   98 UNDO/REDO   99 MONITOR
- *   Row 3      84-88  track STOP (tap = stop, hold = clear)
- *              89 QUANTIZE  90 REC ACTION (rec->play / rec->dub)
- *              91 DUB MODE (overdub / replace)
- *   Row 2      76-80  track REVERSE toggles
- *              81 PLAY MODE (multi / single = song sections)
- *              82 SESSION MODE: steps become save slots 1-16
- *                 (tap a slot = load, hold = save)
- *   Bottom row 68-72  track FX on/off; Shift+tap = one-shot toggle
+ * Surface map (pad columns 1-5 = tracks 1-5; rows numbered TOP-DOWN as
+ * you look at the device — hardware-confirmed 2026-07-13):
+ *   Row 1 (top) 92-96  track REC/PLAY/DUB button (the RC's [>/o]):
+ *                      empty=dim, recording=red, playing=green,
+ *                      overdubbing=yellow-green, stopped=white,
+ *                      pending action blinks
+ *               97     ALL START/STOP   98 UNDO/REDO   99 MONITOR
+ *   Row 2       84-88  track STOP (tap = stop, hold = clear)
+ *               89 QUANTIZE  90 REC ACTION (rec->play / rec->dub)
+ *               91 DUB MODE (overdub / replace)
+ *   Row 3       76-80  track REVERSE toggles
+ *               81 PLAY MODE (multi / single = song sections)
+ *               82 SESSION MODE: steps become save slots 1-16
+ *                  (tap a slot = load, hold = save)
+ *   Row 4 (btm) 68-72  track FX on/off; Shift+tap = one-shot toggle
  *   Steps 1-16        playhead chase of the base loop; session slots
  *                     while session mode is on
  *   Knobs 1-5         track levels     Knob 6 master

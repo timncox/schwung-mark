@@ -25,12 +25,14 @@ the UI (audio keeps running); Shift+Vol+Jog-Click exits.
 
 ## Surface
 
+Rows counted from the top, as you look at the device:
+
 | | Col 1-5 (tracks) | Col 6 | Col 7 | Col 8 |
 |---|---|---|---|---|
-| **Top row** | REC / PLAY / DUB | All start/stop | Undo/redo | Monitor |
-| **Row 3** | Stop (hold = clear) | Quantize | Rec→Play / Rec→Dub | Overdub / Replace |
-| **Row 2** | Reverse | Play mode (multi/single) | Sessions | — |
-| **Bottom** | FX on/off (Shift = one-shot) | — | — | — |
+| **Row 1 (top)** | REC / PLAY / DUB | All start/stop | Undo/redo | Monitor |
+| **Row 2** | Stop (hold = clear) | Quantize | Rec→Play / Rec→Dub | Overdub / Replace |
+| **Row 3** | Reverse | Play mode (multi/single) | Sessions | — |
+| **Row 4 (bottom)** | FX on/off (Shift = one-shot) | — | — | — |
 
 Track button colors: dim = empty, **red** = recording, **green** =
 playing, **yellow** = overdubbing, **white** = stopped, blinking =

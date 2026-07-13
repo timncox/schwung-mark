@@ -55,12 +55,15 @@
         " empty, blink =",
         " waiting for the",
         " measure).",
-        "Row 3: stop; hold",
+        "Row 2: stop; hold",
         " to clear.",
-        "Row 2: reverse.",
-        "Bottom: FX on/off;",
+        "Row 3: reverse.",
+        "Row 4: FX on/off;",
         " Shift+tap =",
-        " one-shot."
+        " one-shot.",
+        "",
+        "(Rows counted from",
+        "the top.)"
       ]
     },
     {
@@ -73,11 +76,11 @@
         " cyan = redo),",
         "Monitor on/off.",
         "",
-        "Row 3: Quantize,",
+        "Row 2: Quantize,",
         "Rec then play or",
         "overdub, Dub mode",
         "(overdub/replace).",
-        "Row 2: Play mode",
+        "Row 3: Play mode",
         "(multi/single),",
         "Sessions."
       ]
@@ -110,7 +113,7 @@
         "them anytime - the",
         "RC's 99 memories.",
         "",
-        "Session pad (row 2",
+        "Session pad (row 3,",
         "col 7): steps show",
         "16 slots. Green =",
         "saved, dim = empty.",
@@ -127,7 +130,7 @@
       "title": "Single mode",
       "lines": [
         "Play-mode pad (row",
-        "2 col 6): tracks",
+        "3, col 6): tracks",
         "become exclusive",
         "song sections -",
         "starting one stops",
