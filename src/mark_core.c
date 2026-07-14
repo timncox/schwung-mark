@@ -1318,6 +1318,17 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
 void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!m || !key || !val) return;
+    if (!strcmp(key, "rui_set")) {
+        const char *separator = strchr(val, ':');
+        size_t key_len = separator ? (size_t)(separator - val) : 0;
+        char routed_key[32];
+        if (!separator || key_len == 0 || key_len >= sizeof(routed_key)) return;
+        memcpy(routed_key, val, key_len);
+        routed_key[key_len] = '\0';
+        if (!strcmp(routed_key, "rui_set")) return;
+        mark_set_param(m, routed_key, separator + 1);
+        return;
+    }
     if (m->io_busy) return;
 
     /* per-track keys: t<1-5>_... */

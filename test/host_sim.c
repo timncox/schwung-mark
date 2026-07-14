@@ -657,7 +657,11 @@ static void test_sessions(void) {
 static void test_rui_poll(void) {
     mark_t *m = mark_create(&host);
     g_in_frame = 0;
-    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "rui_set", "quantize:0");
+    mark_set_param(m, "rui_set", "t2_level:137");
+    assert(gp_int(m, "t2_level") == 137);
+    mark_set_param(m, "rui_set", "rui_set:t2_level:5");
+    assert(gp_int(m, "t2_level") == 137);
 
     char buf[64];
     gp_str(m, "rui_poll", buf, sizeof(buf));

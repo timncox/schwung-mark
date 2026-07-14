@@ -147,7 +147,7 @@ function el(id) { return document.getElementById(id); }
 function num(k, d) { const v = M[k]; return v === undefined ? d : parseFloat(v); }
 function csv(k) { const v = M[k]; return v ? v.split(",").map(Number) : []; }
 function send(key, val) {
-  if (PREFIX) schwungRemote.setParam(PREFIX + key, String(val));
+  if (PREFIX) schwungRemote.setParam(PREFIX + "rui_set", key + ":" + String(val));
 }
 function trig(key) { send(key, "1"); }
 
@@ -172,18 +172,9 @@ schwungRemote.onParamChange(function (params) {
   }
   if (dirty) render();
 });
-/* schwung-manager <= v0.11.4 has no resubscribe(): editing works, but
- * device-side changes only appear after a reload — say so once. */
-if (typeof schwungRemote.resubscribe === "function") {
-  setInterval(function () { schwungRemote.resubscribe(); }, 400);
-} else {
-  window.addEventListener("load", function () {
-    const n = document.createElement("span");
-    n.className = "note";
-    n.textContent = "⚠ schwung too old for live sync — reload to see pad-side changes";
-    document.querySelector(".bar").appendChild(n);
-  });
-}
+/* Never poll resubscribe(): Schwung 0.11.4 remounts the custom iframe during
+ * full parameter refreshes. rui_play keeps transport feedback live; reopen the
+ * slot only when an explicit device-side state refresh is needed. */
 
 function setIf(id, prop, v) {    /* skip controls the user is touching */
   const e = el(id);
@@ -243,14 +234,14 @@ function wireStrip(i) {
   };
   el(`lv${i}`).oninput = (e) => {
     touched[`lv${i}`] = Date.now();
-    send(`t${i}_level`, e.target.value);
     el(`lvv${i}`).textContent = e.target.value;
   };
+  el(`lv${i}`).onchange = (e) => send(`t${i}_level`, e.target.value);
   el(`pn${i}`).oninput = (e) => {
     touched[`pn${i}`] = Date.now();
-    send(`t${i}_pan`, e.target.value);
     el(`pnv${i}`).textContent = e.target.value;
   };
+  el(`pn${i}`).onchange = (e) => send(`t${i}_pan`, e.target.value);
   el(`rv${i}`).onclick = () => send(`t${i}_rev`, csv("rv")[i - 1] ? 0 : 1);
   el(`sh${i}`).onclick = () => send(`t${i}_shot`, csv("sh")[i - 1] ? 0 : 1);
   el(`fx${i}`).onchange = (e) => {
@@ -260,8 +251,8 @@ function wireStrip(i) {
   el(`fo${i}`).onclick = () => send(`t${i}_fx_on`, csv("fo")[i - 1] ? 0 : 1);
   el(`fp${i}`).oninput = (e) => {
     touched[`fp${i}`] = Date.now();
-    send(`t${i}_fxp`, e.target.value);
   };
+  el(`fp${i}`).onchange = (e) => send(`t${i}_fxp`, e.target.value);
   el(`tm${i}`).onclick = () => send(`t${i}_trim`, -1);
   el(`tp${i}`).onclick = () => send(`t${i}_trim`, 1);
 }
@@ -364,9 +355,9 @@ window.addEventListener("load", function () {
   el("bMon").onclick = () => send("monitor", num("mon", 1) ? 0 : 1);
   el("mst").oninput = (e) => {
     touched["mst"] = Date.now();
-    send("master", e.target.value);
     el("mstv").textContent = e.target.value;
   };
+  el("mst").onchange = (e) => send("master", e.target.value);
   el("q").onchange = (e) => {
     touched["q"] = Date.now();
     const v = e.target.value;
