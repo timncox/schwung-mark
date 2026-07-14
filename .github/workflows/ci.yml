@@ -1,0 +1,24 @@
+name: Core CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native simulator
+        run: make test
+      - name: Sanitizers
+        run: |
+          make clean
+          make test CFLAGS="-O1 -g -Wall -Wextra -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer"
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+      - name: Validate UI and manifest
+        run: |
+          node --check src/ui_overtake.js
+          python3 -m json.tool modules/overtake/mark/module.json >/dev/null

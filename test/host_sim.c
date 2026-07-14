@@ -55,6 +55,31 @@ static void run(mark_t *m, uint64_t n, int mode, int16_t *last_out) {
     }
 }
 
+static void run_impulse(mark_t *m, uint32_t n, int16_t amplitude) {
+    int16_t in[BLOCK * 2] = {0}, out[BLOCK * 2];
+    uint32_t done = 0;
+    while (done < n) {
+        int c = n - done > BLOCK ? BLOCK : (int)(n - done);
+        memset(in, 0, sizeof(in));
+        if (done == 0) in[0] = in[1] = amplitude;
+        mark_process(m, in, out, c);
+        g_in_frame += (uint64_t)c;
+        done += (uint32_t)c;
+    }
+}
+
+static void capture_silence(mark_t *m, uint32_t n, int16_t *dst) {
+    int16_t in[BLOCK * 2] = {0}, out[BLOCK * 2];
+    uint32_t done = 0;
+    while (done < n) {
+        int c = n - done > BLOCK ? BLOCK : (int)(n - done);
+        mark_process(m, in, out, c);
+        memcpy(dst + done * 2, out, (size_t)c * 2 * sizeof(int16_t));
+        g_in_frame += (uint64_t)c;
+        done += (uint32_t)c;
+    }
+}
+
 static int gp_int(mark_t *m, const char *key) {
     char buf[64];
     int n = mark_get_param(m, key, buf, sizeof(buf));
@@ -375,6 +400,40 @@ static void quick_loop(mark_t *m, int ti) {
     run(m, BLOCK, 0, NULL);
 }
 
+static void test_undo_capture_ownership(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+    quick_loop(m, 0);
+    uint64_t t2_start = g_in_frame;
+    quick_loop(m, 1);
+
+    /* Track 2 starts the newest dub gesture and therefore owns undo.
+     * Stopping track 1 must not stop track 2's capture. */
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t2_btn", "1");
+    run(m, BLOCK, 2, NULL);
+    mark_set_param(m, "t1_stop", "1");
+    run(m, FPM, 2, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    assert(gp_int(m, "undo_avail") == 1);
+
+    mark_set_param(m, "undo", "1");
+    run(m, FPM, 1, NULL);
+    assert(gp_int(m, "undo_avail") == 2);
+    int16_t out[BLOCK * 2];
+    int found = 0;
+    for (uint32_t scan = 0; scan < FPM + BLOCK * 4 && !found; scan += BLOCK) {
+        run(m, BLOCK, 1, out);
+        if (out[0] == sig(t2_start) && out[2] == sig(t2_start + 1)) found = 1;
+    }
+    assert(found);
+
+    mark_destroy(m);
+    printf("ok: undo capture ownership\n");
+}
+
 static void test_single_mode(void) {
     mark_t *m = mark_create(&host);
     g_in_frame = 0;
@@ -461,6 +520,43 @@ static void test_track_fx(void) {
     printf("ok: track fx\n");
 }
 
+static void test_delay_timing_and_tail(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+
+    /* A single-sample loop impulse makes the 120 BPM eighth-note tap
+     * measurable exactly: 88200 / 8 = 11025 frames. */
+    mark_set_param(m, "t1_btn", "1");
+    run_impulse(m, 22050, 12000);
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t1_fx", "4");
+    mark_set_param(m, "t1_fxp", "0");
+    mark_set_param(m, "t1_fx_on", "1");
+    int16_t *cap = calloc(12000 * 2, sizeof(int16_t));
+    assert(cap);
+    capture_silence(m, 12000, cap);
+    assert(abs((int)cap[8191 * 2]) < 10);
+    assert(abs((int)cap[11025 * 2]) > 2000);
+
+    /* Re-arm a clean delay, start the loop, then stop before its echo.
+     * The feedback network must continue and emit the tail while stopped. */
+    mark_set_param(m, "t1_stop", "1");
+    mark_set_param(m, "t1_fx_on", "0");
+    mark_set_param(m, "t1_fx_on", "1");
+    mark_set_param(m, "t1_btn", "1");
+    capture_silence(m, 256, cap);
+    mark_set_param(m, "t1_stop", "1");
+    memset(cap, 0, 12000 * 2 * sizeof(int16_t));
+    capture_silence(m, 11000, cap);
+    assert(abs((int)cap[(11025 - 256) * 2]) > 2000);
+
+    free(cap);
+    mark_destroy(m);
+    printf("ok: eighth-note delay timing + stopped tail\n");
+}
+
 static void wait_io(mark_t *m) {
     char buf[16];
     for (int spin = 0; spin < 20000; spin++) {
@@ -525,10 +621,25 @@ static void test_sessions(void) {
     assert(out[0] == sig(0) && out[2] == sig(1));
 
     /* loading a missing slot errors and leaves the machine sane */
+    uint32_t live_len = tlen(m, 0);
+    int live_state = tstate(m, 0);
     mark_set_param(m, "load_session", "9");
     wait_io(m);
     gp_str(m, "session_status", buf, sizeof(buf));
     assert(strcmp(buf, "error") == 0);
+    assert(tlen(m, 0) == live_len && tstate(m, 0) == live_state);
+    assert(gp_int(m, "t2_level") == 137);
+
+    /* A present JSON file with a truncated WAV is equally non-destructive. */
+    char wav[320];
+    snprintf(wav, sizeof(wav), "%s/slot03/t1.wav", dir);
+    assert(truncate(wav, 12) == 0);
+    mark_set_param(m, "load_session", "3");
+    wait_io(m);
+    gp_str(m, "session_status", buf, sizeof(buf));
+    assert(strcmp(buf, "error") == 0);
+    assert(tlen(m, 0) == live_len && tstate(m, 0) == live_state);
+    assert(gp_int(m, "t2_level") == 137);
 
     /* delete: slot 3 disappears from the bitmap and won't load */
     mark_set_param(m, "delete_session", "3");
@@ -693,7 +804,9 @@ int main(void) {
     test_monitor();
     test_clocked_grid();
     test_single_mode();
+    test_undo_capture_ownership();
     test_track_fx();
+    test_delay_timing_and_tail();
     test_sessions();
     test_rui_poll();
     test_grid_and_trim();

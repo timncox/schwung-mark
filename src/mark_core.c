@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -42,7 +43,7 @@ typedef enum {
     TFX_COUNT
 } tfx_t;
 
-#define MARK_DLY_LEN 8192      /* per-track delay line, frames */
+#define MARK_DLY_LEN 32768     /* 8th-note delay down through the UI's 50 BPM */
 #define MARK_SESSION_SLOTS 16
 
 /* RBJ biquad (smack pattern) for the LPF/HPF track FX */
@@ -159,14 +160,16 @@ struct mark {
 
     /* Remote-UI sync: bumped on any state-visible edit; gates the browser
      * editor's full-state refetch (schwung-manager polls rui_poll). */
-    uint32_t edit_rev;
+    _Atomic uint32_t edit_rev;
 
     /* Sessions: loop audio + settings saved per slot (tN.wav + a flat
-     * session.json) under session_dir. File I/O runs on a detached worker
+     * session.json) under session_dir. File I/O runs on a joinable worker
      * thread; io_busy gates every state-mutating action meanwhile. */
     char session_dir[240];
-    volatile int io_busy;        /* 0 idle, 1 saving, 2 loading */
-    volatile int io_error;       /* last I/O op failed */
+    _Atomic int io_busy;          /* 0 idle, 1 saving, 2 loading */
+    _Atomic int io_error;         /* last I/O op failed */
+    pthread_t io_thread;
+    int io_thread_valid;
 };
 
 /* ------------------------------------------------------------------ */
@@ -207,6 +210,8 @@ static void update_track_gains(mk_track_t *t) {
     t->pg[0] = t->pan <= 50 ? 1.0f : (float)(100 - t->pan) / 50.0f;
     t->pg[1] = t->pan >= 50 ? 1.0f : (float)t->pan / 50.0f;
 }
+
+static void track_fx_reset(mk_track_t *t);
 
 /* ------------------------------------------------------------------ */
 /*  Clock                                                              */
@@ -333,9 +338,9 @@ mark_t *mark_create(const host_api_v1_t *host) {
 
 void mark_destroy(mark_t *m) {
     if (!m) return;
-    /* a detached I/O worker may still hold this instance — wait it out
-     * (bounded; a stuck filesystem beats a use-after-free) */
-    for (int spin = 0; m->io_busy && spin < 20000; spin++) usleep(1000);
+    /* The worker owns this instance until it returns. Joining makes destroy
+     * safe even when slow storage takes longer than an arbitrary timeout. */
+    if (m->io_thread_valid) pthread_join(m->io_thread, NULL);
     for (int i = 0; i < MARK_TRACKS; i++) { free(m->t[i].buf); free(m->t[i].dly); }
     free(m->undo_buf);
     free(m);
@@ -392,6 +397,12 @@ static void reset_undo(mark_t *m) {
     if (m->swap_track >= 0) m->swap_track = -1;
 }
 
+/* Undo capture belongs to the most recently started dub gesture. Stopping
+ * some other track must not silently truncate that owner's undo region. */
+static void end_dub_capture(mark_t *m, int ti) {
+    if (m->undo_track == ti) m->undo_capturing = 0;
+}
+
 static void begin_dub_gesture(mark_t *m, int ti) {
     mk_track_t *t = &m->t[ti];
     m->undo_track = ti;
@@ -411,7 +422,7 @@ static void solo_stop_others(mark_t *m, int ti) {
         if (i == ti) continue;
         mk_track_t *o = &m->t[i];
         if (o->st == MK_PLAY || o->st == MK_DUB) {
-            if (o->st == MK_DUB) m->undo_capturing = 0;
+            if (o->st == MK_DUB) end_dub_capture(m, i);
             o->st = MK_STOP;
             o->pos = 0.0;
         }
@@ -538,7 +549,7 @@ static void track_button(mark_t *m, int ti) {
         break;
     case MK_DUB:
         t->st = MK_PLAY;
-        m->undo_capturing = 0;
+        end_dub_capture(m, ti);
         m->edit_rev++;
         break;
     case MK_STOP:
@@ -558,7 +569,7 @@ static void track_stop(mark_t *m, int ti) {
         break;
     case MK_PLAY:
     case MK_DUB:
-        if (t->st == MK_DUB) m->undo_capturing = 0;
+        if (t->st == MK_DUB) end_dub_capture(m, ti);
         t->st = MK_STOP;
         t->pos = 0.0;
         m->edit_rev++;
@@ -587,7 +598,7 @@ static void track_trim(mark_t *m, int ti, int delta) {
     if (nl < 64) nl = 64;
     if (t->st == MK_DUB) {   /* dub write head would cross the new edge */
         t->st = MK_PLAY;
-        m->undo_capturing = 0;
+        end_dub_capture(m, ti);
     }
     if (m->undo_track == ti) reset_undo(m);   /* indexes tied to old len */
     t->len = nl;
@@ -611,7 +622,7 @@ static void track_setlen16(mark_t *m, int ti, int n16) {
     if (nl == t->len) return;
     if (t->st == MK_DUB) {
         t->st = MK_PLAY;
-        m->undo_capturing = 0;
+        end_dub_capture(m, ti);
     }
     if (m->undo_track == ti) reset_undo(m);
     t->len = nl;
@@ -630,6 +641,7 @@ static void track_clear(mark_t *m, int ti) {
     t->rec_target = 0;
     t->pending = 0;
     t->pos = 0.0;
+    track_fx_reset(t);
     if (m->undo_track == ti) reset_undo(m);
     if (!any_content(m)) {
         m->grid_unit = 0.0;
@@ -649,7 +661,7 @@ static void all_button(mark_t *m) {
             t->pending = 0;
             if (t->st == MK_REC) request_finish(m, i, MK_STOP);
             else if (t->st == MK_PLAY || t->st == MK_DUB) {
-                if (t->st == MK_DUB) m->undo_capturing = 0;
+                if (t->st == MK_DUB) end_dub_capture(m, i);
                 t->st = MK_STOP;
                 t->pos = 0.0;
             }
@@ -783,12 +795,92 @@ static long wav_read(const char *path, int16_t *data, uint32_t max_frames) {
     return frames;
 }
 
+/* Validate the complete file before a load is allowed to detach the live
+ * performance. In addition to the RIFF tags, verify the PCM format and that
+ * the declared data chunk is actually present on disk. */
+static int wav_probe(const char *path, uint32_t *frames_out) {
+    FILE *f = fopen(path, "rb");
+    struct stat st;
+    if (!f || stat(path, &st) != 0) { if (f) fclose(f); return -1; }
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) ||
+        memcmp(h + 8, "WAVE", 4)) {
+        fclose(f);
+        return -1;
+    }
+    int fmt_ok = 0, data_ok = 0;
+    uint32_t data_frames = 0;
+    uint8_t chdr[8];
+    while (fread(chdr, 1, 8, f) == 8) {
+        uint32_t sz;
+        memcpy(&sz, chdr + 4, 4);
+        long payload = ftell(f);
+        if (payload < 0 || (uint64_t)payload + sz > (uint64_t)st.st_size) break;
+        if (!memcmp(chdr, "fmt ", 4)) {
+            uint8_t fmt[16];
+            if (sz < sizeof(fmt) || fread(fmt, 1, sizeof(fmt), f) != sizeof(fmt)) break;
+            uint16_t pcm, channels, align, bits;
+            uint32_t sr;
+            memcpy(&pcm, fmt, 2); memcpy(&channels, fmt + 2, 2);
+            memcpy(&sr, fmt + 4, 4); memcpy(&align, fmt + 12, 2);
+            memcpy(&bits, fmt + 14, 2);
+            fmt_ok = pcm == 1 && channels == 2 && sr == MARK_SR &&
+                     align == 4 && bits == 16;
+        } else if (!memcmp(chdr, "data", 4)) {
+            if ((sz & 3u) != 0) break;
+            data_frames = sz / 4;
+            data_ok = 1;
+        }
+        long next = payload + (long)((sz + 1u) & ~1u);
+        if (fseek(f, next, SEEK_SET) != 0) break;
+    }
+    fclose(f);
+    if (!fmt_ok || !data_ok) return -1;
+    *frames_out = data_frames;
+    return 0;
+}
+
 typedef struct { mark_t *m; int slot; int op; /* 1 save, 2 load */ } mk_job_t;
 
 static void session_path(const mark_t *m, int slot, const char *file,
                          char *buf, size_t len) {
     snprintf(buf, len, "%s/slot%02d%s%s", m->session_dir, slot,
              file ? "/" : "", file ? file : "");
+}
+
+static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
+    char path[320];
+    session_path(m, slot, "session.json", path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(js, 1, cap - 1, f);
+    int bad = ferror(f) || (n == cap - 1 && !feof(f));
+    fclose(f);
+    js[n] = 0;
+    if (bad || !strstr(js, "\"v\":") || !strchr(js, '}')) return -1;
+    return 0;
+}
+
+/* Header-only preflight runs before live tracks are cleared. Missing,
+ * truncated, or incompatible session files therefore leave the current
+ * loops and mixer settings untouched. */
+static int session_preflight(const mark_t *m, int slot) {
+    char js[2048], path[320];
+    if (session_read_json(m, slot, js, sizeof(js)) != 0) return -1;
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        char k[8], wname[16];
+        snprintf(k, sizeof(k), "l%d", i + 1);
+        long lval = json_int(js, k, 0);
+        snprintf(k, sizeof(k), "F%d", i + 1);
+        long want = lval > 0 ? json_int(js, k, (int)lval) : 0;
+        if (lval < 0 || want < lval || want > (long)m->track_frames) return -1;
+        if (want == 0) continue;
+        snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+        session_path(m, slot, wname, path, sizeof(path));
+        uint32_t have = 0;
+        if (wav_probe(path, &have) != 0 || have < (uint32_t)want) return -1;
+    }
+    return 0;
 }
 
 static void *io_worker(void *arg) {
@@ -801,8 +893,22 @@ static void *io_worker(void *arg) {
         mkdir(m->session_dir, 0755);
         session_path(m, job->slot, NULL, path, sizeof(path));
         mkdir(path, 0755);
-        session_path(m, job->slot, "session.json", path, sizeof(path));
-        FILE *f = fopen(path, "w");
+        /* Stage every payload first. session.json is renamed last, so a
+         * failed write never advertises an incomplete new session. */
+        for (int i = 0; i < MARK_TRACKS && !err; i++) {
+            char wname[20];
+            snprintf(wname, sizeof(wname), "t%d.wav.tmp", i + 1);
+            session_path(m, job->slot, wname, path, sizeof(path));
+            if (m->t[i].len > 0) {
+                uint32_t wf = m->t[i].full_len > m->t[i].len
+                                ? m->t[i].full_len : m->t[i].len;
+                if (wav_write(path, m->t[i].buf, wf) != 0) err = 1;
+            } else {
+                unlink(path);
+            }
+        }
+        session_path(m, job->slot, "session.json.tmp", path, sizeof(path));
+        FILE *f = err ? NULL : fopen(path, "w");
         if (!f) {
             err = 1;
         } else {
@@ -813,40 +919,51 @@ static void *io_worker(void *arg) {
                     m->follow);
             for (int i = 0; i < MARK_TRACKS; i++) {
                 const mk_track_t *t = &m->t[i];
+                uint32_t full = t->len > 0
+                    ? (t->full_len > t->len ? t->full_len : t->len) : 0;
                 fprintf(f, ",\"l%d\":%u,\"F%d\":%u,\"v%d\":%d,\"p%d\":%d,"
                            "\"r%d\":%d,\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,"
                            "\"g%d\":%d",
-                        i + 1, t->len, i + 1, t->full_len, i + 1, t->level,
+                        i + 1, t->len, i + 1, full, i + 1, t->level,
                         i + 1, t->pan, i + 1, t->rev, i + 1, t->shot,
                         i + 1, t->fx, i + 1, t->fx_on, i + 1, t->fxp);
             }
             fprintf(f, "}");
             if (fclose(f) != 0) err = 1;
-            for (int i = 0; i < MARK_TRACKS && !err; i++) {
-                char wname[16];
-                snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
-                session_path(m, job->slot, wname, path, sizeof(path));
-                if (m->t[i].len > 0) {
-                    /* write the FULL finalized loop — a trim is metadata,
-                     * so re-lengthening still works after a reload */
-                    uint32_t wf = m->t[i].full_len > m->t[i].len
-                                    ? m->t[i].full_len : m->t[i].len;
-                    if (wav_write(path, m->t[i].buf, wf) != 0) err = 1;
-                } else {
-                    unlink(path);   /* drop a stale wav from an older save */
-                }
+        }
+        for (int i = 0; i < MARK_TRACKS && !err; i++) {
+            char wtmp[20], wname[16], tmppath[320], finalpath[320];
+            snprintf(wtmp, sizeof(wtmp), "t%d.wav.tmp", i + 1);
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, job->slot, wtmp, tmppath, sizeof(tmppath));
+            session_path(m, job->slot, wname, finalpath, sizeof(finalpath));
+            if (m->t[i].len > 0) {
+                if (rename(tmppath, finalpath) != 0) err = 1;
+            } else {
+                unlink(finalpath);
+            }
+        }
+        if (!err) {
+            char tmppath[320], finalpath[320];
+            session_path(m, job->slot, "session.json.tmp", tmppath, sizeof(tmppath));
+            session_path(m, job->slot, "session.json", finalpath, sizeof(finalpath));
+            if (rename(tmppath, finalpath) != 0) err = 1;
+        }
+        if (err) {
+            session_path(m, job->slot, "session.json.tmp", path, sizeof(path));
+            unlink(path);
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                char wtmp[20];
+                snprintf(wtmp, sizeof(wtmp), "t%d.wav.tmp", i + 1);
+                session_path(m, job->slot, wtmp, path, sizeof(path));
+                unlink(path);
             }
         }
     } else {              /* ---- load ---- */
         char js[2048];
-        session_path(m, job->slot, "session.json", path, sizeof(path));
-        FILE *f = fopen(path, "r");
-        if (!f) {
+        if (session_read_json(m, job->slot, js, sizeof(js)) != 0) {
             err = 1;
         } else {
-            size_t n = fread(js, 1, sizeof(js) - 1, f);
-            js[n] = 0;
-            fclose(f);
             long gu = json_int(js, "gu", 0);
             m->quantize   = json_int(js, "q", 1) ? 1 : 0;
             m->rec_grid   = clampi(json_int(js, "gd", 0), 0, 3);
@@ -879,7 +996,7 @@ static void *io_worker(void *arg) {
                 snprintf(k, sizeof(k), "l%d", i + 1);
                 long lval = json_int(js, k, 0);
                 snprintf(k, sizeof(k), "F%d", i + 1);
-                long want = json_int(js, k, lval);   /* full loop in the wav */
+                long want = lval > 0 ? json_int(js, k, (int)lval) : 0;
                 if (want < lval) want = lval;
                 if (want > (long)m->track_frames) want = (long)m->track_frames;
                 if (want > 0) {
@@ -887,12 +1004,15 @@ static void *io_worker(void *arg) {
                     snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
                     session_path(m, job->slot, wname, path, sizeof(path));
                     long got = wav_read(path, t->buf, (uint32_t)want);
-                    if (got > 0) {
+                    if (got == want) {
                         t->full_len = (uint32_t)got;
                         t->len = (lval > 0 && lval <= got) ? (uint32_t)lval
                                                            : (uint32_t)got;
                         t->pos = 0.0;
                         t->st = MK_STOP;   /* set last: render gates on it */
+                    } else {
+                        err = 1;
+                        break;
                     }
                 }
             }
@@ -910,16 +1030,34 @@ static void *io_worker(void *arg) {
 static void session_start(mark_t *m, int slot, int op) {
     if (m->io_busy || slot < 1 || slot > MARK_SESSION_SLOTS) return;
     if (!m->session_dir[0]) { m->io_error = 1; return; }
+    if (m->io_thread_valid) {
+        pthread_join(m->io_thread, NULL);
+        m->io_thread_valid = 0;
+    }
+    mk_job_t *job = malloc(sizeof(mk_job_t));
+    if (!job) { m->io_error = 1; return; }
+    job->m = m;
+    job->slot = slot;
+    job->op = op;
     if (op == 2) {
-        /* silence + detach every track before the worker touches buffers */
+        if (session_preflight(m, slot) != 0) {
+            m->io_error = 1;
+            m->edit_rev++;
+            free(job);
+            return;
+        }
+        /* Validation succeeded. Silence + detach every track before the
+         * worker touches buffers, preserving the render-thread contract. */
         for (int i = 0; i < MARK_TRACKS; i++) {
             mk_track_t *t = &m->t[i];
             t->st = MK_EMPTY;
             t->len = 0;
+            t->full_len = 0;
             t->pos = 0.0;
             t->rec_len = 0;
             t->rec_target = 0;
             t->pending = 0;
+            track_fx_reset(t);
         }
         reset_undo(m);
         m->grid_unit = 0.0;
@@ -931,7 +1069,7 @@ static void session_start(mark_t *m, int slot, int op) {
             mk_track_t *t = &m->t[i];
             if (t->st == MK_DUB) {
                 t->st = MK_PLAY;
-                m->undo_capturing = 0;
+                end_dub_capture(m, i);
             } else if (t->st == MK_REC) {
                 uint32_t final_len = t->rec_len;
                 double g = effective_grid(m);
@@ -941,28 +1079,32 @@ static void session_start(mark_t *m, int slot, int op) {
             }
         }
     }
-    mk_job_t *job = malloc(sizeof(mk_job_t));
-    if (!job) { m->io_error = 1; return; }
-    job->m = m;
-    job->slot = slot;
-    job->op = op;
     m->io_error = 0;
     m->io_busy = op;
     m->edit_rev++;
-    pthread_t th;
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&th, &at, io_worker, job) != 0) {
-        m->io_busy = 0;
-        m->io_error = 1;
-        free(job);
+    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
+        /* Thread exhaustion must not strand a validated load after its live
+         * tracks were detached. Complete the same job synchronously. */
+        io_worker(job);
+    } else {
+        m->io_thread_valid = 1;
     }
-    pthread_attr_destroy(&at);
 }
 
 /* Track FX: one insert per track, applied post-read / pre-fader. Filter
  * coefficients recompute lazily on the render thread when fx_dirty. */
+static void track_fx_reset(mk_track_t *t) {
+    t->bqL.z1 = t->bqL.z2 = t->bqR.z1 = t->bqR.z2 = 0.0f;
+    t->crush_cnt = 0;
+    t->crush_l = t->crush_r = 0.0f;
+    if (t->dly) memset(t->dly, 0, (size_t)MARK_DLY_LEN * 2 * sizeof(float));
+    t->dly_w = 0;
+    t->ph_lfo = 0.0f;
+    memset(t->ph_x, 0, sizeof(t->ph_x));
+    memset(t->ph_y, 0, sizeof(t->ph_y));
+    t->rm_phase = 0.0f;
+}
+
 static void track_fx_prepare(mk_track_t *t) {
     if (!t->fx_dirty) return;
     t->fx_dirty = 0;
@@ -970,12 +1112,10 @@ static void track_fx_prepare(mk_track_t *t) {
     case TFX_LPF:
         bq_set(&t->bqL, 60.0f * powf(2.0f, (float)t->fxp * 0.075f), 0, 0.9f);
         t->bqR = t->bqL;
-        t->bqL.z1 = t->bqL.z2 = t->bqR.z1 = t->bqR.z2 = 0.0f;
         break;
     case TFX_HPF:
         bq_set(&t->bqL, 40.0f * powf(2.0f, (float)t->fxp * 0.08f), 1, 0.9f);
         t->bqR = t->bqL;
-        t->bqL.z1 = t->bqL.z2 = t->bqR.z1 = t->bqR.z2 = 0.0f;
         break;
     default: break;
     }
@@ -1106,8 +1246,21 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                 continue;
             }
 
-            if ((t->st != MK_PLAY && t->st != MK_DUB) || t->len == 0 || paused)
+            if ((t->st != MK_PLAY && t->st != MK_DUB) || t->len == 0 || paused) {
+                /* Delay is the one track FX with an audible tail. Keep its
+                 * feedback network advancing after a per-track stop instead
+                 * of freezing stale audio for the next restart. */
+                if (!paused && t->st == MK_STOP && t->len > 0 &&
+                    t->fx_on && t->fx == TFX_DELAY && m->swap_track != i) {
+                    float l = 0.0f, r = 0.0f;
+                    track_fx_run(m, t, &l, &r);
+                    float gt = (float)t->level / 100.0f;
+                    t->g_cur += (gt - t->g_cur) * 0.002f;
+                    outl += l * t->g_cur * t->pg[0];
+                    outr += r * t->g_cur * t->pg[1];
+                }
                 continue;
+            }
             if (m->swap_track == i)   /* undo swap in flight: track muted */
                 continue;
 
@@ -1146,7 +1299,7 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
             if (t->pos >= (double)t->len) {
                 t->pos = 0.0;
                 if (t->shot) {       /* one-shot: play once, then stop */
-                    if (t->st == MK_DUB) m->undo_capturing = 0;
+                    if (t->st == MK_DUB) end_dub_capture(m, i);
                     t->st = MK_STOP;
                 }
             }
@@ -1165,6 +1318,7 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
 void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!m || !key || !val) return;
+    if (m->io_busy) return;
 
     /* per-track keys: t<1-5>_... */
     if (key[0] == 't' && key[1] >= '1' && key[1] <= '5' && key[2] == '_') {
@@ -1182,19 +1336,28 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
             t->rev = atoi(val) ? 1 : 0;
             if (t->rev && t->st == MK_DUB) {   /* RC rule: no dub while reversed */
                 t->st = MK_PLAY;
-                m->undo_capturing = 0;
+                end_dub_capture(m, ti);
             }
             m->edit_rev++;
             return;
         }
         if (!strcmp(k, "shot"))  { t->shot = atoi(val) ? 1 : 0; m->edit_rev++; return; }
         if (!strcmp(k, "fx")) {
-            t->fx = clampi(atoi(val), 0, TFX_COUNT - 1);
+            int fx = clampi(atoi(val), 0, TFX_COUNT - 1);
+            if (fx != t->fx) track_fx_reset(t);
+            t->fx = fx;
             t->fx_dirty = 1;
             m->edit_rev++;
             return;
         }
-        if (!strcmp(k, "fx_on")) { t->fx_on = atoi(val) ? 1 : 0; t->fx_dirty = 1; m->edit_rev++; return; }
+        if (!strcmp(k, "fx_on")) {
+            int on = atoi(val) ? 1 : 0;
+            if (on != t->fx_on) track_fx_reset(t);
+            t->fx_on = on;
+            t->fx_dirty = 1;
+            m->edit_rev++;
+            return;
+        }
         if (!strcmp(k, "fxp"))   { t->fxp = clampi(atoi(val), 0, 100); t->fx_dirty = 1; m->edit_rev++; return; }
         return;
     }
@@ -1291,8 +1454,20 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
                 case 1: t->pan = clampi((int)v, 0, 100); update_track_gains(t); break;
                 case 2: t->rev = v ? 1 : 0; break;
                 case 3: t->shot = v ? 1 : 0; break;
-                case 4: t->fx = clampi((int)v, 0, TFX_COUNT - 1); t->fx_dirty = 1; break;
-                case 5: t->fx_on = v ? 1 : 0; t->fx_dirty = 1; break;
+                case 4: {
+                    int fx = clampi((int)v, 0, TFX_COUNT - 1);
+                    if (fx != t->fx) track_fx_reset(t);
+                    t->fx = fx;
+                    t->fx_dirty = 1;
+                    break;
+                }
+                case 5: {
+                    int on = v ? 1 : 0;
+                    if (on != t->fx_on) track_fx_reset(t);
+                    t->fx_on = on;
+                    t->fx_dirty = 1;
+                    break;
+                }
                 case 6: t->fxp = clampi((int)v, 0, 100); t->fx_dirty = 1; break;
                 }
                 arr = (*end == ',') ? end + 1 : end;

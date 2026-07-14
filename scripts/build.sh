@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-
 EOF
 fi
 
+rm -rf build/modules/overtake/mark
 mkdir -p build/modules/overtake/mark
 cp modules/overtake/mark/module.json build/modules/overtake/mark/
 cp src/ui_overtake.js build/modules/overtake/mark/ui.js
@@ -40,5 +41,13 @@ docker run --rm -v "$PWD":/w -w /w "$IMAGE" bash -c "
     echo 'tarball contents:'
     tar -tzf build/mark-module.tar.gz
 "
+
+for member in mark/module.json mark/dsp.so mark/ui.js mark/help.json mark/web_ui.html; do
+    tar -tzf build/mark-module.tar.gz "$member" >/dev/null
+done
+if tar -tzf build/mark-module.tar.gz | grep -Eq '(^|/)(\._|\.DS_Store)'; then
+    echo "Unexpected macOS metadata in build/mark-module.tar.gz" >&2
+    exit 1
+fi
 
 echo "Built: build/mark-module.tar.gz"
