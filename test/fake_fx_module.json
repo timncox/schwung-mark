@@ -1,0 +1,23 @@
+{
+  "id": "testfx",
+  "name": "Test Gain",
+  "version": "1.0.0",
+  "dsp": "testfx.so",
+  "api_version": 2,
+  "component_type": "audio_fx",
+  "capabilities": {
+    "chainable": true,
+    "component_type": "audio_fx",
+    "ui_hierarchy": {
+      "levels": {
+        "root": {
+          "name": "Test Gain",
+          "params": [
+            {"key":"gain","name":"Gain","type":"int","min":0,"max":100,"step":5,"default":50}
+          ],
+          "knobs": ["gain"]
+        }
+      }
+    }
+  }
+}

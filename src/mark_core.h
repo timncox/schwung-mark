@@ -39,6 +39,9 @@ typedef enum {
 typedef struct mark mark_t;
 
 mark_t *mark_create(const host_api_v1_t *host);
+/* Production constructor: module_dir lets Mark discover sibling
+ * modules/audio_fx entries. mark_create() remains the no-catalog test API. */
+mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir);
 void    mark_destroy(mark_t *m);
 
 /* Process one block, stereo interleaved int16. in and out may alias. */

@@ -286,8 +286,8 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T4</div><div class="kv">track 4 level<br>0–200</div></div>
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T5</div><div class="kv">track 5 level<br>0–200</div></div>
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">MST</div><div class="kv">master level<br>0–200</div></div>
-    <div class="knob"><div class="dial" style="--r:-45deg"></div><div class="kn">FX</div><div class="kv">FX type<br>current track</div></div>
-    <div class="knob"><div class="dial" style="--r:45deg"></div><div class="kn">AMT</div><div class="kv">FX amount<br>0–100</div></div>
+    <div class="knob"><div class="dial" style="--r:-45deg"></div><div class="kn">FX</div><div class="kv">built-in or installed<br>Schwung FX</div></div>
+    <div class="knob"><div class="dial" style="--r:45deg"></div><div class="kn">AMT</div><div class="kv">amount / first<br>module parameter</div></div>
   </div>
   <p class="klayer">Hold <b>SHIFT</b> — <b>Pan 1–5 · Monitor · Transport follow · BPM override</b> (49 = off, project tempo)</p>
   <div class="note"><b>"Current track"</b> for the FX knobs is simply the last
@@ -300,9 +300,15 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
   <div class="snum">04 · Track FX</div>
   <h2 class="sh">One insert per track</h2>
   <p>Each track carries one insert effect, toggled from the row-4 pad and
-  shaped by knobs 7–8. Type and amount are saved with sessions. Full control —
-  including while other tracks record — lives in the <a href="#mixer">web
-  mixer</a>.</p>
+  shaped by knobs 7–8. Alongside Mark's built-ins, knob 7 lists every installed
+  chainable Schwung Audio FX v2 module. Hold that track's FX pad to open the
+  module's root page: knobs 1–8 follow the same map it advertises to Schwung.
+  Hold again to return. The <a href="#mixer">web mixer</a> builds the same
+  controls automatically.</p>
+  <div class="note"><b>Native Schwung hosting.</b> The module loads off the
+  audio thread, swaps in at a block boundary, processes post-loop / pre-fader,
+  receives Move's MIDI clock, and keeps tails running after the track stops.
+  Sessions restore both the module and its settings.</div>
   <div class="fxgrid">
     <div class="fxcard" style="--fc:#33cc66"><div class="fn">Low-pass</div>
       <div class="fd">Darkens the track; resonant sweepable cutoff.</div>

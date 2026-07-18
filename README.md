@@ -34,21 +34,25 @@ Rows counted from the top, as you look at the device:
 | **Row 1 (top)** | REC / PLAY / DUB | All start/stop | Undo/redo | Monitor |
 | **Row 2** | Stop (hold = clear) | Quantize | Rec→Play / Rec→Dub | Overdub / Replace |
 | **Row 3** | Reverse | Play mode (multi/single) | Sessions | — |
-| **Row 4 (bottom)** | FX on/off (Shift = one-shot) | — | — | — |
+| **Row 4 (bottom)** | FX on/off (hold = FX controls; Shift = one-shot) | — | — | — |
 
 Track button colors: dim = empty, **red** = recording, **green** =
 playing, **yellow** = overdubbing, **white** = stopped, blinking =
 waiting for the next measure.
 
 Knobs 1–5 = track levels, knob 6 / jog wheel = master, knob 7 = FX type
-and knob 8 = FX amount for the last track touched. Hold **Shift**:
+(built-ins followed by installed Schwung Audio FX), and knob 8 = FX amount
+or the hosted module's first parameter. Hold a track's bottom FX pad to open
+its module controls; knobs 1–8 then follow that module's root knob map. Hold **Shift**:
 knobs 1–5 = pans, 6 = monitor, 7 = transport follow, 8 = BPM override.
 Steps 1–16 chase the base loop's playhead — or show the 16 **session
 slots** while session mode is on (tap = load, hold = save; sessions
 store loop audio + settings on the Move and survive reinstalls).
 
 **Track FX**: one insert per track — low-pass, high-pass, crush,
-tempo-synced delay, phaser, ring mod. **Single mode** makes the five
+tempo-synced delay, phaser, ring mod, or any installed chainable Schwung
+Audio FX v2 module. Loading happens off the audio thread and swaps at a block
+boundary; sessions restore the selected module and its settings. **Single mode** makes the five
 tracks exclusive song sections. The **web mixer** (move.local → Remote
 UI → Tool tab, manager > v0.11.4) has faders, pans, FX, modes, and the
 session grid.

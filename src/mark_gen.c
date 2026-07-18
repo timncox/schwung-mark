@@ -16,8 +16,8 @@
 static const host_api_v1_t *g_host;
 
 static void *gen_create(const char *module_dir, const char *json_defaults) {
-    (void)module_dir; (void)json_defaults;
-    mark_t *m = mark_create(g_host);
+    (void)json_defaults;
+    mark_t *m = mark_create_in_dir(g_host, module_dir);
     /* this build reads the hardware input directly — the UI keys its
      * feedback guard off this flag */
     if (m) {
