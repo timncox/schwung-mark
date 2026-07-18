@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MARK — Operation Manual</title>
-<meta name="description" content="Operation manual for Mark, a schwung module for the Ableton Move: an RC-505-style 5-track live loop station with sessions, track FX, and a web mixer.">
+<meta name="description" content="Operation manual for Mark v0.4.0, a five-track Ableton Move loop station with sessions, sync, a web mixer, and hosted Schwung Audio FX.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔁</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -61,6 +61,10 @@ h1.title{font-family:var(--disp);font-weight:900;line-height:.85;
 .chip b{color:var(--ink);font-weight:400}
 .lede{max-width:660px;margin-top:28px;font-size:18px}
 .lede em{color:var(--acc);font-style:normal}
+.release{display:inline-flex;align-items:center;flex-wrap:wrap;max-width:100%;gap:10px;margin-top:24px;padding:9px 13px;
+  border:1px solid rgba(77,208,106,.45);border-radius:6px;background:rgba(77,208,106,.08);
+  color:var(--ink);font-family:var(--mono);font-size:11px;letter-spacing:.04em}
+.release b{color:var(--acc);font-weight:700}
 section{padding:56px 0;border-top:1px solid var(--line)}
 .snum{font-family:var(--mono);font-size:11px;letter-spacing:.24em;color:var(--acc);
   text-transform:uppercase;margin-bottom:8px}
@@ -166,11 +170,12 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
   <div class="kicker">A schwung module for the Ableton Move</div>
   <h1 class="title">Mark</h1>
   <div class="subtitle"><h2>Five-track loop station</h2></div>
+  <div class="release"><b>NEW · v0.4.0</b> Host your installed Schwung Audio FX inside any loop track</div>
   <div class="chips">
     <span class="chip"><b>5</b> stereo loop tracks</span>
     <span class="chip">record · play · overdub</span>
     <span class="chip"><b>16</b> save sessions</span>
-    <span class="chip">track FX</span>
+    <span class="chip">built-in + Schwung track FX</span>
     <span class="chip">web mixer</span>
     <span class="chip">RC-505 workflow</span>
   </div>
@@ -286,8 +291,8 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T4</div><div class="kv">track 4 level<br>0–200</div></div>
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">T5</div><div class="kv">track 5 level<br>0–200</div></div>
     <div class="knob"><div class="dial" style="--r:0deg"></div><div class="kn">MST</div><div class="kv">master level<br>0–200</div></div>
-    <div class="knob"><div class="dial" style="--r:-45deg"></div><div class="kn">FX</div><div class="kv">FX type<br>current track</div></div>
-    <div class="knob"><div class="dial" style="--r:45deg"></div><div class="kn">AMT</div><div class="kv">FX amount<br>0–100</div></div>
+    <div class="knob"><div class="dial" style="--r:-45deg"></div><div class="kn">FX</div><div class="kv">built-in or installed<br>Schwung FX</div></div>
+    <div class="knob"><div class="dial" style="--r:45deg"></div><div class="kn">AMT</div><div class="kv">amount / first<br>module parameter</div></div>
   </div>
   <p class="klayer">Hold <b>SHIFT</b> — <b>Pan 1–5 · Monitor · Transport follow · BPM override</b> (49 = off, project tempo)</p>
   <div class="note"><b>"Current track"</b> for the FX knobs is simply the last
@@ -300,9 +305,16 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
   <div class="snum">04 · Track FX</div>
   <h2 class="sh">One insert per track</h2>
   <p>Each track carries one insert effect, toggled from the row-4 pad and
-  shaped by knobs 7–8. Type and amount are saved with sessions. Full control —
-  including while other tracks record — lives in the <a href="#mixer">web
-  mixer</a>.</p>
+  shaped by knobs 7–8. Knob 7 moves through Off, LPF, HPF, Crush, Delay,
+  Phaser, Ring, then every installed chainable Schwung Audio FX v2 module.
+  Hold that track's FX pad for 0.6 seconds to open the module's root page:
+  knobs 1–8 follow the same map it advertises to Schwung.
+  Hold again to return. The <a href="#mixer">web mixer</a> builds the same
+  controls automatically.</p>
+  <div class="note"><b>Native Schwung hosting.</b> The module loads off the
+  audio thread, swaps in at a block boundary, processes post-loop / pre-fader,
+  receives Move's MIDI clock, and keeps tails running after the track stops.
+  Sessions restore both the module and its settings.</div>
   <div class="fxgrid">
     <div class="fxcard" style="--fc:#33cc66"><div class="fn">Low-pass</div>
       <div class="fd">Darkens the track; resonant sweepable cutoff.</div>
@@ -421,9 +433,10 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between}
 <section id="install"><div class="wrap">
   <div class="snum">09 · Install & spec</div>
   <h2 class="sh">Get it on your Move</h2>
-  <p>In <b>schwung-manager</b>: Install Custom Module → paste
-  <code>https://github.com/timncox/schwung-mark</code> — or upload
-  <code>mark-module.tar.gz</code> from the
+  <p>Open <b>schwung-manager</b> at <code>move.local:7700</code>, open the
+  Module Store, search for <b>Mark</b>, then choose Install or Update.
+  For a manual install, paste <code>https://github.com/timncox/schwung-mark</code>
+  under Install Custom Module, or upload <code>mark-module.tar.gz</code> from the
   <a href="https://github.com/timncox/schwung-mark/releases">latest release</a>.
   Requires <a href="https://github.com/charlesvestal/schwung">schwung</a> on
   your Move.</p>

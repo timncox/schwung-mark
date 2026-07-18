@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 #include "../src/mark_core.h"
@@ -567,6 +569,112 @@ static void wait_io(mark_t *m) {
     assert(!"session i/o never finished");
 }
 
+static void wait_fx(mark_t *m, int track, int wanted) {
+    char key[32];
+    snprintf(key, sizeof(key), "t%d_fx_status", track + 1);
+    for (int spin = 0; spin < 4000; spin++) {
+        int16_t in[BLOCK * 2] = {0}, out[BLOCK * 2];
+        mark_process(m, in, out, BLOCK);
+        g_in_frame += BLOCK;
+        if (gp_int(m, key) == wanted) return;
+        usleep(1000);
+    }
+    assert(!"hosted fx load never finished");
+}
+
+typedef struct {
+    mark_t *m;
+    _Atomic int stop;
+} fx_reader_race_t;
+
+static void *fx_reader_race(void *arg) {
+    fx_reader_race_t *race = (fx_reader_race_t *)arg;
+    uint8_t tick = 0xF8;
+    char buf[64];
+    while (!atomic_load_explicit(&race->stop, memory_order_acquire)) {
+        (void)mark_get_param(race->m, "t1_mod_gain", buf, sizeof(buf));
+        mark_on_midi(race->m, &tick, 1, 0);
+    }
+    return NULL;
+}
+
+static void test_hosted_schwung_fx(void) {
+    mark_t *m = mark_create_in_dir(&host, "build/test-modules/overtake/mark");
+    assert(m);
+    g_in_frame = 0;
+
+    char buf[2048];
+    gp_str(m, "fx_catalog", buf, sizeof(buf));
+    assert(strstr(buf, "testfx|Test Gain"));
+
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+    mark_set_param(m, "t1_btn", "1");
+    run(m, 2048, 2, NULL);                    /* constant-1000 loop */
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t1_fx_module", "testfx");
+    mark_set_param(m, "t1_fx_on", "1");
+    wait_fx(m, 0, 2);
+
+    /* Control/MIDI readers must never outlive an instance retired at the
+     * next audio-block swap. This used to leave a narrow use-after-dlclose
+     * window that crashed MoveOriginal through an invalid function pointer. */
+    fx_reader_race_t race = {.m = m};
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, fx_reader_race, &race) == 0);
+    for (int i = 0; i < 24; i++) {
+        mark_set_param(m, "t1_fx_module", "");
+        wait_fx(m, 0, 0);
+        mark_set_param(m, "t1_fx_module", "testfx");
+        wait_fx(m, 0, 2);
+    }
+    atomic_store_explicit(&race.stop, 1, memory_order_release);
+    pthread_join(reader, NULL);
+
+    gp_str(m, "t1_fx_module", buf, sizeof(buf));
+    assert(!strcmp(buf, "testfx"));
+    gp_str(m, "t1_mod_hierarchy", buf, sizeof(buf));
+    assert(strstr(buf, "\"gain\""));
+
+    mark_set_param(m, "t1_mod_gain", "25");
+    assert(gp_int(m, "t1_mod_gain") == 25);
+    int16_t out[BLOCK * 2];
+    run(m, BLOCK, 1, out);
+    for (int i = 0; i < BLOCK * 2; i++) assert(out[i] == 250);
+
+    /* MARK sessions retain both the selected module and its normal state
+     * blob, not just the built-in effect code. */
+    char dir[] = "/tmp/mark-fx-sess-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    mark_set_param(m, "session_dir", dir);
+    mark_set_param(m, "save_session", "1");
+    wait_io(m);
+    mark_set_param(m, "t1_mod_gain", "80");
+    mark_set_param(m, "t1_fx_module", "");
+    wait_fx(m, 0, 0);
+    mark_set_param(m, "load_session", "1");
+    wait_io(m);
+    wait_fx(m, 0, 2);
+    gp_str(m, "t1_fx_module", buf, sizeof(buf));
+    assert(!strcmp(buf, "testfx"));
+    assert(gp_int(m, "t1_mod_gain") == 25);
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+
+    /* Bypass is dry, and returning to a built-in unloads the shared object
+     * without doing dlclose/destroy work in the render callback. */
+    mark_set_param(m, "t1_fx_on", "0");
+    run(m, BLOCK, 1, out);
+    for (int i = 0; i < BLOCK * 2; i++) assert(out[i] == 1000);
+    mark_set_param(m, "t1_fx_module", "");
+    wait_fx(m, 0, 0);
+    gp_str(m, "t1_fx_active", buf, sizeof(buf));
+    assert(buf[0] == '\0');
+
+    mark_destroy(m);
+    printf("ok: hosted Schwung audio FX load/param/bypass/unload\n");
+}
+
 static void test_sessions(void) {
     char dir[] = "/tmp/mark-sess-XXXXXX";
     assert(mkdtemp(dir) != NULL);
@@ -811,6 +919,7 @@ int main(void) {
     test_undo_capture_ownership();
     test_track_fx();
     test_delay_timing_and_tail();
+    test_hosted_schwung_fx();
     test_sessions();
     test_rui_poll();
     test_grid_and_trim();

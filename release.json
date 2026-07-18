@@ -1,4 +1,7 @@
 {
-  "version": "0.3.3",
-  "download_url": "https://github.com/timncox/schwung-mark/releases/download/v0.3.3/mark-module.tar.gz"
+  "version": "0.4.0",
+  "download_url": "https://github.com/timncox/schwung-mark/releases/download/v0.4.0/mark-module.tar.gz",
+  "name": "Mark",
+  "description": "Five-track live loop station with per-track recording, sessions, sync, and built-in or hosted Schwung Audio FX",
+  "repo_url": "https://github.com/timncox/schwung-mark"
 }

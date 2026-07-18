@@ -15,11 +15,14 @@
  *               81 PLAY MODE (multi / single = song sections)
  *               82 SESSION MODE: steps become save slots 1-16
  *                  (tap a slot = load, hold = save)
- *   Row 4 (btm) 68-72  track FX on/off; Shift+tap = one-shot toggle
+ *   Row 4 (btm) 68-72  track FX on/off; hold = hosted-FX edit;
+ *                      Shift+tap = one-shot toggle
  *   Steps 1-16        playhead chase of the base loop; session slots
  *                     while session mode is on
  *   Knobs 1-5         track levels     Knob 6 master
- *   Knob 7            current track's FX type   Knob 8 its FX amount
+ *   Knob 7            current track's FX type (built-ins + Schwung FX)
+ *   Knob 8            built-in amount / hosted FX first parameter
+ *   Hosted-FX edit    knobs 1-8 follow the module's root knob map
  *   Shift+Knobs 1-5   track pans       6 monitor  7 follow  8 BPM override
  *   Jog wheel         master level
  *   Play button       passed through to Move (transport + clock keep working)
@@ -34,7 +37,7 @@ import {
     Cyan, Purple, YellowGreen, OrangeRed
 } from '/data/UserData/schwung/shared/constants.mjs';
 
-import { decodeDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
+import { decodeDelta, decodeAcceleratedDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
 
 import {
     drawMenuHeader as drawHeader,
@@ -73,6 +76,9 @@ const ST_SPEECH = ['empty', 'recording', 'playing', 'overdubbing', 'stopped'];
 const FX_NAMES  = ['Off', 'LPF', 'HPF', 'Crush', 'Delay', 'Phasr', 'Ring'];
 const FX_SPEECH = ['off', 'low pass filter', 'high pass filter', 'crush',
                    'delay', 'phaser', 'ring mod'];
+let fxChoices = FX_NAMES.map((name, index) => ({
+    kind: 'builtin', index, name, speech: FX_SPEECH[index], params: []
+}));
 
 /* Quantize grid units (rec_grid in the DSP) */
 const GRID_ABBR   = ['m', 'b', '8', '16'];
@@ -83,6 +89,8 @@ const GRID_PLURAL = ['measures', 'beats', 'eighths', 'sixteenths'];
  * hold a session slot this long to SAVE into it (tap = load) */
 const CLEAR_HOLD_MS = 600;
 const SAVE_HOLD_MS = 600;
+const FX_EDIT_HOLD_MS = 600;
+const FX_LOAD_DEBOUNCE_MS = 220;
 
 /* Knobs 1-8, page 1 */
 const KNOBS = [
@@ -123,6 +131,9 @@ let tshot    = [0, 0, 0, 0, 0];
 let tfx      = [1, 1, 1, 1, 1];
 let tfxon    = [0, 0, 0, 0, 0];
 let tfxp     = [50, 50, 50, 50, 50];
+let tfxmod   = ['', '', '', '', ''];
+let tfxstatus = [0, 0, 0, 0, 0];
+let fxParamValues = [{}, {}, {}, {}, {}];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
@@ -142,6 +153,8 @@ let needsRedraw = true;
 let dspReady = false;
 let anyPending = false;
 let curTrack = 0;       /* target of the FX knobs: last track pad touched */
+let fxEdit = false;     /* hosted module's root knobs own knobs 1-8 */
+let pendingFxChoice = null; /* debounced {track,id,at} module load */
 
 /* Session mode: steps show the 16 save slots */
 let sessionMode = false;
@@ -152,6 +165,7 @@ let ioWasBusy = '';     /* 'saving' | 'loading' while in flight */
 
 /* stop-pad hold tracking: { at, fired } per track, null when up */
 let stopHeld = [null, null, null, null, null];
+let fxHeld = [null, null, null, null, null];
 
 /* Feedback guard (smack pattern): speakers on + no line-in cable = the
  * internal mic would feed the speakers. Mute the DSP's input monitoring
@@ -166,6 +180,120 @@ let resumeRepaints = 0;   /* spaced forced repaints after resume: one
 function gp(key) {
     const v = host_module_get_param(key);
     return (v === null || v === undefined) ? null : String(v);
+}
+
+function paramDef(hierarchy, key) {
+    const levels = hierarchy && hierarchy.levels ? hierarchy.levels : {};
+    for (const levelName in levels) {
+        const params = Array.isArray(levels[levelName].params)
+            ? levels[levelName].params : [];
+        for (let i = 0; i < params.length; i++) {
+            const p = params[i];
+            if (p && typeof p === 'object' && p.key === key) return p;
+        }
+    }
+    return null;
+}
+
+function normalizeFxParam(hierarchy, key) {
+    const raw = paramDef(hierarchy, key) || {};
+    const options = Array.isArray(raw.options) ? raw.options.map(String) : null;
+    return {
+        key,
+        name: String(raw.name || raw.label || key),
+        type: String(raw.type || (options ? 'enum' : 'float')),
+        options,
+        min: raw.min === undefined ? 0 : Number(raw.min),
+        max: raw.max === undefined ? (options ? options.length - 1 : 100) : Number(raw.max),
+        step: raw.step === undefined ? 1 : Number(raw.step),
+        def: raw.default === undefined ? 0 : Number(raw.default),
+        accel: String(raw.knob_acceleration || '')
+    };
+}
+
+function discoverFxModules() {
+    fxChoices = FX_NAMES.map((name, index) => ({
+        kind: 'builtin', index, name, speech: FX_SPEECH[index], params: []
+    }));
+    const catalog = gp('fx_catalog') || '';
+    if (!catalog) return;
+    const entries = catalog.split(',');
+    for (let i = 0; i < entries.length; i++) {
+        const cut = entries[i].indexOf('|');
+        const id = cut >= 0 ? entries[i].slice(0, cut) : entries[i];
+        const fallbackName = cut >= 0 ? entries[i].slice(cut + 1) : id;
+        if (!id) continue;
+        let meta = null;
+        if (typeof host_get_module_metadata === 'function')
+            meta = host_get_module_metadata(id);
+        if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch (_) { meta = null; }
+        }
+        const cap = meta && meta.capabilities ? meta.capabilities : {};
+        const hierarchy = cap.ui_hierarchy || null;
+        const root = hierarchy && hierarchy.levels ? hierarchy.levels.root : null;
+        const knobs = root && Array.isArray(root.knobs) ? root.knobs : [];
+        const params = [];
+        for (let k = 0; k < knobs.length && params.length < 8; k++) {
+            if (typeof knobs[k] === 'string')
+                params.push(normalizeFxParam(hierarchy, knobs[k]));
+        }
+        fxChoices.push({
+            kind: 'module', id,
+            name: String((meta && meta.name) || fallbackName || id),
+            speech: String((meta && meta.name) || fallbackName || id),
+            params
+        });
+    }
+}
+
+function currentFxChoice(track) {
+    if (tfxmod[track]) {
+        for (let i = 0; i < fxChoices.length; i++)
+            if (fxChoices[i].kind === 'module' && fxChoices[i].id === tfxmod[track])
+                return fxChoices[i];
+        return { kind: 'module', id: tfxmod[track], name: tfxmod[track],
+                 speech: tfxmod[track], params: [] };
+    }
+    return fxChoices[Math.max(0, Math.min(FX_NAMES.length - 1, tfx[track]))];
+}
+
+function currentFxChoiceIndex(track) {
+    const choice = currentFxChoice(track);
+    for (let i = 0; i < fxChoices.length; i++) {
+        if (choice.kind === 'builtin' && fxChoices[i].kind === 'builtin' &&
+            choice.index === fxChoices[i].index) return i;
+        if (choice.kind === 'module' && fxChoices[i].kind === 'module' &&
+            choice.id === fxChoices[i].id) return i;
+    }
+    return 0;
+}
+
+function fxChoiceHasEffect(track) {
+    const c = currentFxChoice(track);
+    return c.kind === 'module' || c.index > 0;
+}
+
+function refreshHostedParams(track) {
+    const choice = currentFxChoice(track);
+    if (choice.kind !== 'module' || tfxstatus[track] !== 2) return;
+    for (let i = 0; i < choice.params.length; i++) {
+        const p = choice.params[i];
+        const raw = gp(`t${track + 1}_mod_${p.key}`);
+        if (raw !== null && raw !== '') fxParamValues[track][p.key] = Number(raw);
+        else if (fxParamValues[track][p.key] === undefined)
+            fxParamValues[track][p.key] = p.def;
+    }
+}
+
+function hostedParamDisplay(track, p) {
+    const raw = fxParamValues[track][p.key];
+    const v = raw === undefined || Number.isNaN(raw) ? p.def : raw;
+    if (p.options) {
+        const i = Math.max(0, Math.min(p.options.length - 1, Math.round(v)));
+        return p.options[i];
+    }
+    return Number.isInteger(p.step) ? `${Math.round(v)}` : `${Math.round(v * 100) / 100}`;
 }
 
 function feedbackRisk() {
@@ -256,11 +384,19 @@ function fetchAll() {
         if (v !== null) knob2Values[i] = parseFloat(v) || 0;
     }
     for (let i = 0; i < TRACKS; i++) {
+        const oldMod = tfxmod[i], oldStatus = tfxstatus[i];
         trev[i]  = parseInt(gp(`t${i + 1}_rev`) || '0', 10);
         tshot[i] = parseInt(gp(`t${i + 1}_shot`) || '0', 10);
         tfx[i]   = parseInt(gp(`t${i + 1}_fx`) || '1', 10);
         tfxon[i] = parseInt(gp(`t${i + 1}_fx_on`) || '0', 10);
         tfxp[i]  = parseInt(gp(`t${i + 1}_fxp`) || '50', 10);
+        if (!pendingFxChoice || pendingFxChoice.track !== i) {
+            tfxmod[i] = gp(`t${i + 1}_fx_module`) || '';
+            tfxstatus[i] = parseInt(gp(`t${i + 1}_fx_status`) || '0', 10);
+        }
+        if (tfxmod[i] !== oldMod) fxParamValues[i] = {};
+        if (tfxstatus[i] === 2 && (oldStatus !== 2 || tfxmod[i] !== oldMod))
+            refreshHostedParams(i);
     }
     parseCsv(gp('tmeas'), tmeas);
     quantize  = parseInt(gp('quantize') || '1', 10);
@@ -330,15 +466,64 @@ function adjustKnob(bank, i, delta) {
 
 /* Knobs 7/8: FX type + amount for the current track */
 function adjustFxType(delta) {
-    const v = Math.max(0, Math.min(FX_NAMES.length - 1, tfx[curTrack] + (delta > 0 ? 1 : -1)));
-    if (v === tfx[curTrack]) return;
-    tfx[curTrack] = v;
-    host_module_set_param(`t${curTrack + 1}_fx`, `${v}`);
-    announceParameter(`Track ${curTrack + 1} effect`, FX_SPEECH[v]);
+    const old = currentFxChoiceIndex(curTrack);
+    const next = Math.max(0, Math.min(fxChoices.length - 1,
+                                     old + (delta > 0 ? 1 : -1)));
+    if (next === old) return;
+    const choice = fxChoices[next];
+    if (choice.kind === 'builtin') {
+        if (pendingFxChoice && pendingFxChoice.track === curTrack)
+            pendingFxChoice = null;
+        tfxmod[curTrack] = '';
+        tfxstatus[curTrack] = 0;
+        tfx[curTrack] = choice.index;
+        host_module_set_param(`t${curTrack + 1}_fx`, `${choice.index}`);
+    } else {
+        tfxmod[curTrack] = choice.id;
+        tfxstatus[curTrack] = 1;
+        fxParamValues[curTrack] = {};
+        pendingFxChoice = { track: curTrack, id: choice.id,
+                            at: Date.now() + FX_LOAD_DEBOUNCE_MS };
+    }
+    announceParameter(`Track ${curTrack + 1} effect`, choice.speech);
+    needsRedraw = true;
+}
+
+function adjustHostedParam(track, index, delta) {
+    const choice = currentFxChoice(track);
+    const p = choice.kind === 'module' ? choice.params[index] : null;
+    if (!p) return;
+    if (tfxstatus[track] !== 2) {
+        announce(tfxstatus[track] < 0 ? `${choice.name} failed to load`
+                                      : `${choice.name} loading`);
+        return;
+    }
+    let cur = fxParamValues[track][p.key];
+    if (cur === undefined || Number.isNaN(cur)) cur = p.def;
+    let next;
+    const trigger = p.options && p.options.some(v => v.toLowerCase() === 'trigger');
+    if (trigger) {
+        next = delta > 0 ? p.options.findIndex(v => v.toLowerCase() === 'trigger') : 0;
+    } else if (p.options) {
+        next = Math.max(0, Math.min(p.options.length - 1,
+                                   Math.round(cur) + (delta > 0 ? 1 : -1)));
+    } else {
+        const step = p.step > 0 ? p.step : 1;
+        next = Math.max(p.min, Math.min(p.max, cur + delta * step));
+    }
+    if (next === cur && !trigger) return;
+    fxParamValues[track][p.key] = next;
+    host_module_set_param(`t${track + 1}_mod_${p.key}`, `${next}`);
+    announceParameter(`${choice.name} ${p.name}`, hostedParamDisplay(track, p));
     needsRedraw = true;
 }
 
 function adjustFxParam(delta) {
+    const choice = currentFxChoice(curTrack);
+    if (choice.kind === 'module') {
+        adjustHostedParam(curTrack, 0, delta);
+        return;
+    }
     const v = Math.max(0, Math.min(100, tfxp[curTrack] + delta * 5));
     if (v === tfxp[curTrack]) return;
     tfxp[curTrack] = v;
@@ -377,7 +562,7 @@ function paintTracks(force) {
         /* bottom row: FX on/off; Shift reveals the one-shot layer */
         setLED(PAD_FX[i],
                shiftHeld ? (tshot[i] ? Purple : 0x10)
-                         : (tfxon[i] && tfx[i] > 0 ? OrangeRed : 0x10),
+                         : (tfxon[i] && fxChoiceHasEffect(i) ? OrangeRed : 0x10),
                force);
     }
 }
@@ -445,8 +630,43 @@ function paintAll(force) {
 
 /* ---- Screen ---- */
 
+function fxValueText(track) {
+    const choice = currentFxChoice(track);
+    if (choice.kind === 'builtin') return `${tfxp[track]}`;
+    if (tfxstatus[track] === 1) return 'load';
+    if (tfxstatus[track] < 0) return 'ERR';
+    if (choice.params.length) return hostedParamDisplay(track, choice.params[0]);
+    return 'ready';
+}
+
+function drawHostedFx() {
+    const choice = currentFxChoice(curTrack);
+    drawHeader(`T${curTrack + 1} FX  ${choice.name}`);
+    const params = choice.kind === 'module' ? choice.params : [];
+    if (tfxstatus[curTrack] === 1) {
+        print(4, 25, 'Loading module...', 1);
+    } else if (tfxstatus[curTrack] < 0) {
+        print(4, 25, 'Load failed', 1);
+    } else if (!params.length) {
+        print(4, 25, 'No root knobs', 1);
+    } else {
+        for (let i = 0; i < params.length && i < 8; i++) {
+            const x = 2 + (i % 4) * 31;
+            const y = i < 4 ? 14 : 34;
+            print(x, y, params[i].name.slice(0, 5), 1);
+            print(x, y + 9, hostedParamDisplay(curTrack, params[i]).slice(0, 5), 1);
+        }
+    }
+    drawFooter({ left: 'hold FX: close', right: tfxon[curTrack] ? 'ON' : 'OFF' });
+}
+
 function drawUI() {
     clear_screen();
+    if (fxEdit && !shiftHeld) {
+        drawHostedFx();
+        needsRedraw = false;
+        return;
+    }
     let title = `MARK  @${bpmOverride > 0 ? Math.round(bpmOverride) : gridBpm}`;
     if (swapBusy) title += ' UNDO...';
     drawHeader(title);
@@ -470,8 +690,10 @@ function drawUI() {
         fLeft = 'Pans · Mon · BPM';
         fRight = '';
     } else {
-        fLeft = `T${curTrack + 1} ${FX_NAMES[tfx[curTrack]]}` +
-                (tfxon[curTrack] && tfx[curTrack] > 0 ? ` ${tfxp[curTrack]}` : ' off');
+        const choice = currentFxChoice(curTrack);
+        fLeft = `T${curTrack + 1} ${choice.name}` +
+                (tfxon[curTrack] && fxChoiceHasEffect(curTrack)
+                 ? ` ${fxValueText(curTrack)}` : ' off');
         fRight = `${playMode ? 'SGL' : 'MLT'} Q:${quantize ? GRID_ABBR[recGrid] : '-'}`;
     }
     drawFooter({ left: fLeft, right: fRight });
@@ -481,6 +703,7 @@ function drawUI() {
 /* ---- Lifecycle ---- */
 
 globalThis.init = function() {
+    discoverFxModules();
     dspReady = fetchAll();
     paintAll(true);
     needsRedraw = true;
@@ -491,6 +714,7 @@ globalThis.init = function() {
 };
 
 globalThis.onResume = function() {
+    discoverFxModules();
     dspReady = fetchAll();
     paintAll(true);
     resumeRepaints = 3;
@@ -518,6 +742,15 @@ globalThis.tick = function() {
     /* jack state can change mid-session — re-check about twice a second */
     if (tickCount % 15 === 0) reconcileFeedbackGuard();
 
+    /* Encoder browsing is cheap; loading shared objects is not. Wait until
+     * the knob settles so a fast sweep across the catalog loads only the
+     * final Schwung module. */
+    if (pendingFxChoice && Date.now() >= pendingFxChoice.at) {
+        const p = pendingFxChoice;
+        pendingFxChoice = null;
+        host_module_set_param(`t${p.track + 1}_fx_module`, p.id);
+    }
+
     /* spaced post-resume repaints heal any LED writes the queue dropped */
     if (resumeRepaints > 0 && tickCount % 8 === 0) {
         paintAll(true);
@@ -533,6 +766,26 @@ globalThis.tick = function() {
             host_module_set_param(`t${i + 1}_clear`, '1');
             announce(`Track ${i + 1} cleared`);
             refreshSoon();
+        }
+    }
+
+    /* A long hold on a track's FX pad opens/closes the hosted module's
+     * eight-knob root page. A short tap is still the familiar bypass toggle. */
+    for (let i = 0; i < TRACKS; i++) {
+        if (fxHeld[i] && !fxHeld[i].fired &&
+            Date.now() - fxHeld[i].at >= FX_EDIT_HOLD_MS) {
+            fxHeld[i].fired = true;
+            const choice = currentFxChoice(i);
+            if (choice.kind !== 'module') {
+                announce('Choose a Schwung effect first');
+            } else {
+                curTrack = i;
+                fxEdit = !fxEdit;
+                if (fxEdit) refreshHostedParams(i);
+                announce(fxEdit ? `${choice.name} controls, knobs 1 to 8`
+                                : 'FX controls closed');
+                needsRedraw = true;
+            }
         }
     }
 
@@ -580,13 +833,15 @@ globalThis.tick = function() {
         const oldKnobs = knobValues.join(',') + knob2Values.join(',');
         const oldFlags = `${quantize}${recAction}${dubMode}${monitorOn}${playMode}` +
                          trev.join('') + tshot.join('') +
-                         tfx.join('') + tfxon.join('') + tfxp.join(',');
+                         tfx.join('') + tfxon.join('') + tfxp.join(',') +
+                         tfxmod.join(',') + tfxstatus.join(',');
         fetchAll();
         if (knobValues.join(',') + knob2Values.join(',') !== oldKnobs)
             needsRedraw = true;
         if (`${quantize}${recAction}${dubMode}${monitorOn}${playMode}` +
             trev.join('') + tshot.join('') +
-            tfx.join('') + tfxon.join('') + tfxp.join(',') !== oldFlags) {
+            tfx.join('') + tfxon.join('') + tfxp.join(',') +
+            tfxmod.join(',') + tfxstatus.join(',') !== oldFlags) {
             paintTracks(false);
             paintGlobals(false);
             needsRedraw = true;
@@ -635,9 +890,16 @@ globalThis.onMidiMessageInternal = function(data) {
             return;
         }
         if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
-            const delta = decodeDelta(d2);
-            if (delta === 0) return;
             const k = d1 - MoveKnob1;
+            let delta = decodeDelta(d2);
+            if (!shiftHeld) {
+                const choice = currentFxChoice(curTrack);
+                const p = choice.kind === 'module'
+                    ? choice.params[fxEdit ? k : (k === 7 ? 0 : -1)] : null;
+                if (p && p.accel) delta = decodeAcceleratedDelta(d2, d1);
+            }
+            if (delta === 0) return;
+            if (!shiftHeld && fxEdit) { adjustHostedParam(curTrack, k, delta); return; }
             if (!shiftHeld && k === 6) { adjustFxType(delta); return; }
             if (!shiftHeld && k === 7) { adjustFxParam(delta); return; }
             adjustKnob(shiftHeld ? 2 : 1, k, delta);
@@ -648,6 +910,20 @@ globalThis.onMidiMessageInternal = function(data) {
 
     /* pad releases: end hold windows; a short session-slot tap = LOAD */
     if (status === 0x80 || (status === 0x90 && d2 === 0)) {
+        for (let i = 0; i < TRACKS; i++) {
+            if (fxHeld[i] && d1 === PAD_FX[i]) {
+                if (!fxHeld[i].fired) {
+                    tfxon[i] = tfxon[i] ? 0 : 1;
+                    host_module_set_param(`t${i + 1}_fx_on`, `${tfxon[i]}`);
+                    const choice = currentFxChoice(i);
+                    announce(`Track ${i + 1} ${choice.speech} ${tfxon[i] ? 'on' : 'off'}`);
+                    paintTracks(false);
+                    needsRedraw = true;
+                }
+                fxHeld[i] = null;
+                return;
+            }
+        }
         for (let i = 0; i < TRACKS; i++) {
             if (stopHeld[i] && d1 === PAD_STOP[i]) {
                 stopHeld[i] = null;
@@ -743,9 +1019,8 @@ globalThis.onMidiMessageInternal = function(data) {
                     host_module_set_param(`t${i + 1}_shot`, `${tshot[i]}`);
                     announce(`Track ${i + 1} one-shot ${tshot[i] ? 'on' : 'off'}`);
                 } else {
-                    tfxon[i] = tfxon[i] ? 0 : 1;
-                    host_module_set_param(`t${i + 1}_fx_on`, `${tfxon[i]}`);
-                    announce(`Track ${i + 1} ${FX_SPEECH[tfx[i]]} ${tfxon[i] ? 'on' : 'off'}`);
+                    fxHeld[i] = { at: Date.now(), fired: false };
+                    return;
                 }
                 paintTracks(false);
                 needsRedraw = true;

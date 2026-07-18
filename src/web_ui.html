@@ -61,6 +61,9 @@
   .strip label { font-size: 10px; color: var(--dim); display: block; margin-top: 6px; }
   .strip .tog { display: flex; gap: 4px; margin-top: 6px; }
   .strip .tog button { flex: 1; font-size: 10px; padding: 3px 1px; }
+  .modparams { margin-top: 5px; border-top: 1px solid var(--edge); padding-top: 3px; }
+  .modparams .mp { margin-top: 4px; }
+  .modparams select { width: 100%; font-size: 10px; }
   .right { flex: 0 1 330px; min-width: 280px; display: flex; flex-direction: column; gap: 12px; }
   #slots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .slot { display: flex; flex-direction: column; gap: 2px; }
@@ -142,10 +145,15 @@ let PREFIX = null;               /* "overtake_dsp:" (tool) or "synth:" (slot) */
 const M = {};                    /* stripped key -> string value */
 let playOn = false, playTick = -1, liveBpm = 0, lastRuiPlay = 0;
 const touched = {};              /* control-key -> ts of last local edit */
+let fxCatalogSig = "";
+let fxCatalog = [];
+const moduleUiLoaded = ["", "", "", "", ""];
 
 function el(id) { return document.getElementById(id); }
 function num(k, d) { const v = M[k]; return v === undefined ? d : parseFloat(v); }
 function csv(k) { const v = M[k]; return v ? v.split(",").map(Number) : []; }
+function strcsv(k) { const v = M[k]; return v === undefined ? [] : v.split(","); }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]); }
 function send(key, val) {
   if (PREFIX) schwungRemote.setParam(PREFIX + "rui_set", key + ":" + String(val));
 }
@@ -188,6 +196,99 @@ function paintPlayhead() {
 }
 
 /* ---- channel strips ---- */
+function syncFxCatalog() {
+  const sig = M.fc || "";
+  if (sig === fxCatalogSig) return;
+  fxCatalogSig = sig;
+  fxCatalog = sig ? sig.split(",").filter(Boolean).map(s => {
+    const cut = s.indexOf("|");
+    return { id: cut >= 0 ? s.slice(0, cut) : s,
+             name: cut >= 0 ? s.slice(cut + 1) : s };
+  }) : [];
+  for (let i = 1; i <= 5; i++) {
+    const sel = el(`fx${i}`);
+    if (!sel) continue;
+    const keep = sel.value;
+    sel.innerHTML = FXN.map((n, j) => `<option value="b:${j}">${esc(n)}</option>`).join("") +
+      fxCatalog.map(f => `<option value="m:${esc(f.id)}">${esc(f.name)}</option>`).join("");
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  }
+}
+
+function hierarchyParams(h) {
+  const levels = h && h.levels ? h.levels : {};
+  const root = levels.root || {};
+  const knobs = Array.isArray(root.knobs) ? root.knobs : [];
+  const defs = {};
+  Object.keys(levels).forEach(k => {
+    const ps = Array.isArray(levels[k].params) ? levels[k].params : [];
+    ps.forEach(p => { if (p && typeof p === "object" && p.key) defs[p.key] = p; });
+  });
+  return knobs.filter(k => typeof k === "string").slice(0, 8).map(key => {
+    const p = defs[key] || {};
+    const options = Array.isArray(p.options) ? p.options.map(String) : null;
+    return { key, name: String(p.name || p.label || key), options,
+      min: p.min === undefined ? 0 : Number(p.min),
+      max: p.max === undefined ? (options ? options.length - 1 : 100) : Number(p.max),
+      step: p.step === undefined ? 1 : Number(p.step),
+      def: p.default === undefined ? 0 : Number(p.default) };
+  });
+}
+
+function loadModuleControls(track, moduleId) {
+  const slot = track - 1;
+  const host = el(`mp${track}`);
+  if (!PREFIX || !moduleId || !host) return;
+  const token = `${moduleId}:${strcsv("xs")[slot] || ""}`;
+  if (moduleUiLoaded[slot] === token) return;
+  moduleUiLoaded[slot] = token;
+  host.style.display = "";
+  host.innerHTML = `<span class="note">loading controls…</span>`;
+  schwungRemote.getParam(PREFIX + `t${track}_mod_hierarchy`).then(raw => {
+    if (strcsv("xm")[slot] !== moduleId) return;
+    let h;
+    try { h = typeof raw === "string" ? JSON.parse(raw) : raw; }
+    catch (_) { h = null; }
+    const params = hierarchyParams(h);
+    if (!params.length) {
+      host.innerHTML = `<span class="note">No root controls</span>`;
+      return;
+    }
+    host.innerHTML = "";
+    params.forEach((p, j) => {
+      const row = document.createElement("div");
+      row.className = "mp";
+      const lab = document.createElement("label");
+      lab.textContent = p.name;
+      row.appendChild(lab);
+      const trigger = p.options && p.options.some(v => v.toLowerCase() === "trigger");
+      let control;
+      if (trigger) {
+        control = document.createElement("button");
+        control.textContent = "Trigger";
+        control.onclick = () => send(`t${track}_mod_${p.key}`, "trigger");
+      } else if (p.options) {
+        control = document.createElement("select");
+        p.options.forEach((name, n) => {
+          const o = document.createElement("option");
+          o.value = String(n); o.textContent = name; control.appendChild(o);
+        });
+        control.onchange = e => send(`t${track}_mod_${p.key}`, e.target.value);
+      } else {
+        control = document.createElement("input");
+        control.type = "range"; control.min = p.min; control.max = p.max; control.step = p.step;
+        control.onchange = e => send(`t${track}_mod_${p.key}`, e.target.value);
+      }
+      control.id = `mx${track}_${j}`;
+      row.appendChild(control);
+      host.appendChild(row);
+      schwungRemote.getParam(PREFIX + `t${track}_mod_${p.key}`).then(v => {
+        if (v !== null && v !== undefined && !trigger) control.value = String(v);
+      });
+    });
+  });
+}
+
 function buildStrips() {
   const host = el("strips");
   let html = "";
@@ -208,12 +309,13 @@ function buildStrips() {
         <button id="rv${i}">Rev</button>
         <button id="sh${i}">1shot</button>
       </div>
-      <label>FX</label>
+      <label>FX <span class="note" id="fs${i}"></span></label>
       <div class="row">
-        <select id="fx${i}" style="flex:1">${FXN.map((n, j) => `<option value="${j}">${n}</option>`).join("")}</select>
+        <select id="fx${i}" style="flex:1">${FXN.map((n, j) => `<option value="b:${j}">${n}</option>`).join("")}</select>
         <button id="fo${i}" style="flex:0 0 40px">On</button>
       </div>
       <input id="fp${i}" type="range" min="0" max="100" step="5">
+      <div id="mp${i}" class="modparams" style="display:none"></div>
       <label>Length <span class="note">(trim)</span></label>
       <div class="row">
         <button id="tm${i}" style="flex:0 0 32px">−</button>
@@ -246,7 +348,9 @@ function wireStrip(i) {
   el(`sh${i}`).onclick = () => send(`t${i}_shot`, csv("sh")[i - 1] ? 0 : 1);
   el(`fx${i}`).onchange = (e) => {
     touched[`fx${i}`] = Date.now();
-    send(`t${i}_fx`, e.target.value);
+    const v = e.target.value;
+    if (v.indexOf("m:") === 0) send(`t${i}_fx_module`, v.slice(2));
+    else send(`t${i}_fx`, v.slice(2));
   };
   el(`fo${i}`).onclick = () => send(`t${i}_fx_on`, csv("fo")[i - 1] ? 0 : 1);
   el(`fp${i}`).oninput = (e) => {
@@ -294,6 +398,7 @@ function buildSlots() {
 /* ---- rendering ---- */
 function render() {
   if (M.mst === undefined && M.run === undefined) return;
+  syncFxCatalog();
   el("offline").style.display = "none";
   el("ui").style.display = "";
 
@@ -317,6 +422,7 @@ function render() {
 
   const ts = csv("ts"), ms = csv("ms"), lv = csv("lv"), pn = csv("pn");
   const rv = csv("rv"), sh = csv("sh"), fx = csv("fx"), fo = csv("fo"), fp = csv("fp");
+  const xm = strcsv("xm"), xs = csv("xs");
   const tu = csv("tu"), gd = num("gd", 0);
   for (let i = 1; i <= 5; i++) {
     const s = ts[i - 1] || 0;
@@ -333,9 +439,26 @@ function render() {
     el(`pnv${i}`).textContent = pn[i - 1] !== undefined ? pn[i - 1] : 50;
     el(`rv${i}`).className = rv[i - 1] ? "on" : "";
     el(`sh${i}`).className = sh[i - 1] ? "on" : "";
-    setIf(`fx${i}`, "value", fx[i - 1] !== undefined ? fx[i - 1] : 1);
+    const moduleId = xm[i - 1] || "";
+    setIf(`fx${i}`, "value", moduleId ? `m:${moduleId}`
+                                      : `b:${fx[i - 1] !== undefined ? fx[i - 1] : 1}`);
     el(`fo${i}`).className = fo[i - 1] ? "on" : "";
-    setIf(`fp${i}`, "value", fp[i - 1] !== undefined ? fp[i - 1] : 50);
+    el(`fp${i}`).style.display = moduleId ? "none" : "";
+    if (!moduleId) {
+      setIf(`fp${i}`, "value", fp[i - 1] !== undefined ? fp[i - 1] : 50);
+      el(`mp${i}`).style.display = "none";
+      el(`mp${i}`).innerHTML = "";
+      moduleUiLoaded[i - 1] = "";
+      el(`fs${i}`).textContent = "";
+    } else if ((xs[i - 1] || 0) === 2) {
+      el(`fs${i}`).textContent = "ready";
+      loadModuleControls(i, moduleId);
+    } else {
+      moduleUiLoaded[i - 1] = "";
+      el(`mp${i}`).style.display = "";
+      el(`mp${i}`).innerHTML = `<span class="note">${(xs[i - 1] || 0) < 0 ? "load failed" : "loading…"}</span>`;
+      el(`fs${i}`).textContent = (xs[i - 1] || 0) < 0 ? "error" : "loading";
+    }
     el(`lu${i}`).textContent = s && tu[i - 1]
       ? tu[i - 1] + " " + ["measure", "beat", "8th", "16th"][gd] + (tu[i - 1] === 1 ? "" : "s")
       : "—";

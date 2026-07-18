@@ -35,7 +35,7 @@ cp src/web_ui.html build/modules/overtake/mark/web_ui.html
 docker run --rm -v "$PWD":/w -w /w "$IMAGE" bash -c "
     set -e
     aarch64-linux-gnu-gcc $CFLAGS src/mark_core.c src/mark_gen.c \
-        -o build/modules/overtake/mark/dsp.so -lm -lpthread
+        -o build/modules/overtake/mark/dsp.so -lm -lpthread -ldl
     file build/modules/overtake/mark/dsp.so
     tar --owner=0 --group=0 -czf build/mark-module.tar.gz -C build/modules/overtake mark
     echo 'tarball contents:'

@@ -18,8 +18,12 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <sched.h>
 
 #include "mark_core.h"
+#include "audio_fx_api_v2.h"
 
 /* Allocation fallback ladder: first capacity that calloc grants wins. */
 static const int alloc_seconds[] = { MARK_MAX_SECONDS, 45, 30, 20, 15 };
@@ -45,6 +49,43 @@ typedef enum {
 
 #define MARK_DLY_LEN 32768     /* 8th-note delay down through the UI's 50 BPM */
 #define MARK_SESSION_SLOTS 16
+#define MARK_BLOCK_FRAMES 128
+#define MARK_FX_CATALOG_MAX 48
+#define MARK_FX_ID_MAX 64
+#define MARK_FX_NAME_MAX 80
+#define MARK_FX_REQUESTS 32
+#define MARK_FX_STATE_MAX 8192
+
+typedef struct {
+    char id[MARK_FX_ID_MAX];
+    char name[MARK_FX_NAME_MAX];
+} mk_fx_catalog_t;
+
+/* A loaded Schwung audio-FX instance. Construction/destruction and manifest
+ * reads happen on fx_thread; only process_block/get/set/on_midi run on the
+ * audio thread after an atomic block-boundary handoff. */
+typedef struct mk_ext_fx {
+    void *handle;
+    audio_fx_api_v2_t *api;
+    void *instance;
+    char id[MARK_FX_ID_MAX];
+    char name[MARK_FX_NAME_MAX];
+    char *hierarchy;                 /* cached manifest ui_hierarchy JSON */
+} mk_ext_fx_t;
+
+typedef struct {
+    int track;
+    char id[MARK_FX_ID_MAX];         /* empty = unload / return to built-in */
+} mk_fx_request_t;
+
+typedef struct mk_fx_result {
+    int track;
+    int status;                      /* 0 unloaded, 2 ready, -1 load error */
+    int set_desired;                 /* session restore updates selection */
+    char id[MARK_FX_ID_MAX];
+    mk_ext_fx_t *next;
+    mk_ext_fx_t *retired;            /* filled by audio thread for cleanup */
+} mk_fx_result_t;
 
 /* RBJ biquad (smack pattern) for the LPF/HPF track FX */
 typedef struct { float b0, b1, b2, a1, a2, z1, z2; } mk_bq_t;
@@ -95,6 +136,9 @@ typedef struct {
     int      fx_on;
     int      fxp;          /* 0..100 */
     int      fx_dirty;     /* recompute filter coefficients in render */
+    char     fx_module[MARK_FX_ID_MAX]; /* empty = built-in tfx_t */
+    char     fx_active[MARK_FX_ID_MAX];
+    int      fx_status;    /* 0 built-in, 1 loading, 2 ready, -1 error */
     mk_bq_t  bqL, bqR;
     int      crush_cnt;
     float    crush_l, crush_r;
@@ -170,6 +214,35 @@ struct mark {
     _Atomic int io_error;         /* last I/O op failed */
     pthread_t io_thread;
     int io_thread_valid;
+
+    /* Per-track Schwung FX host. Requests are a fixed SPSC queue written by
+     * set_param on the audio thread and consumed by a normal-priority loader.
+     * Completed instances swap in at the next render block; the loader later
+     * destroys retired instances, so dlopen/malloc/file I/O never enter DSP. */
+    char module_dir[320];
+    char audio_fx_dir[320];
+    mk_fx_catalog_t fx_catalog[MARK_FX_CATALOG_MAX];
+    int fx_catalog_count;
+    mk_fx_request_t fx_requests[MARK_FX_REQUESTS];
+    _Atomic uint32_t fx_req_head;
+    _Atomic uint32_t fx_req_tail;
+    _Atomic(mk_ext_fx_t *) fx_active[MARK_TRACKS];
+    _Atomic(mk_fx_result_t *) fx_pending[MARK_TRACKS];
+    _Atomic(mk_fx_result_t *) fx_done[MARK_TRACKS];
+    /* get/set/on_midi may arrive on host control threads while the audio
+     * callback swaps fx_active. Readers enter before loading an active
+     * pointer; the loader waits for a zero-reader grace point before
+     * destroying a retired instance. An atomic pointer alone does not keep
+     * the object it names alive. */
+    _Atomic uint32_t fx_readers;
+    char session_fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
+    char session_fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
+    _Atomic int session_fx_ready[MARK_TRACKS];
+    _Atomic int fx_thread_stop;
+    pthread_t fx_thread;
+    int fx_thread_valid;
+    int16_t fx_block[MARK_TRACKS][MARK_BLOCK_FRAMES * 2];
+    float mix_l[MARK_BLOCK_FRAMES], mix_r[MARK_BLOCK_FRAMES];
 };
 
 /* ------------------------------------------------------------------ */
@@ -203,6 +276,86 @@ static int json_int(const char *js, const char *key, int def) {
     snprintf(pat, sizeof(pat), "\"%s\":", key);
     const char *p = strstr(js, pat);
     return p ? atoi(p + strlen(pat)) : def;
+}
+
+static int json_string(const char *js, const char *key,
+                       char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return -1;
+    p += strlen(pat);
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_len) out[n++] = *p++;
+    out[n] = '\0';
+    return *p == '"' ? 0 : -1;
+}
+
+static int json_object(const char *js, const char *key,
+                       char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = js;
+    for (;;) {
+        p = strstr(p, pat);
+        if (!p) return -1;
+        int depth = 0, quoted = 0, escaped = 0;
+        for (const char *q = js; q < p; q++) {
+            char c = *q;
+            if (quoted) {
+                if (escaped) escaped = 0;
+                else if (c == '\\') escaped = 1;
+                else if (c == '"') quoted = 0;
+            } else if (c == '"') quoted = 1;
+            else if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+        }
+        if (depth == 1) break;       /* session root, not a plugin state */
+        p += strlen(pat);
+    }
+    if (!(p = strchr(p + strlen(pat), ':'))) return -1;
+    do { p++; } while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n');
+    if (*p != '{' && *p != '[') return -1;
+    const char open = *p, close = open == '{' ? '}' : ']';
+    const char *start = p;
+    int depth = 0, quoted = 0, escaped = 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (quoted) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') quoted = 0;
+            continue;
+        }
+        if (c == '"') quoted = 1;
+        else if (c == open) depth++;
+        else if (c == close && --depth == 0) {
+            size_t n = (size_t)(p - start + 1);
+            if (n >= out_len) return -1;
+            memcpy(out, start, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int json_csv_string(const char *js, const char *key, int index,
+                           char *out, size_t out_len) {
+    char all[MARK_TRACKS * MARK_FX_ID_MAX];
+    if (json_string(js, key, all, sizeof(all)) != 0) return -1;
+    const char *p = all;
+    for (int i = 0; i < index; i++) {
+        p = strchr(p, ',');
+        if (!p) return -1;
+        p++;
+    }
+    const char *end = strchr(p, ',');
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 0;
 }
 
 static void update_track_gains(mk_track_t *t) {
@@ -280,10 +433,330 @@ static int any_content(const mark_t *m) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Hosted Schwung audio FX                                             */
+/* ------------------------------------------------------------------ */
+
+static int valid_fx_id(const char *s) {
+    if (!s || !*s || strlen(s) >= MARK_FX_ID_MAX) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) return 0;
+    return 1;
+}
+
+static char *read_text_file(const char *path, size_t max_bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n <= 0 || (size_t)n > max_bytes || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) { free(buf); return NULL; }
+    buf[got] = '\0';
+    return buf;
+}
+
+static int manifest_string(const char *js, const char *key,
+                           char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return -1;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return -1;
+    while (*++p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {}
+    if (*p != '"') return -1;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_len) {
+        if (*p == '\\' && p[1]) p++;  /* names only need simple unescape */
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return (*p == '"' && n > 0) ? 0 : -1;
+}
+
+/* Copy the manifest's ui_hierarchy object for generic parameter editors.
+ * This is deliberately a balanced-object extractor rather than a JSON model:
+ * the browser/Move JS already understands the schema and the DSP only caches
+ * it outside the render thread. */
+static char *manifest_hierarchy(const char *js) {
+    const char *p = strstr(js, "\"ui_hierarchy\"");
+    if (!p || !(p = strchr(p, ':')) || !(p = strchr(p, '{'))) return NULL;
+    const char *start = p;
+    int depth = 0, quoted = 0, escaped = 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (quoted) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') quoted = 0;
+            continue;
+        }
+        if (c == '"') quoted = 1;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) {
+            size_t n = (size_t)(p - start + 1);
+            char *out = malloc(n + 1);
+            if (!out) return NULL;
+            memcpy(out, start, n);
+            out[n] = '\0';
+            return out;
+        }
+    }
+    return NULL;
+}
+
+static int fx_catalog_cmp(const void *a, const void *b) {
+    const mk_fx_catalog_t *aa = (const mk_fx_catalog_t *)a;
+    const mk_fx_catalog_t *bb = (const mk_fx_catalog_t *)b;
+    return strcmp(aa->name, bb->name);
+}
+
+static int fx_catalog_find(const mark_t *m, const char *id) {
+    for (int i = 0; i < m->fx_catalog_count; i++)
+        if (!strcmp(m->fx_catalog[i].id, id)) return i;
+    return -1;
+}
+
+static void fx_catalog_scan(mark_t *m) {
+    if (!m->audio_fx_dir[0]) return;
+    DIR *d = opendir(m->audio_fx_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) && m->fx_catalog_count < MARK_FX_CATALOG_MAX) {
+        if (de->d_name[0] == '.' || !valid_fx_id(de->d_name)) continue;
+        char so_path[760], json_path[760];
+        struct stat st;
+        snprintf(so_path, sizeof(so_path), "%s/%s/%s.so",
+                 m->audio_fx_dir, de->d_name, de->d_name);
+        if (stat(so_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        snprintf(json_path, sizeof(json_path), "%s/%s/module.json",
+                 m->audio_fx_dir, de->d_name);
+        char *js = read_text_file(json_path, 262144);
+        if (!js) continue;
+        /* The directory id is the ABI lookup key. Reject a manifest that
+         * claims a different id, matching Schwung catalog discovery rules. */
+        char manifest_id[MARK_FX_ID_MAX] = {0};
+        if (manifest_string(js, "id", manifest_id, sizeof(manifest_id)) != 0 ||
+            strcmp(manifest_id, de->d_name) != 0) {
+            free(js);
+            continue;
+        }
+        mk_fx_catalog_t *e = &m->fx_catalog[m->fx_catalog_count++];
+        snprintf(e->id, sizeof(e->id), "%s", de->d_name);
+        if (manifest_string(js, "name", e->name, sizeof(e->name)) != 0)
+            snprintf(e->name, sizeof(e->name), "%s", de->d_name);
+        for (char *p = e->name; *p; p++)
+            if (*p == '"' || *p == '\\' || *p == ',' || *p == '|' ||
+                (unsigned char)*p < 32) *p = ' ';
+        free(js);
+    }
+    closedir(d);
+    qsort(m->fx_catalog, (size_t)m->fx_catalog_count,
+          sizeof(m->fx_catalog[0]), fx_catalog_cmp);
+}
+
+static void ext_fx_destroy(mk_ext_fx_t *fx) {
+    if (!fx) return;
+    if (fx->api && fx->instance && fx->api->destroy_instance)
+        fx->api->destroy_instance(fx->instance);
+    if (fx->handle) dlclose(fx->handle);
+    free(fx->hierarchy);
+    free(fx);
+}
+
+static mk_ext_fx_t *ext_fx_load(mark_t *m, const char *id, const char *state) {
+    int ci = fx_catalog_find(m, id);
+    if (ci < 0) return NULL;
+    char so_path[760], fx_dir[700], json_path[760];
+    snprintf(fx_dir, sizeof(fx_dir), "%s/%s", m->audio_fx_dir, id);
+    snprintf(so_path, sizeof(so_path), "%s/%s.so", fx_dir, id);
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return NULL;
+    audio_fx_init_v2_fn init = (audio_fx_init_v2_fn)dlsym(
+        handle, AUDIO_FX_INIT_V2_SYMBOL);
+    if (!init) { dlclose(handle); return NULL; }
+    audio_fx_api_v2_t *api = init(m->host);
+    if (!api || api->api_version != AUDIO_FX_API_VERSION_2 ||
+        !api->create_instance || !api->destroy_instance || !api->process_block) {
+        dlclose(handle);
+        return NULL;
+    }
+    void *instance = api->create_instance(fx_dir, NULL);
+    if (!instance) { dlclose(handle); return NULL; }
+    if (state && state[0] && api->set_param)
+        api->set_param(instance, "state", state);
+
+    mk_ext_fx_t *fx = calloc(1, sizeof(*fx));
+    if (!fx) { api->destroy_instance(instance); dlclose(handle); return NULL; }
+    fx->handle = handle;
+    fx->api = api;
+    fx->instance = instance;
+    snprintf(fx->id, sizeof(fx->id), "%s", id);
+    snprintf(fx->name, sizeof(fx->name), "%s", m->fx_catalog[ci].name);
+    snprintf(json_path, sizeof(json_path), "%s/module.json", fx_dir);
+    char *js = read_text_file(json_path, 262144);
+    if (js) { fx->hierarchy = manifest_hierarchy(js); free(js); }
+    return fx;
+}
+
+static void fx_reader_enter(mark_t *m) {
+    atomic_fetch_add_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_reader_leave(mark_t *m) {
+    atomic_fetch_sub_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_wait_for_readers(mark_t *m) {
+    while (atomic_load_explicit(&m->fx_readers, memory_order_seq_cst) != 0)
+        usleep(100);
+}
+
+static int fx_enqueue(mark_t *m, int track, const char *id) {
+    uint32_t head = atomic_load_explicit(&m->fx_req_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&m->fx_req_tail, memory_order_acquire);
+    if (head - tail >= MARK_FX_REQUESTS) return -1;
+    mk_fx_request_t *r = &m->fx_requests[head % MARK_FX_REQUESTS];
+    r->track = track;
+    snprintf(r->id, sizeof(r->id), "%s", id ? id : "");
+    atomic_store_explicit(&m->fx_req_head, head + 1, memory_order_release);
+    return 0;
+}
+
+static mk_fx_result_t *fx_load_result(mark_t *m, int track, const char *id,
+                                      const char *state, int set_desired) {
+    mk_fx_result_t *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->track = track;
+    r->set_desired = set_desired;
+    snprintf(r->id, sizeof(r->id), "%s", id ? id : "");
+    if (!id || !id[0]) {
+        r->status = 0;
+    } else {
+        r->next = ext_fx_load(m, id, state);
+        r->status = r->next ? 2 : -1;
+    }
+    return r;
+}
+
+static void fx_publish(mark_t *m, mk_fx_result_t *r) {
+    int ti = r->track;
+    while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire) &&
+           (atomic_load_explicit(&m->fx_pending[ti], memory_order_acquire) ||
+            atomic_load_explicit(&m->fx_done[ti], memory_order_acquire)))
+        usleep(1000);
+    if (atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
+        ext_fx_destroy(r->next);
+        free(r);
+        return;
+    }
+    atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
+}
+
+static void *fx_worker(void *arg) {
+    mark_t *m = (mark_t *)arg;
+    /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
+     * inherit realtime scheduling and contend with the SPI callback. */
+    struct sched_param normal = {0};
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
+        int did_work = 0;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_fx_result_t *done = atomic_exchange_explicit(
+                &m->fx_done[i], NULL, memory_order_acq_rel);
+            if (done) {
+                /* A control/MIDI callback may have loaded the old active
+                 * pointer immediately before the audio-thread swap. Wait
+                 * until every such callback has returned before destroy or
+                 * dlclose makes its instance/API pointers invalid. */
+                if (done->retired) fx_wait_for_readers(m);
+                ext_fx_destroy(done->retired);
+                /* done->next is now owned by fx_active on a successful load. */
+                free(done);
+                did_work = 1;
+            }
+            if (atomic_exchange_explicit(&m->session_fx_ready[i], 0,
+                                         memory_order_acq_rel)) {
+                mk_fx_result_t *r = fx_load_result(m, i, m->session_fx_id[i],
+                                                   m->session_fx_state[i], 1);
+                if (r) fx_publish(m, r);
+                did_work = 1;
+            }
+        }
+
+        uint32_t tail = atomic_load_explicit(&m->fx_req_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&m->fx_req_head, memory_order_acquire);
+        if (tail != head) {
+            mk_fx_request_t req = m->fx_requests[tail % MARK_FX_REQUESTS];
+            atomic_store_explicit(&m->fx_req_tail, tail + 1, memory_order_release);
+            mk_fx_result_t *r = fx_load_result(m, req.track, req.id, NULL, 0);
+            if (r) fx_publish(m, r);
+            did_work = 1;
+        }
+        if (!did_work) usleep(10000);
+    }
+    return NULL;
+}
+
+/* Audio-thread block boundary: install completed instances and hand the old
+ * one back to the loader for destruction. */
+static void fx_apply_pending(mark_t *m) {
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_fx_result_t *r = atomic_exchange_explicit(
+            &m->fx_pending[i], NULL, memory_order_acq_rel);
+        if (!r) continue;
+        mk_track_t *t = &m->t[i];
+        if (r->set_desired)
+            snprintf(t->fx_module, sizeof(t->fx_module), "%s", r->id);
+        if (r->status >= 0) {
+            r->retired = atomic_exchange_explicit(
+                &m->fx_active[i], r->next, memory_order_acq_rel);
+            if (r->status == 2)
+                snprintf(t->fx_active, sizeof(t->fx_active), "%s", r->id);
+            else
+                t->fx_active[0] = '\0';
+        }
+        t->fx_status = r->status;
+        m->edit_rev++;
+        atomic_store_explicit(&m->fx_done[i], r, memory_order_release);
+    }
+}
+
+static void request_fx_module(mark_t *m, int track, const char *id) {
+    mk_track_t *t = &m->t[track];
+    if (id && id[0] && (!valid_fx_id(id) || fx_catalog_find(m, id) < 0)) {
+        t->fx_status = -1;
+        m->edit_rev++;
+        return;
+    }
+    if (!id) id = "";
+    if (!strcmp(t->fx_module, id) && t->fx_status >= 0) return;
+    snprintf(t->fx_module, sizeof(t->fx_module), "%s", id);
+    mk_ext_fx_t *active = atomic_load_explicit(&m->fx_active[track],
+                                                memory_order_acquire);
+    if (!id[0] && !active) {
+        t->fx_status = 0;
+        t->fx_active[0] = '\0';
+    } else {
+        t->fx_status = 1;
+        if (fx_enqueue(m, track, id) != 0) t->fx_status = -1;
+    }
+    m->edit_rev++;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Create / destroy                                                   */
 /* ------------------------------------------------------------------ */
 
-mark_t *mark_create(const host_api_v1_t *host) {
+mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
     mark_t *m = calloc(1, sizeof(mark_t));
     if (!m) return NULL;
 
@@ -333,7 +806,19 @@ mark_t *mark_create(const host_api_v1_t *host) {
         }
     }
     m->host = host;
+    if (module_dir && module_dir[0]) {
+        snprintf(m->module_dir, sizeof(m->module_dir), "%s", module_dir);
+        snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
+                 module_dir);
+        fx_catalog_scan(m);
+        if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
+            m->fx_thread_valid = 1;
+    }
     return m;
+}
+
+mark_t *mark_create(const host_api_v1_t *host) {
+    return mark_create_in_dir(host, NULL);
 }
 
 void mark_destroy(mark_t *m) {
@@ -341,6 +826,22 @@ void mark_destroy(mark_t *m) {
     /* The worker owns this instance until it returns. Joining makes destroy
      * safe even when slow storage takes longer than an arbitrary timeout. */
     if (m->io_thread_valid) pthread_join(m->io_thread, NULL);
+    if (m->fx_thread_valid) {
+        atomic_store_explicit(&m->fx_thread_stop, 1, memory_order_release);
+        pthread_join(m->fx_thread, NULL);
+    }
+    fx_wait_for_readers(m);
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_fx_result_t *pending = atomic_exchange(&m->fx_pending[i], NULL);
+        if (pending) {
+            ext_fx_destroy(pending->next);
+            ext_fx_destroy(pending->retired);
+            free(pending);
+        }
+        mk_fx_result_t *done = atomic_exchange(&m->fx_done[i], NULL);
+        if (done) { ext_fx_destroy(done->retired); free(done); }
+        ext_fx_destroy(atomic_exchange(&m->fx_active[i], NULL));
+    }
     for (int i = 0; i < MARK_TRACKS; i++) { free(m->t[i].buf); free(m->t[i].dly); }
     free(m->undo_buf);
     free(m);
@@ -383,6 +884,17 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         break;
     default: break;
     }
+    /* Hosted effects receive the same clock/transport stream a normal
+     * Schwung Chain slot would. UI performance messages can also reach
+     * effects that opt into on_midi. */
+    fx_reader_enter(m);
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[i],
+                                                memory_order_acquire);
+        if (fx && fx->api && fx->api->on_midi)
+            fx->api->on_midi(fx->instance, msg, len, source);
+    }
+    fx_reader_leave(m);
 }
 
 /* ------------------------------------------------------------------ */
@@ -840,7 +1352,13 @@ static int wav_probe(const char *path, uint32_t *frames_out) {
     return 0;
 }
 
-typedef struct { mark_t *m; int slot; int op; /* 1 save, 2 load */ } mk_job_t;
+typedef struct {
+    mark_t *m;
+    int slot;
+    int op;                              /* 1 save, 2 load */
+    char fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
+    char fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
+} mk_job_t;
 
 static void session_path(const mark_t *m, int slot, const char *file,
                          char *buf, size_t len) {
@@ -865,7 +1383,7 @@ static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
  * truncated, or incompatible session files therefore leave the current
  * loops and mixer settings untouched. */
 static int session_preflight(const mark_t *m, int slot) {
-    char js[2048], path[320];
+    char js[65536], path[320];
     if (session_read_json(m, slot, js, sizeof(js)) != 0) return -1;
     for (int i = 0; i < MARK_TRACKS; i++) {
         char k[8], wname[16];
@@ -886,6 +1404,8 @@ static int session_preflight(const mark_t *m, int slot) {
 static void *io_worker(void *arg) {
     mk_job_t *job = (mk_job_t *)arg;
     mark_t *m = job->m;
+    struct sched_param normal = {0};
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
     char path[320];
     int err = 0;
 
@@ -923,11 +1443,15 @@ static void *io_worker(void *arg) {
                     ? (t->full_len > t->len ? t->full_len : t->len) : 0;
                 fprintf(f, ",\"l%d\":%u,\"F%d\":%u,\"v%d\":%d,\"p%d\":%d,"
                            "\"r%d\":%d,\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,"
-                           "\"g%d\":%d",
+                           "\"g%d\":%d,\"x%d\":\"%s\"",
                         i + 1, t->len, i + 1, full, i + 1, t->level,
                         i + 1, t->pan, i + 1, t->rev, i + 1, t->shot,
-                        i + 1, t->fx, i + 1, t->fx_on, i + 1, t->fxp);
+                        i + 1, t->fx, i + 1, t->fx_on, i + 1, t->fxp,
+                        i + 1, job->fx_id[i]);
             }
+            for (int i = 0; i < MARK_TRACKS; i++)
+                if (job->fx_state[i][0])
+                    fprintf(f, ",\"z%d\":%s", i + 1, job->fx_state[i]);
             fprintf(f, "}");
             if (fclose(f) != 0) err = 1;
         }
@@ -960,7 +1484,7 @@ static void *io_worker(void *arg) {
             }
         }
     } else {              /* ---- load ---- */
-        char js[2048];
+        char js[65536];
         if (session_read_json(m, job->slot, js, sizeof(js)) != 0) {
             err = 1;
         } else {
@@ -992,6 +1516,18 @@ static void *io_worker(void *arg) {
                 snprintf(k, sizeof(k), "g%d", i + 1);
                 t->fxp = clampi(json_int(js, k, 50), 0, 100);
                 t->fx_dirty = 1;
+                snprintf(k, sizeof(k), "x%d", i + 1);
+                char fx_id[MARK_FX_ID_MAX] = {0};
+                if (json_string(js, k, fx_id, sizeof(fx_id)) != 0)
+                    fx_id[0] = '\0';
+                snprintf(m->session_fx_id[i], sizeof(m->session_fx_id[i]),
+                         "%s", fx_id);
+                snprintf(k, sizeof(k), "z%d", i + 1);
+                if (json_object(js, k, m->session_fx_state[i],
+                                sizeof(m->session_fx_state[i])) != 0)
+                    m->session_fx_state[i][0] = '\0';
+                atomic_store_explicit(&m->session_fx_ready[i], 1,
+                                      memory_order_release);
 
                 snprintf(k, sizeof(k), "l%d", i + 1);
                 long lval = json_int(js, k, 0);
@@ -1034,7 +1570,7 @@ static void session_start(mark_t *m, int slot, int op) {
         pthread_join(m->io_thread, NULL);
         m->io_thread_valid = 0;
     }
-    mk_job_t *job = malloc(sizeof(mk_job_t));
+    mk_job_t *job = calloc(1, sizeof(mk_job_t));
     if (!job) { m->io_error = 1; return; }
     job->m = m;
     job->slot = slot;
@@ -1078,6 +1614,25 @@ static void session_start(mark_t *m, int slot, int op) {
                 finalize_record(m, i, final_len, MK_PLAY);
             }
         }
+        /* Snapshot plugin settings on the audio/parameter thread before the
+         * file worker starts. The worker never calls into a live DSP instance;
+         * session JSON receives the module's normal `state` blob verbatim. */
+        fx_reader_enter(m);
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+            snprintf(job->fx_id[i], sizeof(job->fx_id[i]), "%s", t->fx_module);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[i],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->get_param) {
+                int n = fx->api->get_param(fx->instance, "state",
+                                            job->fx_state[i],
+                                            sizeof(job->fx_state[i]));
+                if (n <= 0 || n >= (int)sizeof(job->fx_state[i]) ||
+                    (job->fx_state[i][0] != '{' && job->fx_state[i][0] != '['))
+                    job->fx_state[i][0] = '\0';
+            }
+        }
+        fx_reader_leave(m);
     }
     m->io_error = 0;
     m->io_busy = op;
@@ -1194,10 +1749,22 @@ static void track_fx_run(mark_t *m, mk_track_t *t, float *l, float *r) {
 
 void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
     if (!m) return;
+    if (frames > MARK_BLOCK_FRAMES) frames = MARK_BLOCK_FRAMES;
 
+    fx_apply_pending(m);
     swap_step(m);
-    for (int i = 0; i < MARK_TRACKS; i++)
-        if (m->t[i].fx_on) track_fx_prepare(&m->t[i]);
+    mk_ext_fx_t *block_fx[MARK_TRACKS] = {0};
+    int use_ext[MARK_TRACKS] = {0};
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_track_t *t = &m->t[i];
+        block_fx[i] = atomic_load_explicit(&m->fx_active[i], memory_order_acquire);
+        use_ext[i] = t->fx_on && t->fx_module[0] && block_fx[i] &&
+                     !strcmp(t->fx_module, block_fx[i]->id);
+        if (use_ext[i])
+            memset(m->fx_block[i], 0, (size_t)frames * 2 * sizeof(int16_t));
+        else if (t->fx_on && !t->fx_module[0])
+            track_fx_prepare(t);
+    }
 
     int paused = m->transport_paused;
     int use_measure_flag = m->measure_flag;
@@ -1251,7 +1818,8 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                  * feedback network advancing after a per-track stop instead
                  * of freezing stale audio for the next restart. */
                 if (!paused && t->st == MK_STOP && t->len > 0 &&
-                    t->fx_on && t->fx == TFX_DELAY && m->swap_track != i) {
+                    t->fx_on && !t->fx_module[0] && t->fx == TFX_DELAY &&
+                    m->swap_track != i) {
                     float l = 0.0f, r = 0.0f;
                     track_fx_run(m, t, &l, &r);
                     float gt = (float)t->level / 100.0f;
@@ -1288,12 +1856,17 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                 }
             }
 
-            if (t->fx_on && t->fx != TFX_OFF) track_fx_run(m, t, &l, &r);
-
-            float gt = (float)t->level / 100.0f;
-            t->g_cur += (gt - t->g_cur) * 0.002f;
-            outl += l * t->g_cur * t->pg[0];
-            outr += r * t->g_cur * t->pg[1];
+            if (use_ext[i]) {
+                m->fx_block[i][n * 2] = clip16(l);
+                m->fx_block[i][n * 2 + 1] = clip16(r);
+            } else {
+                if (t->fx_on && !t->fx_module[0] && t->fx != TFX_OFF)
+                    track_fx_run(m, t, &l, &r);
+                float gt = (float)t->level / 100.0f;
+                t->g_cur += (gt - t->g_cur) * 0.002f;
+                outl += l * t->g_cur * t->pg[0];
+                outr += r * t->g_cur * t->pg[1];
+            }
 
             t->pos += 1.0;
             if (t->pos >= (double)t->len) {
@@ -1305,9 +1878,34 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
             }
         }
 
-        float dry = m->monitor ? 1.0f : 0.0f;
-        out[n * 2]     = clip16(outl * m->master_g + inl * dry);
-        out[n * 2 + 1] = clip16(outr * m->master_g + inr * dry);
+        m->mix_l[n] = outl;
+        m->mix_r[n] = outr;
+    }
+
+    /* Audio-FX v2 is block-based. Process each selected track in-place, then
+     * add it to the float mix before MARK's fader/pan/master stages. A stopped
+     * track supplies silence, allowing reverb/delay tails to decay naturally. */
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        if (!use_ext[i]) continue;
+        mk_track_t *t = &m->t[i];
+        block_fx[i]->api->process_block(block_fx[i]->instance,
+                                        m->fx_block[i], frames);
+        float gt = (float)t->level / 100.0f;
+        for (int n = 0; n < frames; n++) {
+            t->g_cur += (gt - t->g_cur) * 0.002f;
+            m->mix_l[n] += (float)m->fx_block[i][n * 2]
+                         * t->g_cur * t->pg[0];
+            m->mix_r[n] += (float)m->fx_block[i][n * 2 + 1]
+                         * t->g_cur * t->pg[1];
+        }
+    }
+
+    float dry = m->monitor ? 1.0f : 0.0f;
+    for (int n = 0; n < frames; n++) {
+        out[n * 2] = clip16(m->mix_l[n] * m->master_g
+                            + (float)in[n * 2] * dry);
+        out[n * 2 + 1] = clip16(m->mix_r[n] * m->master_g
+                                + (float)in[n * 2 + 1] * dry);
     }
     m->global_frames += (uint64_t)frames;
 }
@@ -1321,7 +1919,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!strcmp(key, "rui_set")) {
         const char *separator = strchr(val, ':');
         size_t key_len = separator ? (size_t)(separator - val) : 0;
-        char routed_key[32];
+        char routed_key[128];
         if (!separator || key_len == 0 || key_len >= sizeof(routed_key)) return;
         memcpy(routed_key, val, key_len);
         routed_key[key_len] = '\0';
@@ -1358,7 +1956,12 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
             if (fx != t->fx) track_fx_reset(t);
             t->fx = fx;
             t->fx_dirty = 1;
+            if (t->fx_module[0]) request_fx_module(m, ti, "");
             m->edit_rev++;
+            return;
+        }
+        if (!strcmp(k, "fx_module")) {
+            request_fx_module(m, ti, val);
             return;
         }
         if (!strcmp(k, "fx_on")) {
@@ -1370,6 +1973,17 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
             return;
         }
         if (!strcmp(k, "fxp"))   { t->fxp = clampi(atoi(val), 0, 100); t->fx_dirty = 1; m->edit_rev++; return; }
+        if (!strncmp(k, "mod_", 4)) {
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->set_param) {
+                fx->api->set_param(fx->instance, k + 4, val);
+                m->edit_rev++;
+            }
+            fx_reader_leave(m);
+            return;
+        }
         return;
     }
 
@@ -1484,6 +2098,13 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
                 arr = (*end == ',') ? end + 1 : end;
             }
         }
+        if (strstr(val, "\"xm\":\"")) {
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                char id[MARK_FX_ID_MAX];
+                if (json_csv_string(val, "xm", i, id, sizeof(id)) == 0)
+                    request_fx_module(m, i, id);
+            }
+        }
         m->edit_rev++;
         return;
     }
@@ -1525,6 +2146,37 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         if (!strcmp(k, "fx"))    return snprintf(buf, (size_t)buf_len, "%d", t->fx);
         if (!strcmp(k, "fx_on")) return snprintf(buf, (size_t)buf_len, "%d", t->fx_on);
         if (!strcmp(k, "fxp"))   return snprintf(buf, (size_t)buf_len, "%d", t->fxp);
+        if (!strcmp(k, "fx_module"))
+            return snprintf(buf, (size_t)buf_len, "%s", t->fx_module);
+        if (!strcmp(k, "fx_status"))
+            return snprintf(buf, (size_t)buf_len, "%d", t->fx_status);
+        if (!strcmp(k, "fx_active"))
+            return snprintf(buf, (size_t)buf_len, "%s", t->fx_active);
+        if (!strcmp(k, "mod_hierarchy")) {
+            int result = -1;
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->hierarchy) {
+                size_t n = strlen(fx->hierarchy);
+                if (n < (size_t)buf_len) {
+                    memcpy(buf, fx->hierarchy, n + 1);
+                    result = (int)n;
+                }
+            }
+            fx_reader_leave(m);
+            return result;
+        }
+        if (!strncmp(k, "mod_", 4)) {
+            int result = -1;
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->get_param)
+                result = fx->api->get_param(fx->instance, k + 4, buf, buf_len);
+            fx_reader_leave(m);
+            return result;
+        }
         /* trigger params read back inactive */
         if (!strcmp(k, "btn") || !strcmp(k, "stop") || !strcmp(k, "clear"))
             return snprintf(buf, (size_t)buf_len, "0");
@@ -1532,6 +2184,17 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
     }
 
     if (!strcmp(key, "tstates")) return track_csv(m, buf, buf_len, g_state);
+    if (!strcmp(key, "fx_catalog")) {
+        int n = 0;
+        for (int i = 0; i < m->fx_catalog_count && n < buf_len - 8; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                    "%s%s|%s", i ? "," : "",
+                                    m->fx_catalog[i].id,
+                                    m->fx_catalog[i].name), buf_len);
+        return n;
+    }
+    if (!strcmp(key, "fx_module_count"))
+        return snprintf(buf, (size_t)buf_len, "%d", m->fx_catalog_count);
     if (!strcmp(key, "tpend"))   return track_csv(m, buf, buf_len, g_pend);
     if (!strcmp(key, "tpos")) {
         int n = 0;
@@ -1719,6 +2382,15 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
             n = nclamp(n + track_csv(m, buf + n, buf_len - n, arrs[f].get), buf_len);
             n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\""), buf_len);
         }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), ",\"xm\":\""), buf_len);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%s",
+                                    i ? "," : "", m->t[i].fx_module), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\",\"xs\":\""), buf_len);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", m->t[i].fx_status), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\""), buf_len);
         n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), ",\"ms\":\""), buf_len);
         if (n < buf_len - 24) {
             int w = mark_get_param(m, "tmeas", buf + n, buf_len - n);
@@ -1742,9 +2414,16 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
             ? (int)((double)MARK_SR * 60.0 / (fpt * 24.0) + 0.5) : 0;
         n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
                                 "\",\"run\":%d,\"un\":%d,\"io\":%d,\"mon\":%d,"
-                                "\"bpm\":%d,\"sec\":%u,\"sess\":\"",
+                                "\"bpm\":%d,\"sec\":%u,\"fc\":\"",
                                 run, undo_avail, m->io_busy, m->monitor,
                                 bpm, m->track_frames / MARK_SR), buf_len);
+        for (int i = 0; i < m->fx_catalog_count; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                    "%s%s|%s", i ? "," : "",
+                                    m->fx_catalog[i].id,
+                                    m->fx_catalog[i].name), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                "\",\"sess\":\""), buf_len);
         if (n < buf_len - 40) {
             int w = mark_get_param(m, "session_slots", buf + n, buf_len - n);
             if (w > 0) n = nclamp(n + w, buf_len);
