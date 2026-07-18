@@ -18,9 +18,11 @@ of choice is the RC-505.
 
 ## Install
 
-In schwung-manager, choose **Install Custom Module** and give it this
-repository URL (`https://github.com/timncox/schwung-mark`), or upload
-`mark-module.tar.gz` from the latest release.
+Open schwung-manager at **move.local:7700**, open the Module Store, search
+for **Mark**, and choose Install or Update. For a manual install, choose
+**Install Custom Module** and give it this repository URL
+(`https://github.com/timncox/schwung-mark`), or upload `mark-module.tar.gz`
+from the latest release.
 
 Launch from the overtake menu (**Shift+Vol+Jog-Click**). Back suspends
 the UI (audio keeps running); Shift+Vol+Jog-Click exits.
