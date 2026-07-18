@@ -2,8 +2,11 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - release.json
+      - .github/workflows/release.yml
 
 permissions:
   contents: write
@@ -25,3 +28,5 @@ jobs:
         with:
           files: build/mark-module.tar.gz
           generate_release_notes: true
+          tag_name: v0.4.0
+          target_commitish: main
