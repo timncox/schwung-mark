@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "audio_fx_api_v2.h"
 
@@ -38,10 +39,22 @@ static void fake_set(void *instance, const char *key, const char *val) {
 
 static int fake_get(void *instance, const char *key, char *buf, int len) {
     fake_fx_t *fx = (fake_fx_t *)instance;
+    /* Keep the call open briefly so the host test can exercise an unload
+     * racing a control-thread reader. */
+    usleep(250);
     if (!strcmp(key, "gain")) return snprintf(buf, (size_t)len, "%d", fx->gain);
     if (!strcmp(key, "state"))
         return snprintf(buf, (size_t)len, "{\"gain\":%d}", fx->gain);
     return -1;
+}
+
+static void fake_midi(void *instance, const uint8_t *msg, int len, int source) {
+    fake_fx_t *fx = (fake_fx_t *)instance;
+    (void)msg;
+    (void)len;
+    (void)source;
+    usleep(250);
+    if (fx->gain < 0) fx->gain = 0;
 }
 
 static audio_fx_api_v2_t api = {
@@ -51,7 +64,7 @@ static audio_fx_api_v2_t api = {
     .process_block = fake_process,
     .set_param = fake_set,
     .get_param = fake_get,
-    .on_midi = NULL,
+    .on_midi = fake_midi,
 };
 
 audio_fx_api_v2_t *move_audio_fx_init_v2(const host_api_v1_t *host) {

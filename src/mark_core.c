@@ -229,6 +229,12 @@ struct mark {
     _Atomic(mk_ext_fx_t *) fx_active[MARK_TRACKS];
     _Atomic(mk_fx_result_t *) fx_pending[MARK_TRACKS];
     _Atomic(mk_fx_result_t *) fx_done[MARK_TRACKS];
+    /* get/set/on_midi may arrive on host control threads while the audio
+     * callback swaps fx_active. Readers enter before loading an active
+     * pointer; the loader waits for a zero-reader grace point before
+     * destroying a retired instance. An atomic pointer alone does not keep
+     * the object it names alive. */
+    _Atomic uint32_t fx_readers;
     char session_fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
     char session_fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
     _Atomic int session_fx_ready[MARK_TRACKS];
@@ -601,6 +607,19 @@ static mk_ext_fx_t *ext_fx_load(mark_t *m, const char *id, const char *state) {
     return fx;
 }
 
+static void fx_reader_enter(mark_t *m) {
+    atomic_fetch_add_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_reader_leave(mark_t *m) {
+    atomic_fetch_sub_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_wait_for_readers(mark_t *m) {
+    while (atomic_load_explicit(&m->fx_readers, memory_order_seq_cst) != 0)
+        usleep(100);
+}
+
 static int fx_enqueue(mark_t *m, int track, const char *id) {
     uint32_t head = atomic_load_explicit(&m->fx_req_head, memory_order_relaxed);
     uint32_t tail = atomic_load_explicit(&m->fx_req_tail, memory_order_acquire);
@@ -654,6 +673,11 @@ static void *fx_worker(void *arg) {
             mk_fx_result_t *done = atomic_exchange_explicit(
                 &m->fx_done[i], NULL, memory_order_acq_rel);
             if (done) {
+                /* A control/MIDI callback may have loaded the old active
+                 * pointer immediately before the audio-thread swap. Wait
+                 * until every such callback has returned before destroy or
+                 * dlclose makes its instance/API pointers invalid. */
+                if (done->retired) fx_wait_for_readers(m);
                 ext_fx_destroy(done->retired);
                 /* done->next is now owned by fx_active on a successful load. */
                 free(done);
@@ -806,6 +830,7 @@ void mark_destroy(mark_t *m) {
         atomic_store_explicit(&m->fx_thread_stop, 1, memory_order_release);
         pthread_join(m->fx_thread, NULL);
     }
+    fx_wait_for_readers(m);
     for (int i = 0; i < MARK_TRACKS; i++) {
         mk_fx_result_t *pending = atomic_exchange(&m->fx_pending[i], NULL);
         if (pending) {
@@ -862,12 +887,14 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
     /* Hosted effects receive the same clock/transport stream a normal
      * Schwung Chain slot would. UI performance messages can also reach
      * effects that opt into on_midi. */
+    fx_reader_enter(m);
     for (int i = 0; i < MARK_TRACKS; i++) {
         mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[i],
                                                 memory_order_acquire);
         if (fx && fx->api && fx->api->on_midi)
             fx->api->on_midi(fx->instance, msg, len, source);
     }
+    fx_reader_leave(m);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1590,6 +1617,7 @@ static void session_start(mark_t *m, int slot, int op) {
         /* Snapshot plugin settings on the audio/parameter thread before the
          * file worker starts. The worker never calls into a live DSP instance;
          * session JSON receives the module's normal `state` blob verbatim. */
+        fx_reader_enter(m);
         for (int i = 0; i < MARK_TRACKS; i++) {
             mk_track_t *t = &m->t[i];
             snprintf(job->fx_id[i], sizeof(job->fx_id[i]), "%s", t->fx_module);
@@ -1604,6 +1632,7 @@ static void session_start(mark_t *m, int slot, int op) {
                     job->fx_state[i][0] = '\0';
             }
         }
+        fx_reader_leave(m);
     }
     m->io_error = 0;
     m->io_busy = op;
@@ -1945,12 +1974,14 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         }
         if (!strcmp(k, "fxp"))   { t->fxp = clampi(atoi(val), 0, 100); t->fx_dirty = 1; m->edit_rev++; return; }
         if (!strncmp(k, "mod_", 4)) {
+            fx_reader_enter(m);
             mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
                                                     memory_order_acquire);
             if (fx && !strcmp(fx->id, t->fx_module) && fx->api->set_param) {
                 fx->api->set_param(fx->instance, k + 4, val);
                 m->edit_rev++;
             }
+            fx_reader_leave(m);
             return;
         }
         return;
@@ -2122,20 +2153,29 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         if (!strcmp(k, "fx_active"))
             return snprintf(buf, (size_t)buf_len, "%s", t->fx_active);
         if (!strcmp(k, "mod_hierarchy")) {
+            int result = -1;
+            fx_reader_enter(m);
             mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
                                                     memory_order_acquire);
-            if (!fx || strcmp(fx->id, t->fx_module) || !fx->hierarchy) return -1;
-            size_t n = strlen(fx->hierarchy);
-            if (n >= (size_t)buf_len) return -1;
-            memcpy(buf, fx->hierarchy, n + 1);
-            return (int)n;
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->hierarchy) {
+                size_t n = strlen(fx->hierarchy);
+                if (n < (size_t)buf_len) {
+                    memcpy(buf, fx->hierarchy, n + 1);
+                    result = (int)n;
+                }
+            }
+            fx_reader_leave(m);
+            return result;
         }
         if (!strncmp(k, "mod_", 4)) {
+            int result = -1;
+            fx_reader_enter(m);
             mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
                                                     memory_order_acquire);
             if (fx && !strcmp(fx->id, t->fx_module) && fx->api->get_param)
-                return fx->api->get_param(fx->instance, k + 4, buf, buf_len);
-            return -1;
+                result = fx->api->get_param(fx->instance, k + 4, buf, buf_len);
+            fx_reader_leave(m);
+            return result;
         }
         /* trigger params read back inactive */
         if (!strcmp(k, "btn") || !strcmp(k, "stop") || !strcmp(k, "clear"))

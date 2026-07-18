@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 #include "../src/mark_core.h"
@@ -580,6 +582,22 @@ static void wait_fx(mark_t *m, int track, int wanted) {
     assert(!"hosted fx load never finished");
 }
 
+typedef struct {
+    mark_t *m;
+    _Atomic int stop;
+} fx_reader_race_t;
+
+static void *fx_reader_race(void *arg) {
+    fx_reader_race_t *race = (fx_reader_race_t *)arg;
+    uint8_t tick = 0xF8;
+    char buf[64];
+    while (!atomic_load_explicit(&race->stop, memory_order_acquire)) {
+        (void)mark_get_param(race->m, "t1_mod_gain", buf, sizeof(buf));
+        mark_on_midi(race->m, &tick, 1, 0);
+    }
+    return NULL;
+}
+
 static void test_hosted_schwung_fx(void) {
     mark_t *m = mark_create_in_dir(&host, "build/test-modules/overtake/mark");
     assert(m);
@@ -597,6 +615,21 @@ static void test_hosted_schwung_fx(void) {
     mark_set_param(m, "t1_fx_module", "testfx");
     mark_set_param(m, "t1_fx_on", "1");
     wait_fx(m, 0, 2);
+
+    /* Control/MIDI readers must never outlive an instance retired at the
+     * next audio-block swap. This used to leave a narrow use-after-dlclose
+     * window that crashed MoveOriginal through an invalid function pointer. */
+    fx_reader_race_t race = {.m = m};
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, fx_reader_race, &race) == 0);
+    for (int i = 0; i < 24; i++) {
+        mark_set_param(m, "t1_fx_module", "");
+        wait_fx(m, 0, 0);
+        mark_set_param(m, "t1_fx_module", "testfx");
+        wait_fx(m, 0, 2);
+    }
+    atomic_store_explicit(&race.stop, 1, memory_order_release);
+    pthread_join(reader, NULL);
 
     gp_str(m, "t1_fx_module", buf, sizeof(buf));
     assert(!strcmp(buf, "testfx"));
