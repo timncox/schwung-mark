@@ -1,6 +1,6 @@
 ---
 status: active
-last_touched: 2026-07-18
+last_touched: 2026-07-20
 deploy: scripts/deploy.sh
 ---
 
@@ -17,6 +17,8 @@ and browser mixer are in `src/ui_overtake.js` and `src/web_ui.html`.
 - Keep the render path non-allocating; session file I/O belongs on its worker.
 - Session failures must preserve the current in-memory performance.
 - `make arm` stages and cross-compiles the module archive with Docker.
+- Mark has one catalog ID, so keep its `release.json` in Schwung's documented
+  single-module shape and validate the canonical asset URL before tagging.
 - `scripts/deploy.sh` writes to Move hardware. Do not run it without explicit
   deployment authorization.
 
