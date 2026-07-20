@@ -82,4 +82,8 @@ make arm     # Docker cross-compile for the Move + tarball
 scripts/deploy.sh   # scp straight onto move.local + rescan
 ```
 
+Mark publishes one catalog module, so it intentionally keeps Schwung's
+single-module `release.json` format. The nested multi-module format is reserved
+for repositories that publish more than one catalog ID.
+
 MIT. Engine patterns borrowed from [schwung-smack](https://github.com/timncox/schwung-smack).
