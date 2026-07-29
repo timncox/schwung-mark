@@ -370,43 +370,139 @@ function pollStatus() {
     return true;
 }
 
+/* ------------------------------------------------------------ bulk reads
+ *
+ * A single gp() is a BLOCKING round-trip to the shim, serviced once per SPI
+ * frame (~23 ms) and abandoned after 100 ms — schwung's comment above
+ * js_shadow_get_param calls it "the where-does-the-tick-time-go measurement".
+ * The channel serves roughly 44 reads a second in total, and this UI was
+ * asking for 224: a full refresh of fifty-odd keys, three times a second, on
+ * top of a per-tick status poll. Past the ceiling reads simply TIME OUT and
+ * return null, so the UI starves itself and then acts on missing data.
+ *
+ * Overtake modules get BULK_GET — one round-trip for up to 64 keys. Wire
+ * format from shim_handle_param_bulk / bulk_next in schwung's
+ * src/schwung_shim.c: "<count>\n" then records of "<len>\n<bytes>", request
+ * carrying keys and response carrying values in the same order. Falls back to
+ * individual reads on a host without the binding. */
+const BULK_MAX = 48;
+
+function encodeBulk(items) {
+    let out = `${items.length}\n`;
+    for (const it of items) out += `${it.length}\n${it}`;
+    return out;
+}
+
+function decodeBulk(blob, expected) {
+    const out = new Array(expected).fill(null);
+    const s = `${blob}`;
+    let p = 0;
+    const readLen = () => {
+        let n = 0, any = false;
+        while (p < s.length && s[p] >= '0' && s[p] <= '9') {
+            n = n * 10 + (s.charCodeAt(p) - 48); p++; any = true;
+        }
+        if (!any || s[p] !== '\n') return -1;
+        p++;
+        return n;
+    };
+    const count = readLen();
+    if (count < 0) return null;
+    for (let i = 0; i < count && i < expected; i++) {
+        const len = readLen();
+        if (len < 0) return null;
+        out[i] = s.slice(p, p + len);
+        p += len;
+    }
+    return out;
+}
+
+function getParams(keys) {
+    const out = {};
+    if (typeof host_module_get_params !== 'function') {
+        for (const k of keys) out[k] = gp(k);
+        return out;
+    }
+    for (let base = 0; base < keys.length; base += BULK_MAX) {
+        const chunk = keys.slice(base, base + BULK_MAX);
+        const blob = host_module_get_params(encodeBulk(chunk));
+        const vals = (blob === null || blob === undefined)
+            ? null : decodeBulk(blob, chunk.length);
+        if (!vals) { for (const k of chunk) out[k] = gp(k); continue; }
+        for (let i = 0; i < chunk.length; i++) out[chunk[i]] = vals[i];
+    }
+    return out;
+}
+
+/* decodeDelta reports ACCUMULATED encoder movement, so one brisk turn arrives
+ * as a single event carrying 20 or more. Applied raw to a short range that
+ * lands on an end stop every time and makes the values in between unreachable.
+ * Cap the magnitude at a quarter of the range. */
+function scaledSteps(delta, min, max, step) {
+    const span = Math.max(1, Math.round((max - min) / (step || 1)));
+    const cap = Math.max(1, Math.ceil(span / 4));
+    const mag = Math.min(Math.abs(delta), cap);
+    return delta > 0 ? mag : -mag;
+}
+
 function fetchAll() {
     const rs = gp('run_state');
     if (rs === null) return false;       /* DSP not up yet — retry in tick */
-    for (let i = 0; i < KNOBS.length; i++) {
-        if (!KNOBS[i]) continue;
-        const v = gp(KNOBS[i].key);
-        if (v !== null) knobValues[i] = parseFloat(v) || 0;
-    }
-    for (let i = 0; i < KNOBS2.length; i++) {
-        if (!KNOBS2[i]) continue;
-        const v = gp(KNOBS2[i].key);
-        if (v !== null) knob2Values[i] = parseFloat(v) || 0;
-    }
+
+    /* One round-trip for the lot. Read individually this was over fifty
+     * blocking frames, three times a second. */
+    const keys = [];
+    for (const k of KNOBS) if (k) keys.push(k.key);
+    for (const k of KNOBS2) if (k) keys.push(k.key);
+    for (let i = 1; i <= TRACKS; i++)
+        keys.push(`t${i}_rev`, `t${i}_shot`, `t${i}_fx`, `t${i}_fx_on`, `t${i}_fxp`,
+                  `t${i}_fx_module`, `t${i}_fx_status`);
+    keys.push('tmeas', 'quantize', 'rec_grid', 'rec_action', 'dub_mode',
+              'play_mode', 'grid_bpm', 'monitor', 'bpm_override');
+    const v = getParams(keys);
+
+    /* A read that did not come back keeps its previous value. Folding null
+     * into a literal default put that default in the mirror, and the mirror
+     * is written back to the DSP on the next knob turn — a saturated channel
+     * could silently reset the whole surface. */
+    const num = (key, prev) => {
+        const raw = v[key];
+        if (raw === undefined || raw === null || raw === '') return prev;
+        const n = parseFloat(raw);
+        return Number.isFinite(n) ? n : prev;
+    };
+
+    for (let i = 0; i < KNOBS.length; i++)
+        if (KNOBS[i]) knobValues[i] = num(KNOBS[i].key, knobValues[i]);
+    for (let i = 0; i < KNOBS2.length; i++)
+        if (KNOBS2[i]) knob2Values[i] = num(KNOBS2[i].key, knob2Values[i]);
+
     for (let i = 0; i < TRACKS; i++) {
         const oldMod = tfxmod[i], oldStatus = tfxstatus[i];
-        trev[i]  = parseInt(gp(`t${i + 1}_rev`) || '0', 10);
-        tshot[i] = parseInt(gp(`t${i + 1}_shot`) || '0', 10);
-        tfx[i]   = parseInt(gp(`t${i + 1}_fx`) || '1', 10);
-        tfxon[i] = parseInt(gp(`t${i + 1}_fx_on`) || '0', 10);
-        tfxp[i]  = parseInt(gp(`t${i + 1}_fxp`) || '50', 10);
+        trev[i]  = num(`t${i + 1}_rev`, trev[i]);
+        tshot[i] = num(`t${i + 1}_shot`, tshot[i]);
+        tfx[i]   = num(`t${i + 1}_fx`, tfx[i]);
+        tfxon[i] = num(`t${i + 1}_fx_on`, tfxon[i]);
+        tfxp[i]  = num(`t${i + 1}_fxp`, tfxp[i]);
         if (!pendingFxChoice || pendingFxChoice.track !== i) {
-            tfxmod[i] = gp(`t${i + 1}_fx_module`) || '';
-            tfxstatus[i] = parseInt(gp(`t${i + 1}_fx_status`) || '0', 10);
+            const mod = v[`t${i + 1}_fx_module`];
+            if (mod !== null && mod !== undefined) tfxmod[i] = mod;
+            tfxstatus[i] = num(`t${i + 1}_fx_status`, tfxstatus[i]);
         }
         if (tfxmod[i] !== oldMod) fxParamValues[i] = {};
         if (tfxstatus[i] === 2 && (oldStatus !== 2 || tfxmod[i] !== oldMod))
             refreshHostedParams(i);
     }
-    parseCsv(gp('tmeas'), tmeas);
-    quantize  = parseInt(gp('quantize') || '1', 10);
-    recGrid   = parseInt(gp('rec_grid') || '0', 10);
-    recAction = parseInt(gp('rec_action') || '0', 10);
-    dubMode   = parseInt(gp('dub_mode') || '0', 10);
-    playMode  = parseInt(gp('play_mode') || '0', 10);
-    gridBpm   = parseInt(gp('grid_bpm') || '120', 10);
-    monitorOn = (gp('monitor') || '1') !== '0';
-    bpmOverride = parseFloat(gp('bpm_override')) || 0;
+
+    if (v.tmeas) parseCsv(v.tmeas, tmeas);
+    quantize  = num('quantize', quantize);
+    recGrid   = num('rec_grid', recGrid);
+    recAction = num('rec_action', recAction);
+    dubMode   = num('dub_mode', dubMode);
+    playMode  = num('play_mode', playMode);
+    gridBpm   = num('grid_bpm', gridBpm);
+    monitorOn = num('monitor', monitorOn ? 1 : 0) !== 0;
+    bpmOverride = num('bpm_override', bpmOverride);
     if (sessionMode) fetchSlots();
     pollStatus();
     return true;
@@ -438,7 +534,7 @@ function adjustKnob(bank, i, delta) {
     if (k.isBpm) {
         /* 49 and below = Off (project tempo); 50-200 = override */
         const cur = vals[i] > 0 ? vals[i] : 49;
-        const v = Math.max(49, Math.min(200, Math.round(cur) + delta * k.step));
+        const v = Math.max(49, Math.min(200, Math.round(cur) + scaledSteps(delta, 49, 200, k.step) * k.step));
         const out = v < 50 ? 0 : v;
         vals[i] = out;
         bpmOverride = out;
@@ -450,7 +546,7 @@ function adjustKnob(bank, i, delta) {
     const max = k.opts ? k.opts.length - 1 : k.max;
     const min = k.opts ? 0 : k.min;
     const step = k.opts ? 1 : k.step;
-    const v = Math.max(min, Math.min(max, vals[i] + delta * step));
+    const v = Math.max(min, Math.min(max, vals[i] + scaledSteps(delta, min, max, step) * step));
     if (v === vals[i]) return;
     vals[i] = v;
     host_module_set_param(k.key, `${Math.round(v)}`);
@@ -509,7 +605,7 @@ function adjustHostedParam(track, index, delta) {
                                    Math.round(cur) + (delta > 0 ? 1 : -1)));
     } else {
         const step = p.step > 0 ? p.step : 1;
-        next = Math.max(p.min, Math.min(p.max, cur + delta * step));
+        next = Math.max(p.min, Math.min(p.max, cur + scaledSteps(delta, p.min, p.max, step) * step));
     }
     if (next === cur && !trigger) return;
     fxParamValues[track][p.key] = next;
@@ -524,7 +620,7 @@ function adjustFxParam(delta) {
         adjustHostedParam(curTrack, 0, delta);
         return;
     }
-    const v = Math.max(0, Math.min(100, tfxp[curTrack] + delta * 5));
+    const v = Math.max(0, Math.min(100, tfxp[curTrack] + scaledSteps(delta, 0, 100, 5) * 5));
     if (v === tfxp[curTrack]) return;
     tfxp[curTrack] = v;
     host_module_set_param(`t${curTrack + 1}_fxp`, `${v}`);
@@ -822,8 +918,11 @@ globalThis.tick = function() {
         }
     }
 
-    /* per-tick status poll drives blink, chase and async transitions */
-    pollStatus();
+    /* Every other tick, not every tick. One poll is one blocking read, and at
+     * 44 a second it claimed the whole param channel by itself — which is what
+     * made the editor's own reads time out. Twenty-two updates a second still
+     * reads as continuous motion. */
+    if (tickCount % 2 === 0) pollStatus();
     if (anyPending && tickCount % 4 === 0) paintTracks(false);
     paintSteps(false);
 
