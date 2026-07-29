@@ -8,9 +8,9 @@ else
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: test arm clean
+.PHONY: test test-ui arm clean
 
-test: build/host_sim
+test: build/host_sim test-ui
 	./build/host_sim
 
 build/host_sim: src/mark_core.c src/mark_core.h test/host_sim.c $(TEST_FX_DIR)/testfx.so
@@ -27,3 +27,6 @@ arm:
 
 clean:
 	rm -rf build
+
+test-ui:
+	node --no-warnings --experimental-vm-modules test/ui_overtake.mjs
