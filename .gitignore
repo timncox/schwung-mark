@@ -1,3 +1,6 @@
 build/
 *.so
 .DS_Store
+
+# agent worktrees are separate checkouts, never part of a commit
+.claude/worktrees/
