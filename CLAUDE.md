@@ -1,6 +1,6 @@
 ---
 status: active
-last_touched: 2026-07-18
+last_touched: 2026-07-30
 ---
 
 # Mark
@@ -55,6 +55,11 @@ Distribution repo: github.com/timncox/schwung-mark.
   (chain slots deliver one external CC twice: channel dispatch + FX
   broadcast — verified in schwung shadow_midi.c 2026-07-24). Map in
   README; overtake delivery is channel-blind and exactly-once.
+- Hosted Audio FX root knobs follow the generic module interaction contract:
+  explicit `behavior: "trigger"` or idle/trigger enum options make a
+  directional one-shot (CW fires once, CCW idles/re-arms, 700 ms pause starts a
+  new gesture); `knob_acceleration: "wide"` uses 10x/50x/250x speed bands;
+  enum reads remember whether the child exchanges indices or option names.
 
 ## Engine model
 
@@ -104,7 +109,8 @@ Distribution repo: github.com/timncox/schwung-mark.
 Bump `modules/overtake/mark/module.json` version + root `release.json`,
 `make arm`, commit/push, `gh release create vX` with
 `build/mark-module.tar.gz`. Installer resolves release.json →
-download_url. Not in the schwung catalog yet (add after hardware test).
+download_url. Mark's existing Schwung catalog entry reads this repository's
+single-module release metadata.
 
 ## Not yet verified on hardware
 

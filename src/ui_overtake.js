@@ -37,7 +37,7 @@ import {
     Cyan, Purple, YellowGreen, OrangeRed
 } from '/data/UserData/schwung/shared/constants.mjs';
 
-import { decodeDelta, decodeAcceleratedDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
+import { decodeDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
 
 import {
     drawMenuHeader as drawHeader,
@@ -91,6 +91,7 @@ const CLEAR_HOLD_MS = 600;
 const SAVE_HOLD_MS = 600;
 const FX_EDIT_HOLD_MS = 600;
 const FX_LOAD_DEBOUNCE_MS = 220;
+const TRIGGER_GESTURE_RESET_MS = 700;
 
 /* Knobs 1-8, page 1 */
 const KNOBS = [
@@ -134,6 +135,8 @@ let tfxp     = [50, 50, 50, 50, 50];
 let tfxmod   = ['', '', '', '', ''];
 let tfxstatus = [0, 0, 0, 0, 0];
 let fxParamValues = [{}, {}, {}, {}, {}];
+let fxParamFormats = [{}, {}, {}, {}, {}];
+let fxParamGestures = [{}, {}, {}, {}, {}];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
@@ -195,9 +198,18 @@ function paramDef(hierarchy, key) {
     return null;
 }
 
-function normalizeFxParam(hierarchy, key) {
-    const raw = paramDef(hierarchy, key) || {};
+function normalizeFxParam(hierarchy, key, inline) {
+    const raw = Object.assign({}, paramDef(hierarchy, key) || {}, inline || {});
     const options = Array.isArray(raw.options) ? raw.options.map(String) : null;
+    const normalized = (options || []).map(v => v.trim().toLowerCase());
+    const behavior = raw.behavior === 'trigger' ||
+        (normalized.includes('idle') && normalized.includes('trigger'))
+        ? 'trigger' : '';
+    let def = Number(raw.default);
+    if (!Number.isFinite(def)) {
+        const named = options ? normalized.indexOf(String(raw.default || '').trim().toLowerCase()) : -1;
+        def = named >= 0 ? named : 0;
+    }
     return {
         key,
         name: String(raw.name || raw.label || key),
@@ -206,8 +218,10 @@ function normalizeFxParam(hierarchy, key) {
         min: raw.min === undefined ? 0 : Number(raw.min),
         max: raw.max === undefined ? (options ? options.length - 1 : 100) : Number(raw.max),
         step: raw.step === undefined ? 1 : Number(raw.step),
-        def: raw.default === undefined ? 0 : Number(raw.default),
-        accel: String(raw.knob_acceleration || '')
+        def,
+        behavior,
+        accel: raw.knob_acceleration === 'wide' || raw.knobAcceleration === 'wide'
+            ? 'wide' : ''
     };
 }
 
@@ -235,8 +249,11 @@ function discoverFxModules() {
         const knobs = root && Array.isArray(root.knobs) ? root.knobs : [];
         const params = [];
         for (let k = 0; k < knobs.length && params.length < 8; k++) {
-            if (typeof knobs[k] === 'string')
+            if (typeof knobs[k] === 'string') {
                 params.push(normalizeFxParam(hierarchy, knobs[k]));
+            } else if (knobs[k] && typeof knobs[k] === 'object' && knobs[k].key) {
+                params.push(normalizeFxParam(hierarchy, knobs[k].key, knobs[k]));
+            }
         }
         fxChoices.push({
             kind: 'module', id,
@@ -274,15 +291,42 @@ function fxChoiceHasEffect(track) {
     return c.kind === 'module' || c.index > 0;
 }
 
+function enumRawUsesIndex(p, raw) {
+    if (!p.options || raw === null || raw === undefined) return true;
+    const text = String(raw).trim();
+    const named = p.options.some(v => v.trim().toLowerCase() === text.toLowerCase());
+    return !named && Number.isFinite(Number(text));
+}
+
+function hostedRawValue(p, raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    if (p.options) {
+        const text = String(raw).trim().toLowerCase();
+        const named = p.options.findIndex(v => v.trim().toLowerCase() === text);
+        if (named >= 0) return named;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+}
+
+function hostedEnumValue(track, p, index) {
+    const i = Math.max(0, Math.min(p.options.length - 1, Math.round(index)));
+    return fxParamFormats[track][p.key] === false ? p.options[i] : `${i}`;
+}
+
 function refreshHostedParams(track) {
     const choice = currentFxChoice(track);
     if (choice.kind !== 'module' || tfxstatus[track] !== 2) return;
     for (let i = 0; i < choice.params.length; i++) {
         const p = choice.params[i];
         const raw = gp(`t${track + 1}_mod_${p.key}`);
-        if (raw !== null && raw !== '') fxParamValues[track][p.key] = Number(raw);
-        else if (fxParamValues[track][p.key] === undefined)
+        const value = hostedRawValue(p, raw);
+        if (value !== null) {
+            fxParamValues[track][p.key] = value;
+            if (p.options) fxParamFormats[track][p.key] = enumRawUsesIndex(p, raw);
+        } else if (fxParamValues[track][p.key] === undefined) {
             fxParamValues[track][p.key] = p.def;
+        }
     }
 }
 
@@ -489,7 +533,11 @@ function fetchAll() {
             if (mod !== null && mod !== undefined) tfxmod[i] = mod;
             tfxstatus[i] = num(`t${i + 1}_fx_status`, tfxstatus[i]);
         }
-        if (tfxmod[i] !== oldMod) fxParamValues[i] = {};
+        if (tfxmod[i] !== oldMod) {
+            fxParamValues[i] = {};
+            fxParamFormats[i] = {};
+            fxParamGestures[i] = {};
+        }
         if (tfxstatus[i] === 2 && (oldStatus !== 2 || tfxmod[i] !== oldMod))
             refreshHostedParams(i);
     }
@@ -578,11 +626,78 @@ function adjustFxType(delta) {
         tfxmod[curTrack] = choice.id;
         tfxstatus[curTrack] = 1;
         fxParamValues[curTrack] = {};
+        fxParamFormats[curTrack] = {};
+        fxParamGestures[curTrack] = {};
         pendingFxChoice = { track: curTrack, id: choice.id,
                             at: Date.now() + FX_LOAD_DEBOUNCE_MS };
     }
     announceParameter(`Track ${curTrack + 1} effect`, choice.speech);
     needsRedraw = true;
+}
+
+function hostedGesture(track, key) {
+    if (!fxParamGestures[track][key]) {
+        fxParamGestures[track][key] = {
+            lastTurnMs: 0, direction: 0, triggerLatched: false
+        };
+    }
+    return fxParamGestures[track][key];
+}
+
+function triggerIndices(p) {
+    if (p.behavior !== 'trigger' || !p.options || p.options.length < 2) return null;
+    const normalized = p.options.map(v => v.trim().toLowerCase());
+    const idle = normalized.indexOf('idle');
+    const trigger = normalized.indexOf('trigger');
+    return idle >= 0 && trigger >= 0 ? { idle, trigger } : { idle: 0, trigger: 1 };
+}
+
+function applyHostedTrigger(track, choice, p, delta) {
+    const indices = triggerIndices(p);
+    if (!indices || delta === 0) return false;
+
+    const now = Date.now();
+    const gesture = hostedGesture(track, p.key);
+    if (!gesture.lastTurnMs || now - gesture.lastTurnMs > TRIGGER_GESTURE_RESET_MS)
+        gesture.triggerLatched = false;
+    gesture.lastTurnMs = now;
+    gesture.direction = delta > 0 ? 1 : -1;
+    fxParamValues[track][p.key] = indices.idle;
+
+    let sendIndex = null;
+    if (delta < 0) {
+        gesture.triggerLatched = false;
+        sendIndex = indices.idle;
+    } else if (!gesture.triggerLatched) {
+        gesture.triggerLatched = true;
+        sendIndex = indices.trigger;
+    }
+
+    if (sendIndex !== null) {
+        host_module_set_param(`t${track + 1}_mod_${p.key}`,
+                              hostedEnumValue(track, p, sendIndex));
+        announceParameter(`${choice.name} ${p.name}`, p.options[sendIndex]);
+    }
+    needsRedraw = true;
+    return true;
+}
+
+function accelerateWideDelta(track, p, delta) {
+    if (p.accel !== 'wide' || delta === 0) return delta;
+    const now = Date.now();
+    const direction = delta > 0 ? 1 : -1;
+    const gesture = hostedGesture(track, p.key);
+    const elapsed = gesture.lastTurnMs > 0
+        ? now - gesture.lastTurnMs : Number.POSITIVE_INFINITY;
+    let multiplier = 1;
+    if (direction === gesture.direction) {
+        if (elapsed <= 35) multiplier = 250;
+        else if (elapsed <= 90) multiplier = 50;
+        else if (elapsed <= 180) multiplier = 10;
+    }
+    gesture.lastTurnMs = now;
+    gesture.direction = direction;
+    return delta * multiplier;
 }
 
 function adjustHostedParam(track, index, delta) {
@@ -594,22 +709,24 @@ function adjustHostedParam(track, index, delta) {
                                       : `${choice.name} loading`);
         return;
     }
+    if (applyHostedTrigger(track, choice, p, delta)) return;
     let cur = fxParamValues[track][p.key];
     if (cur === undefined || Number.isNaN(cur)) cur = p.def;
     let next;
-    const trigger = p.options && p.options.some(v => v.toLowerCase() === 'trigger');
-    if (trigger) {
-        next = delta > 0 ? p.options.findIndex(v => v.toLowerCase() === 'trigger') : 0;
-    } else if (p.options) {
+    if (p.options) {
         next = Math.max(0, Math.min(p.options.length - 1,
                                    Math.round(cur) + (delta > 0 ? 1 : -1)));
     } else {
         const step = p.step > 0 ? p.step : 1;
-        next = Math.max(p.min, Math.min(p.max, cur + scaledSteps(delta, p.min, p.max, step) * step));
+        const steps = p.accel === 'wide'
+            ? accelerateWideDelta(track, p, delta)
+            : scaledSteps(delta, p.min, p.max, step);
+        next = Math.max(p.min, Math.min(p.max, cur + steps * step));
     }
-    if (next === cur && !trigger) return;
+    if (next === cur) return;
     fxParamValues[track][p.key] = next;
-    host_module_set_param(`t${track + 1}_mod_${p.key}`, `${next}`);
+    const value = p.options ? hostedEnumValue(track, p, next) : `${next}`;
+    host_module_set_param(`t${track + 1}_mod_${p.key}`, value);
     announceParameter(`${choice.name} ${p.name}`, hostedParamDisplay(track, p));
     needsRedraw = true;
 }
@@ -990,13 +1107,7 @@ globalThis.onMidiMessageInternal = function(data) {
         }
         if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
             const k = d1 - MoveKnob1;
-            let delta = decodeDelta(d2);
-            if (!shiftHeld) {
-                const choice = currentFxChoice(curTrack);
-                const p = choice.kind === 'module'
-                    ? choice.params[fxEdit ? k : (k === 7 ? 0 : -1)] : null;
-                if (p && p.accel) delta = decodeAcceleratedDelta(d2, d1);
-            }
+            const delta = decodeDelta(d2);
             if (delta === 0) return;
             if (!shiftHeld && fxEdit) { adjustHostedParam(curTrack, k, delta); return; }
             if (!shiftHeld && k === 6) { adjustFxType(delta); return; }

@@ -2,7 +2,7 @@
   "id": "mark",
   "name": "Mark",
   "abbrev": "MRK",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Five-track live loop station with per-track recording, sessions, sync, and built-in or hosted Schwung Audio FX",
   "dsp": "dsp.so",
   "ui": "ui.js",

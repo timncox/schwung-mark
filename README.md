@@ -59,6 +59,12 @@ tracks exclusive song sections. The **web mixer** (move.local → Remote
 UI → Tool tab, manager > v0.11.4) has faders, pans, FX, modes, and the
 session grid.
 
+Hosted FX follow Schwung's generic interaction metadata: directional trigger
+knobs fire once clockwise, turn left to return to idle/re-arm, and automatically
+re-arm after a short pause. Parameters marked `knob_acceleration: "wide"` keep
+single-step precision during slow turns while fast turns cross large ranges
+quickly. Both numeric and name-based enum modules are supported.
+
 ## Sync
 
 Set Move's **MIDI Clock to Out** (Settings → MIDI Sync) to lock loops to

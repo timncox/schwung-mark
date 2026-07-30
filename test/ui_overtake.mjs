@@ -35,6 +35,40 @@ const constants = {
 };
 
 const TRACKS = 5;
+let nowMs = 1000;
+class FakeDate extends Date {
+    static now() { return nowMs; }
+}
+
+const moduleMetadata = new Map([
+    ['mockfx', {
+        name: 'Mock FX',
+        capabilities: {
+            ui_hierarchy: {
+                levels: {
+                    root: {
+                        knobs: [
+                            { key: 'reroll', name: 'Reroll', type: 'enum',
+                              options: ['idle', 'trigger'], behavior: 'trigger',
+                              default: 'idle' },
+                            'seed',
+                            'mode',
+                            'capture'
+                        ],
+                        params: [
+                            { key: 'seed', name: 'Seed', type: 'int', min: 0,
+                              max: 5000, step: 1, knob_acceleration: 'wide' },
+                            { key: 'mode', name: 'Mode', type: 'enum',
+                              options: ['clean', 'wild'], default: 'clean' },
+                            { key: 'capture', name: 'Capture', type: 'enum',
+                              options: ['idle', 'trigger'], default: 'idle' }
+                        ]
+                    }
+                }
+            }
+        }
+    }]
+]);
 
 /* A plausible engine state. `status` is pipe-delimited with CSV fields. */
 const params = new Map([
@@ -50,7 +84,7 @@ const params = new Map([
     ['master', '100'], ['tmeas', '1'], ['quantize', '1'], ['rec_grid', '0'],
     ['rec_action', '0'], ['dub_mode', '0'], ['play_mode', '0'],
     ['grid_bpm', '120'], ['monitor', '1'], ['bpm_override', '0'],
-    ['follow', '1']
+    ['follow', '1'], ['fx_catalog', 'mockfx|Mock FX']
 ]);
 for (let t = 1; t <= TRACKS; t++) {
     params.set(`t${t}_level`, '100');
@@ -68,15 +102,18 @@ let roundTrips = 0;
 let readFailures = 0;
 const announcements = [];
 const writes = [];
+const screenText = [];
 
 const context = vm.createContext({
-    console, Math, Number, JSON, String, Array, parseInt, parseFloat, isFinite, Date,
-    clear_screen() {}, print() {}, fill_rect() {}, draw_rect() {},
+    console, Math, Number, JSON, String, Array, parseInt, parseFloat, isFinite,
+    Date: FakeDate,
+    clear_screen() {}, print(_x, _y, text) { screenText.push(String(text)); },
+    fill_rect() {}, draw_rect() {},
     text_width(t) { return String(t).length * 6; },
     move_midi_internal_send() {},
     host_speaker_active() { return false; },
     host_line_in_connected() { return true; },
-    host_get_module_metadata() { return null; },
+    host_get_module_metadata(id) { return moduleMetadata.get(id) ?? null; },
     host_module_get_param(key) {
         roundTrips++;
         if (readFailures > 0) { readFailures--; return null; }
@@ -169,6 +206,8 @@ await module_.evaluate();
 
 const ui = context;
 const cc = (num, value) => ui.onMidiMessageInternal([0xb0, num, value]);
+const noteOn = (num, value = 127) => ui.onMidiMessageInternal([0x90, num, value]);
+const noteOff = (num) => ui.onMidiMessageInternal([0x80, num, 0]);
 const settle = (n = 20) => { for (let i = 0; i < n; i++) ui.tick(); };
 
 /* ------------------------------------------------------------------ tests */
@@ -233,4 +272,89 @@ assert.equal(w?.value, '155',
     `after a dead param channel the UI wrote t1_level=${w?.value}; it must continue ` +
     'from 150, not from a zeroed mirror');
 
-console.log('mark overtake UI: param-channel and knob-response tests passed');
+/* Hosted modules use the same generic interaction contract as Movy. Inline
+ * root knobs must be accepted, trigger actions fire only once per gesture and
+ * return the display to idle, wide ranges accelerate by turn speed, and named
+ * enums must be written back as names rather than silently changing format. */
+params.set('t1_fx_module', 'mockfx');
+params.set('t1_fx_status', '2');
+params.set('t1_mod_reroll', 'idle');
+params.set('t1_mod_seed', '0');
+params.set('t1_mod_mode', 'clean');
+params.set('t1_mod_capture', 'idle');
+ui.init();
+settle(20);
+
+/* Hold track 1's FX pad to enter the hosted module's eight-knob page. */
+noteOn(68);
+nowMs += 601;
+ui.tick();
+noteOff(68);
+
+/* Explicit trigger metadata: clockwise fires once, another event in the same
+ * gesture does not repeat, counter-clockwise writes idle and re-arms. */
+writes.length = 0;
+screenText.length = 0;
+nowMs += 1000;
+cc(MoveKnob1, 1);
+let triggerWrites = writes.filter(x => x.key === 't1_mod_reroll');
+assert.deepEqual(triggerWrites.map(x => x.value), ['trigger'],
+    'clockwise must send the named trigger value exactly once');
+ui.tick();
+assert(screenText.includes('idle'),
+    'a trigger action must return its on-screen value to idle immediately');
+
+writes.length = 0;
+nowMs += 20;
+cc(MoveKnob1, 1);
+assert.equal(writes.filter(x => x.key === 't1_mod_reroll').length, 0,
+    'continued clockwise movement in one gesture must not retrigger');
+
+writes.length = 0;
+nowMs += 20;
+cc(MoveKnob1, 127);
+assert.deepEqual(writes.filter(x => x.key === 't1_mod_reroll').map(x => x.value), ['idle'],
+    'counter-clockwise must send idle and re-arm the trigger');
+nowMs += 20;
+cc(MoveKnob1, 1);
+triggerWrites = writes.filter(x => x.key === 't1_mod_reroll');
+assert.equal(triggerWrites.at(-1)?.value, 'trigger',
+    'clockwise must fire again after a counter-clockwise re-arm');
+
+writes.length = 0;
+nowMs += 701;
+cc(MoveKnob1, 1);
+assert.deepEqual(writes.filter(x => x.key === 't1_mod_reroll').map(x => x.value), ['trigger'],
+    'a short pause must begin a new trigger gesture');
+
+/* Wide acceleration: slow turns retain single-seed precision, progressively
+ * faster turns traverse a 5k range quickly, and reversing returns to one-step
+ * precision instead of jumping in the old direction. */
+writes.length = 0;
+nowMs += 1000;
+cc(MoveKnob1 + 1, 1);
+assert.equal(writes.at(-1)?.value, '1', 'slow seed turn must move by one');
+nowMs += 100;
+cc(MoveKnob1 + 1, 1);
+assert.equal(writes.at(-1)?.value, '11', 'medium seed turn must accelerate');
+nowMs += 20;
+cc(MoveKnob1 + 1, 1);
+assert.equal(writes.at(-1)?.value, '261', 'fast seed turn must traverse the wide range');
+nowMs += 20;
+cc(MoveKnob1 + 1, 127);
+assert.equal(writes.at(-1)?.value, '260', 'direction reversal must move by one');
+
+/* Name-format enums stay name-format. */
+writes.length = 0;
+cc(MoveKnob1 + 2, 1);
+assert.deepEqual(writes.filter(x => x.key === 't1_mod_mode').map(x => x.value), ['wild'],
+    'a name-based enum must be written back by name');
+
+/* idle/trigger options infer action behavior even without an explicit field. */
+writes.length = 0;
+nowMs += 1000;
+cc(MoveKnob1 + 3, 1);
+assert.deepEqual(writes.filter(x => x.key === 't1_mod_capture').map(x => x.value), ['trigger'],
+    'idle/trigger options must infer one-shot trigger behavior');
+
+console.log('mark overtake UI: param-channel, hosted-FX, and knob-response tests passed');
