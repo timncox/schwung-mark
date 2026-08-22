@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <time.h>
 
 #include "mark_core.h"
 #include "audio_fx_api_v2.h"
@@ -218,6 +219,11 @@ struct mark {
     _Atomic int io_error;         /* last I/O op failed */
     pthread_t io_thread;
     int io_thread_valid;
+    /* Which slots hold a session, one bit per slot, refreshed on fx_worker.
+     * Probing is 16 stat() calls; see session_slots_probe(). want: 0 none,
+     * 1 a reader asked, 2 forced (a save/load just finished). */
+    _Atomic uint32_t session_slots_mask;
+    _Atomic int      session_slots_want;
 
     /* Per-track Schwung FX host. Requests are a fixed SPSC queue written by
      * set_param on the audio thread and consumed by a normal-priority loader.
@@ -665,12 +671,27 @@ static void fx_publish(mark_t *m, mk_fx_result_t *r) {
     atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
 }
 
+/* Defined with the other session helpers, below session_path(). */
+static uint32_t session_slots_probe(const mark_t *m);
+
+/* How long the slot probe may go stale while a reader keeps asking. The files
+ * only change on save/load, and those force a probe, so this is purely a cap
+ * on how often idle repaints can drive one. */
+#define MARK_SLOT_PROBE_MS 250u
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 static void *fx_worker(void *arg) {
     mark_t *m = (mark_t *)arg;
     /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
      * inherit realtime scheduling and contend with the SPI callback. */
     struct sched_param normal = {0};
     (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    uint64_t last_probe_ms = 0;
     while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
         int did_work = 0;
         for (int i = 0; i < MARK_TRACKS; i++) {
@@ -705,6 +726,23 @@ static void *fx_worker(void *arg) {
             if (r) fx_publish(m, r);
             did_work = 1;
         }
+        /* Refresh the session-slot mask that get_param serves. Dropping a
+         * throttled request is safe: the reader re-asks on its next repaint,
+         * so this self-corrects instead of needing to be re-armed. Not
+         * did_work -- a probe must not spin the loop. */
+        int want = atomic_exchange_explicit(&m->session_slots_want, 0,
+                                            memory_order_acq_rel);
+        if (want) {
+            uint64_t now_ms = monotonic_ms();
+            if (want > 1 || last_probe_ms == 0
+                || now_ms - last_probe_ms >= MARK_SLOT_PROBE_MS) {
+                atomic_store_explicit(&m->session_slots_mask,
+                                      session_slots_probe(m),
+                                      memory_order_release);
+                last_probe_ms = now_ms;
+            }
+        }
+
         if (!did_work) usleep(10000);
     }
     return NULL;
@@ -1447,6 +1485,26 @@ static void session_path(const mark_t *m, int slot, const char *file,
              file ? "/" : "", file ? file : "");
 }
 
+/*
+ * Which slots hold a session, as a bitmask.
+ *
+ * SIXTEEN stat() calls. Every module entry point -- create_instance,
+ * set_param, get_param, on_midi, render_block -- IS the SPI audio callback at
+ * SCHED_FIFO 90 with roughly 900us of budget, so this must only ever be
+ * reached from fx_worker, which runs at SCHED_OTHER.
+ */
+static uint32_t session_slots_probe(const mark_t *m) {
+    uint32_t mask = 0;
+    if (!m || !m->session_dir[0]) return 0;
+    for (int i = 1; i <= MARK_SESSION_SLOTS; i++) {
+        char path[320];
+        struct stat st;
+        session_path(m, i, "session.json", path, sizeof(path));
+        if (stat(path, &st) == 0) mask |= 1u << (i - 1);
+    }
+    return mask;
+}
+
 static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
     char path[320];
     session_path(m, slot, "session.json", path, sizeof(path));
@@ -1638,6 +1696,9 @@ static void *io_worker(void *arg) {
     }
 
     m->io_error = err;
+    /* A save or a load just changed which slots exist; do not make the next
+     * reader wait out the probe throttle for it. */
+    atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
     m->edit_rev++;
     m->io_busy = 0;       /* release last */
     free(job);
@@ -2094,6 +2155,8 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     }
     if (!strcmp(key, "session_dir")) {
         snprintf(m->session_dir, sizeof(m->session_dir), "%s", val);
+        /* Different directory, different slots. */
+        atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
         return;
     }
     if (!strcmp(key, "save_session")) {
@@ -2124,6 +2187,14 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         }
         session_path(m, slot, NULL, path, sizeof(path));
         rmdir(path);
+        /* We know exactly which slot went away, so retire its bit here rather
+         * than making the reader wait for the next probe -- the UI expects
+         * the slot to vanish on this very repaint. Still ask for a probe, to
+         * reconcile if an unlink failed. */
+        atomic_fetch_and_explicit(&m->session_slots_mask,
+                                  ~(uint32_t)(1u << (slot - 1)),
+                                  memory_order_release);
+        atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
         m->edit_rev++;
         return;
     }
@@ -2389,19 +2460,37 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         return snprintf(buf, (size_t)buf_len, "%s", s);
     }
     if (!strcmp(key, "session_slots")) {
-        /* csv of 0/1 per slot; stat() runs on the UI thread, not audio */
-        int n = 0;
-        for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++) {
-            int have = 0;
-            if (m->session_dir[0]) {
-                char path[320];
-                struct stat st;
-                session_path(m, i, "session.json", path, sizeof(path));
-                have = stat(path, &st) == 0;
-            }
-            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
-                                    i > 1 ? "," : "", have), buf_len);
+        /*
+         * csv of 0/1 per slot, formatted from a cached mask.
+         *
+         * This used to stat() all sixteen slots right here, under a comment
+         * claiming it ran on "the UI thread, not audio". There is no UI
+         * thread: get_param is the SPI audio callback. Worse, this key is
+         * read once per repaint by the session page AND embedded in the
+         * Remote-UI full-state blob, so the cost repeated rather than being
+         * paid once per click.
+         *
+         * Asking the worker on each read, instead of pushing from the save
+         * and load paths, keeps the one virtue the old code had: a session
+         * that appeared underneath us -- scp'd in, or written by another
+         * instance -- still shows up, now one refresh later.
+         */
+        uint32_t mask;
+        atomic_store_explicit(&m->session_slots_want, 1, memory_order_relaxed);
+        if (m->fx_thread_valid) {
+            mask = atomic_load_explicit(&m->session_slots_mask,
+                                        memory_order_acquire);
+        } else {
+            /* No worker exists only when create_instance was given no
+             * module_dir, which the Move host always supplies. Off device,
+             * correctness beats the budget. */
+            mask = session_slots_probe(m);
         }
+        int n = 0;
+        for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%u",
+                                    i > 1 ? "," : "",
+                                    (mask >> (i - 1)) & 1u), buf_len);
         return n;
     }
     if (!strcmp(key, "rui_poll")) {
