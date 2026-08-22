@@ -10,6 +10,8 @@
  *   - Overdubbing a reversed track is refused (the RC-505 does the same).
  *   - Loop audio is not saved with presets; `state` carries settings only.
  */
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -671,6 +673,39 @@ static void fx_publish(mark_t *m, mk_fx_result_t *r) {
     atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
 }
 
+/*
+ * Shed the audio thread's priority, get off its core, and say who we are.
+ *
+ * POSIX PTHREAD_INHERIT_SCHED is the default and every module entry point IS
+ * the SPI audio callback at SCHED_FIFO 90, so a worker is born realtime and
+ * must demote as its FIRST action -- Move's own Link Main publisher runs at
+ * FIFO 35, so an inherited-priority worker starves the audio it went
+ * off-thread to protect.
+ *
+ * Pinning to cores 0-2 leaves core 3 to the SPI callback. Naming is not
+ * cosmetic: a child inherits the parent's `comm`, so an un-named inherited
+ * worker reports as "Audio Main/SPI" and is invisible in top, in a thread
+ * list, and to Schwung's rt_thread_audit -- which is exactly how tablor hid
+ * from the audit that went looking for it. Linux caps the name at 15 chars.
+ */
+static void worker_demote(const char *name) {
+    struct sched_param normal = {0};
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(0, &set);
+    CPU_SET(1, &set);
+    CPU_SET(2, &set);
+    (void)sched_setaffinity(0, sizeof(set), &set);
+    (void)pthread_setname_np(pthread_self(), name);
+#elif defined(__APPLE__)
+    (void)pthread_setname_np(name);   /* host tests only; names the thread */
+#else
+    (void)name;
+#endif
+}
+
 /* Defined with the other session helpers, below session_path(). */
 static uint32_t session_slots_probe(const mark_t *m);
 
@@ -687,10 +722,7 @@ static uint64_t monotonic_ms(void) {
 
 static void *fx_worker(void *arg) {
     mark_t *m = (mark_t *)arg;
-    /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
-     * inherit realtime scheduling and contend with the SPI callback. */
-    struct sched_param normal = {0};
-    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    worker_demote("mark-fx");
     uint64_t last_probe_ms = 0;
     while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
         int did_work = 0;
@@ -1543,8 +1575,7 @@ static int session_preflight(const mark_t *m, int slot) {
 static void *io_worker(void *arg) {
     mk_job_t *job = (mk_job_t *)arg;
     mark_t *m = job->m;
-    struct sched_param normal = {0};
-    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    worker_demote("mark-io");
     char path[320];
     int err = 0;
 
