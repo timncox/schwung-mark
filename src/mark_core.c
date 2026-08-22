@@ -921,10 +921,13 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         snprintf(m->module_dir, sizeof(m->module_dir), "%s", module_dir);
         snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
                  module_dir);
+        /* No fallback scan if this fails. Without the worker nothing would
+         * service an fx_enqueue anyway, so a catalog built here would only
+         * advertise modules that could never load -- and building it is the
+         * blocking directory walk this moved off the callback in the first
+         * place. An absent worker means no hosted FX, stated plainly. */
         if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
             m->fx_thread_valid = 1;
-        else
-            fx_catalog_scan(m);   /* no worker to do it; off device only */
     }
     return m;
 }
@@ -2290,6 +2293,17 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
          */
         int slot = atoi(val);
         if (slot < 1 || slot > MARK_SESSION_SLOTS) return;
+        /*
+         * session_start declines SILENTLY while the worker already owns the
+         * directory, so the same refusal the old inline code made has to be
+         * made here -- before the mask is touched. Retiring the bit for a
+         * delete that never runs would blank the slot in the UI until the
+         * next probe put it back: a flicker that lies.
+         *
+         * No race with the worker clearing io_busy underneath us: that can
+         * only turn a refusal into an accept, never the reverse.
+         */
+        if (m->io_busy || !m->session_dir[0]) return;
         atomic_fetch_and_explicit(&m->session_slots_mask,
                                   ~(uint32_t)(1u << (slot - 1)),
                                   memory_order_release);
