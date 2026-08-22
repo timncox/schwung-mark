@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "../src/mark_core.h"
 
@@ -559,11 +560,29 @@ static void test_delay_timing_and_tail(void) {
     printf("ok: eighth-note delay timing + stopped tail\n");
 }
 
+/*
+ * The FX catalog is built on fx_worker now, not in create_instance, so it is
+ * legitimately empty for a moment after create. Anything reading it has to
+ * tolerate that -- which is the whole hazard this waits on: the device UI
+ * reads the catalog once at init, so if it asks too early it shows builtins
+ * only until the module is re-entered.
+ */
+static void wait_catalog(mark_t *m, const char *want) {
+    char buf[2048];
+    for (int spin = 0; spin < 400; spin++) {          /* ~4 s ceiling */
+        gp_str(m, "fx_catalog", buf, sizeof(buf));
+        if (strstr(buf, want)) return;
+        usleep(10000);
+    }
+    assert(!"fx catalog never published");
+}
+
 static void wait_io(mark_t *m) {
     char buf[16];
     for (int spin = 0; spin < 20000; spin++) {
         gp_str(m, "session_status", buf, sizeof(buf));
-        if (strcmp(buf, "saving") != 0 && strcmp(buf, "loading") != 0) return;
+        if (strcmp(buf, "saving") != 0 && strcmp(buf, "loading") != 0 &&
+            strcmp(buf, "deleting") != 0) return;
         usleep(1000);
     }
     assert(!"session i/o never finished");
@@ -604,6 +623,8 @@ static void test_hosted_schwung_fx(void) {
     g_in_frame = 0;
 
     char buf[2048];
+    /* Published by the worker, so it is not there the instant create returns. */
+    wait_catalog(m, "testfx|Test Gain");
     gp_str(m, "fx_catalog", buf, sizeof(buf));
     assert(strstr(buf, "testfx|Test Gain"));
 
@@ -749,8 +770,13 @@ static void test_sessions(void) {
     assert(tlen(m, 0) == live_len && tstate(m, 0) == live_state);
     assert(gp_int(m, "t2_level") == 137);
 
-    /* delete: slot 3 disappears from the bitmap and won't load */
+    /* delete: slot 3 disappears from the bitmap and won't load.
+     * The unlinks run on the io worker now, so wait for it. This build has no
+     * fx worker (mark_create passes no module_dir), so session_slots probes
+     * the filesystem inline and would otherwise still see the files. On
+     * device the bit is retired the instant the key is written. */
     mark_set_param(m, "delete_session", "3");
+    wait_io(m);
     gp_str(m, "session_slots", buf, sizeof(buf));
     assert(strncmp(buf, "0,0,0", 5) == 0);
     mark_set_param(m, "load_session", "3");
@@ -760,6 +786,86 @@ static void test_sessions(void) {
 
     mark_destroy(m);
     printf("ok: session save/load\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * session_slots is served from a worker-refreshed cache
+ * ------------------------------------------------------------------ */
+
+/* one slot's flag out of the "0,0,1,..." csv the module emits; slot is 1-based */
+static int slot_bit(const char *csv, int slot) {
+    int idx = 0;
+    for (const char *p = csv; *p; p++) {
+        if (idx == slot - 1) return *p == '1';
+        if (*p == ',') idx++;
+    }
+    return -1;
+}
+
+/* The probe is asynchronous now: a reader asks, fx_worker answers on its next
+ * pass (10 ms) subject to the 250 ms throttle. */
+static void wait_slot_bit(mark_t *m, int slot, int want) {
+    char buf[96];
+    for (int spin = 0; spin < 400; spin++) {          /* ~4 s ceiling */
+        gp_str(m, "session_slots", buf, sizeof(buf));
+        if (slot_bit(buf, slot) == want) return;
+        usleep(10000);
+    }
+    assert(!"session slot bit never settled");
+}
+
+static void test_session_slots_cached(void) {
+    /*
+     * Every other test builds with mark_create(), which passes no module_dir,
+     * so no fx worker exists and session_slots falls back to probing inline.
+     * That is the off-device path. This one takes the path every install on
+     * the Move takes -- worker present, bitmap served from its cache -- and
+     * pins the three behaviours that path has to keep.
+     */
+    char dir[] = "/tmp/mark-slotcache-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+
+    mark_t *m = mark_create_in_dir(&host, "build/test-modules/overtake/mark");
+    assert(m);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+    mark_set_param(m, "session_dir", dir);
+
+    char buf[96];
+    gp_str(m, "session_slots", buf, sizeof(buf));
+    assert(slot_bit(buf, 16) == 0);   /* all 16 slots present in the csv, all clear */
+    wait_slot_bit(m, 1, 0);
+
+    /* 1. a save lands without waiting out the throttle */
+    quick_loop(m, 0);
+    mark_set_param(m, "save_session", "2");
+    wait_io(m);
+    wait_slot_bit(m, 2, 1);
+
+    /* 2. a session that appears underneath us -- scp'd in, or written by
+     *    another instance -- is still noticed. The old per-repaint stat()
+     *    had this property for free; a cache pushed only from save/load
+     *    would have silently lost it. */
+    char ext[320];
+    snprintf(ext, sizeof(ext), "%s/slot05", dir);
+    assert(mkdir(ext, 0755) == 0);
+    snprintf(ext, sizeof(ext), "%s/slot05/session.json", dir);
+    FILE *f = fopen(ext, "w");
+    assert(f);
+    fputs("{}", f);
+    fclose(f);
+    wait_slot_bit(m, 5, 1);
+
+    /* 3. a delete retires its bit on this very read -- no probe latency,
+     *    because the UI expects the slot to vanish as it is pressed. */
+    mark_set_param(m, "delete_session", "2");
+    gp_str(m, "session_slots", buf, sizeof(buf));
+    assert(slot_bit(buf, 2) == 0);
+    assert(slot_bit(buf, 5) == 1);                   /* untouched slot survives */
+
+    mark_destroy(m);
+    printf("ok: session slot cache (worker-refreshed)\n");
 }
 
 static void test_rui_poll(void) {
@@ -977,6 +1083,7 @@ int main(void) {
     test_delay_timing_and_tail();
     test_hosted_schwung_fx();
     test_sessions();
+    test_session_slots_cached();
     test_rui_poll();
     test_grid_and_trim();
     test_trim_session_roundtrip();

@@ -84,7 +84,12 @@ const params = new Map([
     ['master', '100'], ['tmeas', '1'], ['quantize', '1'], ['rec_grid', '0'],
     ['rec_action', '0'], ['dub_mode', '0'], ['play_mode', '0'],
     ['grid_bpm', '120'], ['monitor', '1'], ['bpm_override', '0'],
-    ['follow', '1'], ['fx_catalog', 'mockfx|Mock FX']
+    /* Empty at boot on purpose: Mark builds the catalog on its worker
+     * thread, so it is legitimately not there when the UI first asks.
+     * It is published a few lines below, after init(), which makes every
+     * hosted-FX assertion in this file depend on the UI's bounded retry
+     * having picked it up. */
+    ['follow', '1'], ['fx_catalog', '']
 ]);
 for (let t = 1; t <= TRACKS; t++) {
     params.set(`t${t}_level`, '100');
@@ -213,6 +218,13 @@ const settle = (n = 20) => { for (let i = 0; i < n; i++) ui.tick(); };
 /* ------------------------------------------------------------------ tests */
 
 ui.init();
+
+/* The worker publishes the catalog after init() has already asked once and
+ * got nothing. discoverFxModules only runs at init and onResume, so without
+ * the retry the FX list would stay builtins-only until the module was
+ * re-entered -- and every hosted-FX test below would fail. */
+params.set('fx_catalog', 'mockfx|Mock FX');
+
 settle(60);                                    /* let LED init and first fetch finish */
 
 /* The headline measurement. */
@@ -228,6 +240,18 @@ roundTrips = 0;
 cc(MoveKnob1, 1);
 assert(roundTrips <= 1,
     `a knob detent cost ${roundTrips} blocking round-trips on the input path`);
+
+/* The catalog published after init() must have reached the FX list. Knob 7
+ * cycles fxChoices, so selecting the hosted module is only possible if the
+ * bounded retry picked it up: with builtins alone the list holds seven
+ * entries and no t1_fx_module write can happen. This has to sit ahead of
+ * every later ui.init(), each of which re-runs discovery and would mask it. */
+writes.length = 0;
+for (let i = 0; i < 12; i++) cc(MoveKnob1 + 6, 1);
+nowMs += 300;                                  /* fake clock: elapse the */
+settle(30);                                    /* FX load debounce */
+assert(writes.some(x => x.key === 't1_fx_module' && x.value === 'mockfx'),
+    'a catalog published after init must still reach the FX list');
 
 /* decodeDelta is accumulated: one brisk turn arrives as a single event
  * carrying 20+. Track level is 0-200 in steps of 5, so a fast spin should

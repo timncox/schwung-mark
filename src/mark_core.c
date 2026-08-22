@@ -10,6 +10,8 @@
  *   - Overdubbing a reversed track is refused (the RC-505 does the same).
  *   - Loop audio is not saved with presets; `state` carries settings only.
  */
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,6 +23,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <time.h>
 
 #include "mark_core.h"
 #include "audio_fx_api_v2.h"
@@ -218,6 +221,11 @@ struct mark {
     _Atomic int io_error;         /* last I/O op failed */
     pthread_t io_thread;
     int io_thread_valid;
+    /* Which slots hold a session, one bit per slot, refreshed on fx_worker.
+     * Probing is 16 stat() calls; see session_slots_probe(). want: 0 none,
+     * 1 a reader asked, 2 forced (a save/load just finished). */
+    _Atomic uint32_t session_slots_mask;
+    _Atomic int      session_slots_want;
 
     /* Per-track Schwung FX host. Requests are a fixed SPSC queue written by
      * set_param on the audio thread and consumed by a normal-priority loader.
@@ -226,7 +234,9 @@ struct mark {
     char module_dir[320];
     char audio_fx_dir[320];
     mk_fx_catalog_t fx_catalog[MARK_FX_CATALOG_MAX];
-    int fx_catalog_count;
+    /* Built on fx_worker and published once, last, so a reader that sees a
+     * non-zero count is guaranteed to see the entries behind it. */
+    _Atomic int fx_catalog_count;
     mk_fx_request_t fx_requests[MARK_FX_REQUESTS];
     _Atomic uint32_t fx_req_head;
     _Atomic uint32_t fx_req_tail;
@@ -534,7 +544,8 @@ static void fx_catalog_scan(mark_t *m) {
     DIR *d = opendir(m->audio_fx_dir);
     if (!d) return;
     struct dirent *de;
-    while ((de = readdir(d)) && m->fx_catalog_count < MARK_FX_CATALOG_MAX) {
+    int count = 0;
+    while ((de = readdir(d)) && count < MARK_FX_CATALOG_MAX) {
         if (de->d_name[0] == '.' || !valid_fx_id(de->d_name)) continue;
         char so_path[760], json_path[760];
         struct stat st;
@@ -553,7 +564,7 @@ static void fx_catalog_scan(mark_t *m) {
             free(js);
             continue;
         }
-        mk_fx_catalog_t *e = &m->fx_catalog[m->fx_catalog_count++];
+        mk_fx_catalog_t *e = &m->fx_catalog[count++];
         snprintf(e->id, sizeof(e->id), "%s", de->d_name);
         if (manifest_string(js, "name", e->name, sizeof(e->name)) != 0)
             snprintf(e->name, sizeof(e->name), "%s", de->d_name);
@@ -563,8 +574,9 @@ static void fx_catalog_scan(mark_t *m) {
         free(js);
     }
     closedir(d);
-    qsort(m->fx_catalog, (size_t)m->fx_catalog_count,
-          sizeof(m->fx_catalog[0]), fx_catalog_cmp);
+    qsort(m->fx_catalog, (size_t)count, sizeof(m->fx_catalog[0]),
+          fx_catalog_cmp);
+    m->fx_catalog_count = count;   /* publish last */
 }
 
 static void ext_fx_destroy(mk_ext_fx_t *fx) {
@@ -665,12 +677,78 @@ static void fx_publish(mark_t *m, mk_fx_result_t *r) {
     atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
 }
 
+/*
+ * Shed the audio thread's priority, get off its core, and say who we are.
+ *
+ * POSIX PTHREAD_INHERIT_SCHED is the default and every module entry point IS
+ * the SPI audio callback at SCHED_FIFO 90, so a worker is born realtime and
+ * must demote as its FIRST action -- Move's own Link Main publisher runs at
+ * FIFO 35, so an inherited-priority worker starves the audio it went
+ * off-thread to protect.
+ *
+ * Pinning to cores 0-2 leaves core 3 to the SPI callback. Naming is not
+ * cosmetic: a child inherits the parent's `comm`, so an un-named inherited
+ * worker reports as "Audio Main/SPI" and is invisible in top, in a thread
+ * list, and to Schwung's rt_thread_audit -- which is exactly how tablor hid
+ * from the audit that went looking for it. Linux caps the name at 15 chars.
+ */
+static void worker_demote(const char *name) {
+    struct sched_param normal = {0};
+    /* 0 is the correct SCHED_OTHER priority on Linux, but it is below the
+     * valid range on some hosts, where the call either fails or leaves the
+     * thread barely schedulable. Ask for the platform's own minimum. */
+    int lo = sched_get_priority_min(SCHED_OTHER);
+    normal.sched_priority = lo < 0 ? 0 : lo;
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(0, &set);
+    CPU_SET(1, &set);
+    CPU_SET(2, &set);
+    (void)sched_setaffinity(0, sizeof(set), &set);
+    (void)pthread_setname_np(pthread_self(), name);
+#else
+    /* Naming and affinity are Linux-only here on purpose: the Move is the
+     * only place they mean anything, and rt_thread_audit is what reads the
+     * name. The host tests just need the demote. */
+    (void)name;
+#endif
+}
+
+/* Defined with the other session helpers, below session_path(). */
+static uint32_t session_slots_probe(const mark_t *m);
+
+/* How long the slot probe may go stale while a reader keeps asking. The files
+ * only change on save/load, and those force a probe, so this is purely a cap
+ * on how often idle repaints can drive one. */
+#define MARK_SLOT_PROBE_MS 250u
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 static void *fx_worker(void *arg) {
     mark_t *m = (mark_t *)arg;
-    /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
-     * inherit realtime scheduling and contend with the SPI callback. */
-    struct sched_param normal = {0};
-    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    worker_demote("mark-fx");
+    /*
+     * Build the FX catalog here, not in create_instance.
+     *
+     * It is an opendir, then a stat and a module.json read -- up to 256 kB
+     * each -- for every module in the directory, and create_instance is the
+     * SPI audio callback. Doing it first, before any request is serviced,
+     * means a session load arriving immediately still resolves its ids.
+     *
+     * The count bump is a rev change so the Remote UI refetches; the device
+     * UI retries a few times while the list is empty (see discoverFxModules
+     * in ui_overtake.js), because it reads the catalog once at init and
+     * would otherwise show builtins only until the module was re-entered.
+     */
+    fx_catalog_scan(m);
+    m->edit_rev++;
+    uint64_t last_probe_ms = 0;
     while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
         int did_work = 0;
         for (int i = 0; i < MARK_TRACKS; i++) {
@@ -705,6 +783,35 @@ static void *fx_worker(void *arg) {
             if (r) fx_publish(m, r);
             did_work = 1;
         }
+        /*
+         * Refresh the session-slot mask that get_param serves.
+         *
+         * Never while the io worker owns the session directory. A probe that
+         * lands mid-delete stats files the unlinks have not reached yet and
+         * resurrects the bit the UI just retired; mid-save it can see a
+         * half-written session.json. Deferring instead of clearing the
+         * request means it survives the op rather than being dropped by it,
+         * and io_worker forces one on completion.
+         *
+         * Dropping a THROTTLED request is still safe -- the reader re-asks on
+         * its next repaint, so that path self-corrects. Neither sets did_work:
+         * a probe must not spin the loop.
+         */
+        int want = atomic_load_explicit(&m->session_slots_want,
+                                        memory_order_acquire);
+        if (want && !atomic_load_explicit(&m->io_busy, memory_order_acquire)) {
+            atomic_store_explicit(&m->session_slots_want, 0,
+                                  memory_order_relaxed);
+            uint64_t now_ms = monotonic_ms();
+            if (want > 1 || last_probe_ms == 0
+                || now_ms - last_probe_ms >= MARK_SLOT_PROBE_MS) {
+                atomic_store_explicit(&m->session_slots_mask,
+                                      session_slots_probe(m),
+                                      memory_order_release);
+                last_probe_ms = now_ms;
+            }
+        }
+
         if (!did_work) usleep(10000);
     }
     return NULL;
@@ -814,7 +921,11 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         snprintf(m->module_dir, sizeof(m->module_dir), "%s", module_dir);
         snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
                  module_dir);
-        fx_catalog_scan(m);
+        /* No fallback scan if this fails. Without the worker nothing would
+         * service an fx_enqueue anyway, so a catalog built here would only
+         * advertise modules that could never load -- and building it is the
+         * blocking directory walk this moved off the callback in the first
+         * place. An absent worker means no hosted FX, stated plainly. */
         if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
             m->fx_thread_valid = 1;
     }
@@ -1436,7 +1547,11 @@ static int wav_probe(const char *path, uint32_t *frames_out) {
 typedef struct {
     mark_t *m;
     int slot;
-    int op;                              /* 1 save, 2 load */
+    int op;                              /* 1 save, 2 load, 3 delete */
+    /* session_start creates the worker before it mutates any live state, so
+     * a failed pthread_create cannot strand a validated load. The worker
+     * parks here until the instance is ready for it. */
+    _Atomic int armed;
     char fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
     char fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
 } mk_job_t;
@@ -1445,6 +1560,26 @@ static void session_path(const mark_t *m, int slot, const char *file,
                          char *buf, size_t len) {
     snprintf(buf, len, "%s/slot%02d%s%s", m->session_dir, slot,
              file ? "/" : "", file ? file : "");
+}
+
+/*
+ * Which slots hold a session, as a bitmask.
+ *
+ * SIXTEEN stat() calls. Every module entry point -- create_instance,
+ * set_param, get_param, on_midi, render_block -- IS the SPI audio callback at
+ * SCHED_FIFO 90 with roughly 900us of budget, so this must only ever be
+ * reached from fx_worker, which runs at SCHED_OTHER.
+ */
+static uint32_t session_slots_probe(const mark_t *m) {
+    uint32_t mask = 0;
+    if (!m || !m->session_dir[0]) return 0;
+    for (int i = 1; i <= MARK_SESSION_SLOTS; i++) {
+        char path[320];
+        struct stat st;
+        session_path(m, i, "session.json", path, sizeof(path));
+        if (stat(path, &st) == 0) mask |= 1u << (i - 1);
+    }
+    return mask;
 }
 
 static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
@@ -1485,12 +1620,30 @@ static int session_preflight(const mark_t *m, int slot) {
 static void *io_worker(void *arg) {
     mk_job_t *job = (mk_job_t *)arg;
     mark_t *m = job->m;
-    struct sched_param normal = {0};
-    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    worker_demote("mark-io");
+    /* Demote first, then wait: spinning here at the priority we were born
+     * with is the thing this whole arrangement exists to avoid. session_start
+     * guarantees an arm follows a successful create with no return between
+     * them, so this cannot park forever -- if it could, mark_destroy's join
+     * would deadlock. */
+    while (!atomic_load_explicit(&job->armed, memory_order_acquire))
+        usleep(200);
     char path[320];
     int err = 0;
 
-    if (job->op == 1) {   /* ---- save ---- */
+    if (job->op == 3) {   /* ---- delete ---- */
+        char path[320];
+        session_path(m, job->slot, "session.json", path, sizeof(path));
+        if (unlink(path) != 0) err = 1;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            char wname[16];
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, job->slot, wname, path, sizeof(path));
+            unlink(path);            /* a track that was never recorded */
+        }
+        session_path(m, job->slot, NULL, path, sizeof(path));
+        rmdir(path);
+    } else if (job->op == 1) {   /* ---- save ---- */
         mkdir(m->session_dir, 0755);
         session_path(m, job->slot, NULL, path, sizeof(path));
         mkdir(path, 0755);
@@ -1638,6 +1791,9 @@ static void *io_worker(void *arg) {
     }
 
     m->io_error = err;
+    /* A save or a load just changed which slots exist; do not make the next
+     * reader wait out the probe throttle for it. */
+    atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
     m->edit_rev++;
     m->io_busy = 0;       /* release last */
     free(job);
@@ -1656,13 +1812,32 @@ static void session_start(mark_t *m, int slot, int op) {
     job->m = m;
     job->slot = slot;
     job->op = op;
+    if (op == 2 && session_preflight(m, slot) != 0) {
+        m->io_error = 1;
+        m->edit_rev++;
+        free(job);
+        return;
+    }
+
+    /*
+     * Create the worker BEFORE touching live state.
+     *
+     * This used to run last, and a failed pthread_create fell back to calling
+     * io_worker() inline -- a whole session save or load, wav files and all,
+     * on the SPI audio callback. The reason was sound: for a load, the tracks
+     * had already been detached, so refusing would have left Mark silent with
+     * nothing loaded. Creating first removes the dilemma instead of trading
+     * one failure for a worse one. The worker parks on its gate until armed.
+     */
+    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
+        m->io_error = 1;
+        m->edit_rev++;
+        free(job);
+        return;
+    }
+    m->io_thread_valid = 1;
+
     if (op == 2) {
-        if (session_preflight(m, slot) != 0) {
-            m->io_error = 1;
-            m->edit_rev++;
-            free(job);
-            return;
-        }
         /* Validation succeeded. Silence + detach every track before the
          * worker touches buffers, preserving the render-thread contract. */
         for (int i = 0; i < MARK_TRACKS; i++) {
@@ -1678,7 +1853,7 @@ static void session_start(mark_t *m, int slot, int op) {
         }
         reset_undo(m);
         m->grid_unit = 0.0;
-    } else {
+    } else if (op == 1) {
         /* saving while overdubbing/recording would race the writer — leave
          * dub, and finalize a recording at what's already down (no
          * extend-to-measure: that would keep writing during the save) */
@@ -1718,13 +1893,9 @@ static void session_start(mark_t *m, int slot, int op) {
     m->io_error = 0;
     m->io_busy = op;
     m->edit_rev++;
-    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
-        /* Thread exhaustion must not strand a validated load after its live
-         * tracks were detached. Complete the same job synchronously. */
-        io_worker(job);
-    } else {
-        m->io_thread_valid = 1;
-    }
+    /* Release the worker. Nothing may return between the create above and
+     * this line. */
+    atomic_store_explicit(&job->armed, 1, memory_order_release);
 }
 
 /* Track FX: one insert per track, applied post-read / pre-fader. Filter
@@ -2094,6 +2265,8 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     }
     if (!strcmp(key, "session_dir")) {
         snprintf(m->session_dir, sizeof(m->session_dir), "%s", val);
+        /* Different directory, different slots. */
+        atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
         return;
     }
     if (!strcmp(key, "save_session")) {
@@ -2107,24 +2280,34 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         return;
     }
     if (!strcmp(key, "delete_session")) {
-        /* deletion is a handful of unlinks — safe synchronously on the UI
-         * thread, but never while a save/load worker owns the directory */
+        /*
+         * "A handful of unlinks" is still blocking filesystem work, and it was
+         * running here -- on the SPI audio callback -- under a comment calling
+         * this the UI thread. It goes to the same worker that owns every other
+         * mutation of the session directory, which also means there is exactly
+         * one writer to reason about rather than two.
+         *
+         * The bit is retired here rather than on completion because the UI
+         * expects the slot to vanish on the repaint it was pressed; the
+         * worker's forced probe reconciles it afterwards if an unlink failed.
+         */
         int slot = atoi(val);
-        if (slot < 1 || slot > MARK_SESSION_SLOTS || m->io_busy ||
-            !m->session_dir[0])
-            return;
-        char path[320];
-        session_path(m, slot, "session.json", path, sizeof(path));
-        unlink(path);
-        for (int i = 0; i < MARK_TRACKS; i++) {
-            char wname[16];
-            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
-            session_path(m, slot, wname, path, sizeof(path));
-            unlink(path);
-        }
-        session_path(m, slot, NULL, path, sizeof(path));
-        rmdir(path);
-        m->edit_rev++;
+        if (slot < 1 || slot > MARK_SESSION_SLOTS) return;
+        /*
+         * session_start declines SILENTLY while the worker already owns the
+         * directory, so the same refusal the old inline code made has to be
+         * made here -- before the mask is touched. Retiring the bit for a
+         * delete that never runs would blank the slot in the UI until the
+         * next probe put it back: a flicker that lies.
+         *
+         * No race with the worker clearing io_busy underneath us: that can
+         * only turn a refusal into an accept, never the reverse.
+         */
+        if (m->io_busy || !m->session_dir[0]) return;
+        atomic_fetch_and_explicit(&m->session_slots_mask,
+                                  ~(uint32_t)(1u << (slot - 1)),
+                                  memory_order_release);
+        session_start(m, slot, 3);
         return;
     }
 
@@ -2385,23 +2568,42 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
     if (!strcmp(key, "session_status")) {
         const char *s = m->io_busy == 1 ? "saving"
                       : m->io_busy == 2 ? "loading"
+                      : m->io_busy == 3 ? "deleting"
                       : m->io_error ? "error" : "idle";
         return snprintf(buf, (size_t)buf_len, "%s", s);
     }
     if (!strcmp(key, "session_slots")) {
-        /* csv of 0/1 per slot; stat() runs on the UI thread, not audio */
-        int n = 0;
-        for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++) {
-            int have = 0;
-            if (m->session_dir[0]) {
-                char path[320];
-                struct stat st;
-                session_path(m, i, "session.json", path, sizeof(path));
-                have = stat(path, &st) == 0;
-            }
-            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
-                                    i > 1 ? "," : "", have), buf_len);
+        /*
+         * csv of 0/1 per slot, formatted from a cached mask.
+         *
+         * This used to stat() all sixteen slots right here, under a comment
+         * claiming it ran on "the UI thread, not audio". There is no UI
+         * thread: get_param is the SPI audio callback. Worse, this key is
+         * read once per repaint by the session page AND embedded in the
+         * Remote-UI full-state blob, so the cost repeated rather than being
+         * paid once per click.
+         *
+         * Asking the worker on each read, instead of pushing from the save
+         * and load paths, keeps the one virtue the old code had: a session
+         * that appeared underneath us -- scp'd in, or written by another
+         * instance -- still shows up, now one refresh later.
+         */
+        uint32_t mask;
+        atomic_store_explicit(&m->session_slots_want, 1, memory_order_relaxed);
+        if (m->fx_thread_valid) {
+            mask = atomic_load_explicit(&m->session_slots_mask,
+                                        memory_order_acquire);
+        } else {
+            /* No worker exists only when create_instance was given no
+             * module_dir, which the Move host always supplies. Off device,
+             * correctness beats the budget. */
+            mask = session_slots_probe(m);
         }
+        int n = 0;
+        for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%u",
+                                    i > 1 ? "," : "",
+                                    (mask >> (i - 1)) & 1u), buf_len);
         return n;
     }
     if (!strcmp(key, "rui_poll")) {
