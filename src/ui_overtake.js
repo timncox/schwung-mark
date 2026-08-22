@@ -225,12 +225,30 @@ function normalizeFxParam(hierarchy, key, inline) {
     };
 }
 
+/*
+ * Mark builds its FX catalog on a worker thread now, not in create_instance
+ * -- an opendir plus a stat and a manifest read per module is not something
+ * the audio callback can afford. So the catalog can legitimately still be
+ * empty the first time we ask.
+ *
+ * That matters here because discovery runs exactly twice, at init and at
+ * onResume. Asking once, too early, would leave the list showing builtins
+ * only until the user left the module and came back. Retry a few times while
+ * it is empty, spaced out, then stop for good: gp() is a blocking round-trip
+ * on the param channel, and turning this into a poll would recreate the
+ * problem the param-read budget work just fixed.
+ */
+let fxCatalogFound = false;
+let fxCatalogTries = 0;
+const FX_CATALOG_TRIES = 8;
+
 function discoverFxModules() {
     fxChoices = FX_NAMES.map((name, index) => ({
         kind: 'builtin', index, name, speech: FX_SPEECH[index], params: []
     }));
     const catalog = gp('fx_catalog') || '';
     if (!catalog) return;
+    fxCatalogFound = true;
     const entries = catalog.split(',');
     for (let i = 0; i < entries.length; i++) {
         const cut = entries[i].indexOf('|');
@@ -950,6 +968,14 @@ globalThis.tick = function() {
             drawUI();
         }
         return;
+    }
+
+    /* The worker may not have published the FX catalog when init asked. */
+    if (!fxCatalogFound && fxCatalogTries < FX_CATALOG_TRIES &&
+        tickCount % 8 === 0) {
+        fxCatalogTries++;
+        discoverFxModules();
+        if (fxCatalogFound) { paintAll(true); needsRedraw = true; }
     }
 
     /* jack state can change mid-session — re-check about twice a second */

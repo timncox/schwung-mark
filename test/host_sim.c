@@ -560,6 +560,23 @@ static void test_delay_timing_and_tail(void) {
     printf("ok: eighth-note delay timing + stopped tail\n");
 }
 
+/*
+ * The FX catalog is built on fx_worker now, not in create_instance, so it is
+ * legitimately empty for a moment after create. Anything reading it has to
+ * tolerate that -- which is the whole hazard this waits on: the device UI
+ * reads the catalog once at init, so if it asks too early it shows builtins
+ * only until the module is re-entered.
+ */
+static void wait_catalog(mark_t *m, const char *want) {
+    char buf[2048];
+    for (int spin = 0; spin < 400; spin++) {          /* ~4 s ceiling */
+        gp_str(m, "fx_catalog", buf, sizeof(buf));
+        if (strstr(buf, want)) return;
+        usleep(10000);
+    }
+    assert(!"fx catalog never published");
+}
+
 static void wait_io(mark_t *m) {
     char buf[16];
     for (int spin = 0; spin < 20000; spin++) {
@@ -606,6 +623,8 @@ static void test_hosted_schwung_fx(void) {
     g_in_frame = 0;
 
     char buf[2048];
+    /* Published by the worker, so it is not there the instant create returns. */
+    wait_catalog(m, "testfx|Test Gain");
     gp_str(m, "fx_catalog", buf, sizeof(buf));
     assert(strstr(buf, "testfx|Test Gain"));
 

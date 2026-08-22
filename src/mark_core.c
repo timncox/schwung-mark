@@ -234,7 +234,9 @@ struct mark {
     char module_dir[320];
     char audio_fx_dir[320];
     mk_fx_catalog_t fx_catalog[MARK_FX_CATALOG_MAX];
-    int fx_catalog_count;
+    /* Built on fx_worker and published once, last, so a reader that sees a
+     * non-zero count is guaranteed to see the entries behind it. */
+    _Atomic int fx_catalog_count;
     mk_fx_request_t fx_requests[MARK_FX_REQUESTS];
     _Atomic uint32_t fx_req_head;
     _Atomic uint32_t fx_req_tail;
@@ -542,7 +544,8 @@ static void fx_catalog_scan(mark_t *m) {
     DIR *d = opendir(m->audio_fx_dir);
     if (!d) return;
     struct dirent *de;
-    while ((de = readdir(d)) && m->fx_catalog_count < MARK_FX_CATALOG_MAX) {
+    int count = 0;
+    while ((de = readdir(d)) && count < MARK_FX_CATALOG_MAX) {
         if (de->d_name[0] == '.' || !valid_fx_id(de->d_name)) continue;
         char so_path[760], json_path[760];
         struct stat st;
@@ -561,7 +564,7 @@ static void fx_catalog_scan(mark_t *m) {
             free(js);
             continue;
         }
-        mk_fx_catalog_t *e = &m->fx_catalog[m->fx_catalog_count++];
+        mk_fx_catalog_t *e = &m->fx_catalog[count++];
         snprintf(e->id, sizeof(e->id), "%s", de->d_name);
         if (manifest_string(js, "name", e->name, sizeof(e->name)) != 0)
             snprintf(e->name, sizeof(e->name), "%s", de->d_name);
@@ -571,8 +574,9 @@ static void fx_catalog_scan(mark_t *m) {
         free(js);
     }
     closedir(d);
-    qsort(m->fx_catalog, (size_t)m->fx_catalog_count,
-          sizeof(m->fx_catalog[0]), fx_catalog_cmp);
+    qsort(m->fx_catalog, (size_t)count, sizeof(m->fx_catalog[0]),
+          fx_catalog_cmp);
+    m->fx_catalog_count = count;   /* publish last */
 }
 
 static void ext_fx_destroy(mk_ext_fx_t *fx) {
@@ -690,6 +694,11 @@ static void fx_publish(mark_t *m, mk_fx_result_t *r) {
  */
 static void worker_demote(const char *name) {
     struct sched_param normal = {0};
+    /* 0 is the correct SCHED_OTHER priority on Linux, but it is below the
+     * valid range on some hosts, where the call either fails or leaves the
+     * thread barely schedulable. Ask for the platform's own minimum. */
+    int lo = sched_get_priority_min(SCHED_OTHER);
+    normal.sched_priority = lo < 0 ? 0 : lo;
     (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
 #if defined(__linux__)
     cpu_set_t set;
@@ -699,9 +708,10 @@ static void worker_demote(const char *name) {
     CPU_SET(2, &set);
     (void)sched_setaffinity(0, sizeof(set), &set);
     (void)pthread_setname_np(pthread_self(), name);
-#elif defined(__APPLE__)
-    (void)pthread_setname_np(name);   /* host tests only; names the thread */
 #else
+    /* Naming and affinity are Linux-only here on purpose: the Move is the
+     * only place they mean anything, and rt_thread_audit is what reads the
+     * name. The host tests just need the demote. */
     (void)name;
 #endif
 }
@@ -723,6 +733,21 @@ static uint64_t monotonic_ms(void) {
 static void *fx_worker(void *arg) {
     mark_t *m = (mark_t *)arg;
     worker_demote("mark-fx");
+    /*
+     * Build the FX catalog here, not in create_instance.
+     *
+     * It is an opendir, then a stat and a module.json read -- up to 256 kB
+     * each -- for every module in the directory, and create_instance is the
+     * SPI audio callback. Doing it first, before any request is serviced,
+     * means a session load arriving immediately still resolves its ids.
+     *
+     * The count bump is a rev change so the Remote UI refetches; the device
+     * UI retries a few times while the list is empty (see discoverFxModules
+     * in ui_overtake.js), because it reads the catalog once at init and
+     * would otherwise show builtins only until the module was re-entered.
+     */
+    fx_catalog_scan(m);
+    m->edit_rev++;
     uint64_t last_probe_ms = 0;
     while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
         int did_work = 0;
@@ -896,9 +921,10 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         snprintf(m->module_dir, sizeof(m->module_dir), "%s", module_dir);
         snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
                  module_dir);
-        fx_catalog_scan(m);
         if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
             m->fx_thread_valid = 1;
+        else
+            fx_catalog_scan(m);   /* no worker to do it; off device only */
     }
     return m;
 }
