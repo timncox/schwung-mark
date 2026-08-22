@@ -1507,6 +1507,10 @@ typedef struct {
     mark_t *m;
     int slot;
     int op;                              /* 1 save, 2 load */
+    /* session_start creates the worker before it mutates any live state, so
+     * a failed pthread_create cannot strand a validated load. The worker
+     * parks here until the instance is ready for it. */
+    _Atomic int armed;
     char fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
     char fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
 } mk_job_t;
@@ -1576,6 +1580,13 @@ static void *io_worker(void *arg) {
     mk_job_t *job = (mk_job_t *)arg;
     mark_t *m = job->m;
     worker_demote("mark-io");
+    /* Demote first, then wait: spinning here at the priority we were born
+     * with is the thing this whole arrangement exists to avoid. session_start
+     * guarantees an arm follows a successful create with no return between
+     * them, so this cannot park forever -- if it could, mark_destroy's join
+     * would deadlock. */
+    while (!atomic_load_explicit(&job->armed, memory_order_acquire))
+        usleep(200);
     char path[320];
     int err = 0;
 
@@ -1748,13 +1759,32 @@ static void session_start(mark_t *m, int slot, int op) {
     job->m = m;
     job->slot = slot;
     job->op = op;
+    if (op == 2 && session_preflight(m, slot) != 0) {
+        m->io_error = 1;
+        m->edit_rev++;
+        free(job);
+        return;
+    }
+
+    /*
+     * Create the worker BEFORE touching live state.
+     *
+     * This used to run last, and a failed pthread_create fell back to calling
+     * io_worker() inline -- a whole session save or load, wav files and all,
+     * on the SPI audio callback. The reason was sound: for a load, the tracks
+     * had already been detached, so refusing would have left Mark silent with
+     * nothing loaded. Creating first removes the dilemma instead of trading
+     * one failure for a worse one. The worker parks on its gate until armed.
+     */
+    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
+        m->io_error = 1;
+        m->edit_rev++;
+        free(job);
+        return;
+    }
+    m->io_thread_valid = 1;
+
     if (op == 2) {
-        if (session_preflight(m, slot) != 0) {
-            m->io_error = 1;
-            m->edit_rev++;
-            free(job);
-            return;
-        }
         /* Validation succeeded. Silence + detach every track before the
          * worker touches buffers, preserving the render-thread contract. */
         for (int i = 0; i < MARK_TRACKS; i++) {
@@ -1810,13 +1840,9 @@ static void session_start(mark_t *m, int slot, int op) {
     m->io_error = 0;
     m->io_busy = op;
     m->edit_rev++;
-    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
-        /* Thread exhaustion must not strand a validated load after its live
-         * tracks were detached. Complete the same job synchronously. */
-        io_worker(job);
-    } else {
-        m->io_thread_valid = 1;
-    }
+    /* Release the worker. Nothing may return between the create above and
+     * this line. */
+    atomic_store_explicit(&job->armed, 1, memory_order_release);
 }
 
 /* Track FX: one insert per track, applied post-read / pre-fader. Filter
