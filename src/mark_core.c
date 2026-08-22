@@ -758,13 +758,25 @@ static void *fx_worker(void *arg) {
             if (r) fx_publish(m, r);
             did_work = 1;
         }
-        /* Refresh the session-slot mask that get_param serves. Dropping a
-         * throttled request is safe: the reader re-asks on its next repaint,
-         * so this self-corrects instead of needing to be re-armed. Not
-         * did_work -- a probe must not spin the loop. */
-        int want = atomic_exchange_explicit(&m->session_slots_want, 0,
-                                            memory_order_acq_rel);
-        if (want) {
+        /*
+         * Refresh the session-slot mask that get_param serves.
+         *
+         * Never while the io worker owns the session directory. A probe that
+         * lands mid-delete stats files the unlinks have not reached yet and
+         * resurrects the bit the UI just retired; mid-save it can see a
+         * half-written session.json. Deferring instead of clearing the
+         * request means it survives the op rather than being dropped by it,
+         * and io_worker forces one on completion.
+         *
+         * Dropping a THROTTLED request is still safe -- the reader re-asks on
+         * its next repaint, so that path self-corrects. Neither sets did_work:
+         * a probe must not spin the loop.
+         */
+        int want = atomic_load_explicit(&m->session_slots_want,
+                                        memory_order_acquire);
+        if (want && !atomic_load_explicit(&m->io_busy, memory_order_acquire)) {
+            atomic_store_explicit(&m->session_slots_want, 0,
+                                  memory_order_relaxed);
             uint64_t now_ms = monotonic_ms();
             if (want > 1 || last_probe_ms == 0
                 || now_ms - last_probe_ms >= MARK_SLOT_PROBE_MS) {
@@ -1506,7 +1518,7 @@ static int wav_probe(const char *path, uint32_t *frames_out) {
 typedef struct {
     mark_t *m;
     int slot;
-    int op;                              /* 1 save, 2 load */
+    int op;                              /* 1 save, 2 load, 3 delete */
     /* session_start creates the worker before it mutates any live state, so
      * a failed pthread_create cannot strand a validated load. The worker
      * parks here until the instance is ready for it. */
@@ -1590,7 +1602,19 @@ static void *io_worker(void *arg) {
     char path[320];
     int err = 0;
 
-    if (job->op == 1) {   /* ---- save ---- */
+    if (job->op == 3) {   /* ---- delete ---- */
+        char path[320];
+        session_path(m, job->slot, "session.json", path, sizeof(path));
+        if (unlink(path) != 0) err = 1;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            char wname[16];
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, job->slot, wname, path, sizeof(path));
+            unlink(path);            /* a track that was never recorded */
+        }
+        session_path(m, job->slot, NULL, path, sizeof(path));
+        rmdir(path);
+    } else if (job->op == 1) {   /* ---- save ---- */
         mkdir(m->session_dir, 0755);
         session_path(m, job->slot, NULL, path, sizeof(path));
         mkdir(path, 0755);
@@ -1800,7 +1824,7 @@ static void session_start(mark_t *m, int slot, int op) {
         }
         reset_undo(m);
         m->grid_unit = 0.0;
-    } else {
+    } else if (op == 1) {
         /* saving while overdubbing/recording would race the writer — leave
          * dub, and finalize a recording at what's already down (no
          * extend-to-measure: that would keep writing during the save) */
@@ -2227,32 +2251,23 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         return;
     }
     if (!strcmp(key, "delete_session")) {
-        /* deletion is a handful of unlinks — safe synchronously on the UI
-         * thread, but never while a save/load worker owns the directory */
+        /*
+         * "A handful of unlinks" is still blocking filesystem work, and it was
+         * running here -- on the SPI audio callback -- under a comment calling
+         * this the UI thread. It goes to the same worker that owns every other
+         * mutation of the session directory, which also means there is exactly
+         * one writer to reason about rather than two.
+         *
+         * The bit is retired here rather than on completion because the UI
+         * expects the slot to vanish on the repaint it was pressed; the
+         * worker's forced probe reconciles it afterwards if an unlink failed.
+         */
         int slot = atoi(val);
-        if (slot < 1 || slot > MARK_SESSION_SLOTS || m->io_busy ||
-            !m->session_dir[0])
-            return;
-        char path[320];
-        session_path(m, slot, "session.json", path, sizeof(path));
-        unlink(path);
-        for (int i = 0; i < MARK_TRACKS; i++) {
-            char wname[16];
-            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
-            session_path(m, slot, wname, path, sizeof(path));
-            unlink(path);
-        }
-        session_path(m, slot, NULL, path, sizeof(path));
-        rmdir(path);
-        /* We know exactly which slot went away, so retire its bit here rather
-         * than making the reader wait for the next probe -- the UI expects
-         * the slot to vanish on this very repaint. Still ask for a probe, to
-         * reconcile if an unlink failed. */
+        if (slot < 1 || slot > MARK_SESSION_SLOTS) return;
         atomic_fetch_and_explicit(&m->session_slots_mask,
                                   ~(uint32_t)(1u << (slot - 1)),
                                   memory_order_release);
-        atomic_store_explicit(&m->session_slots_want, 2, memory_order_relaxed);
-        m->edit_rev++;
+        session_start(m, slot, 3);
         return;
     }
 
@@ -2513,6 +2528,7 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
     if (!strcmp(key, "session_status")) {
         const char *s = m->io_busy == 1 ? "saving"
                       : m->io_busy == 2 ? "loading"
+                      : m->io_busy == 3 ? "deleting"
                       : m->io_error ? "error" : "idle";
         return snprintf(buf, (size_t)buf_len, "%s", s);
     }

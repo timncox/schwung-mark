@@ -564,7 +564,8 @@ static void wait_io(mark_t *m) {
     char buf[16];
     for (int spin = 0; spin < 20000; spin++) {
         gp_str(m, "session_status", buf, sizeof(buf));
-        if (strcmp(buf, "saving") != 0 && strcmp(buf, "loading") != 0) return;
+        if (strcmp(buf, "saving") != 0 && strcmp(buf, "loading") != 0 &&
+            strcmp(buf, "deleting") != 0) return;
         usleep(1000);
     }
     assert(!"session i/o never finished");
@@ -750,8 +751,13 @@ static void test_sessions(void) {
     assert(tlen(m, 0) == live_len && tstate(m, 0) == live_state);
     assert(gp_int(m, "t2_level") == 137);
 
-    /* delete: slot 3 disappears from the bitmap and won't load */
+    /* delete: slot 3 disappears from the bitmap and won't load.
+     * The unlinks run on the io worker now, so wait for it. This build has no
+     * fx worker (mark_create passes no module_dir), so session_slots probes
+     * the filesystem inline and would otherwise still see the files. On
+     * device the bit is retired the instant the key is written. */
     mark_set_param(m, "delete_session", "3");
+    wait_io(m);
     gp_str(m, "session_slots", buf, sizeof(buf));
     assert(strncmp(buf, "0,0,0", 5) == 0);
     mark_set_param(m, "load_session", "3");
