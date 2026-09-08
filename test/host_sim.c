@@ -927,6 +927,93 @@ static void test_trim_session_roundtrip(void) {
     printf("ok: trim survives session round-trip\n");
 }
 
+/* ---- mark_process_multi: one jack per track ---------------------- */
+
+/* Distinct amplitude band per track, so a crossed route is unmissable:
+ * track 0 lands near 1000, track 1 near 2000, track 2 near 3000. */
+static int16_t msig(int track, uint64_t k) {
+    return (int16_t)(1000 * (track + 1) + (int)(k % 7) * 13);
+}
+
+/* Drive mark_process_multi for n frames. mode 0 = per-track signal,
+ * 1 = silence. If cap is non-NULL the LAST block of each track's output is
+ * copied into cap[track][...]. */
+static void run_multi(mark_t *m, uint32_t n, int mode,
+                      int16_t cap[MARK_TRACKS][BLOCK]) {
+    static int16_t inb[MARK_TRACKS][BLOCK], outb[MARK_TRACKS][BLOCK];
+    const int16_t *inp[MARK_TRACKS];
+    int16_t *outp[MARK_TRACKS];
+    for (int i = 0; i < MARK_TRACKS; i++) { inp[i] = inb[i]; outp[i] = outb[i]; }
+
+    uint32_t done = 0;
+    while (done < n) {
+        int c = n - done > BLOCK ? BLOCK : (int)(n - done);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            for (int f = 0; f < c; f++)
+                inb[i][f] = mode == 0 ? msig(i, g_in_frame + (uint64_t)f) : 0;
+        mark_process_multi(m, inp, outp, c);
+        if (cap)
+            for (int i = 0; i < MARK_TRACKS; i++)
+                memcpy(cap[i], outb[i], (size_t)c * sizeof(int16_t));
+        g_in_frame += (uint64_t)c;
+        done += (uint32_t)c;
+    }
+}
+
+static void test_process_multi(void) {
+    mark_t *m = mark_create(&host);
+    assert(m);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+    mark_set_param(m, "master", "100");
+    mark_set_param(m, "t1_level", "100");
+    mark_set_param(m, "t2_level", "100");
+
+    /* Record tracks 1 and 2 at once, each from its OWN input jack. */
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t2_btn", "1");
+    run_multi(m, FPM, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t2_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tstate(m, 1) == MK_PLAY);
+
+    /* Play into silence, long enough for the per-track gain ramp to settle. */
+    int16_t cap[MARK_TRACKS][BLOCK];
+    run_multi(m, 8000, 1, cap);
+
+    /* Each output must carry ONLY its own track's band. Crossed routing or a
+     * shared mix bus would put ~3000 (the sum) on both, or the wrong band on
+     * each; either fails here. */
+    int lo0 = 32767, hi0 = -32768, lo1 = 32767, hi1 = -32768;
+    for (int f = 0; f < BLOCK; f++) {
+        if (cap[0][f] < lo0) lo0 = cap[0][f];
+        if (cap[0][f] > hi0) hi0 = cap[0][f];
+        if (cap[1][f] < lo1) lo1 = cap[1][f];
+        if (cap[1][f] > hi1) hi1 = cap[1][f];
+    }
+    assert(lo0 > 900  && hi0 < 1200);   /* track 1's band, alone */
+    assert(lo1 > 1900 && hi1 < 2200);   /* track 2's band, alone */
+
+    /* A track that never recorded must be silent on its own jack. */
+    for (int f = 0; f < BLOCK; f++) assert(cap[2][f] == 0);
+
+    /* Monitor in multi mode passes each track's OWN input through. */
+    mark_set_param(m, "monitor", "1");
+    run_multi(m, BLOCK * 4, 0, cap);
+    int seen0 = 0, seen2 = 0;
+    for (int f = 0; f < BLOCK; f++) {
+        if (cap[0][f] > 1500) seen0 = 1;             /* t1 loop + own dry */
+        if (cap[2][f] > 2900 && cap[2][f] < 3200) seen2 = 1; /* dry only */
+    }
+    assert(seen0);
+    assert(seen2);
+
+    mark_destroy(m);
+    printf("ok: process_multi per-track in/out isolation\n");
+}
+
 static void test_cc_control(void) {
     mark_t *m = mark_create(&host);
     g_in_frame = 0;
@@ -1003,6 +1090,7 @@ int main(void) {
     test_trim_session_roundtrip();
     test_len16_and_16th_grid();
     test_cc_control();
+    test_process_multi();
     printf("all mark sim tests passed\n");
     return 0;
 }

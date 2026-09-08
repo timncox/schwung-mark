@@ -77,7 +77,28 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir);
 void    mark_destroy(mark_t *m);
 
 /* Process one block, stereo interleaved int16. in and out may alias. */
+/* Classic form: one stereo input every track records, one stereo mix every
+ * track sums into. Buffers are interleaved, `frames` frames each. */
 void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames);
+
+/*
+ * Per-track form, for a panel with a jack per track.
+ *
+ * in_ch[i] and out_ch[i] are MONO buffers of `frames` samples: track i
+ * records in_ch[i] and appears alone on out_ch[i]. Both arrays must have
+ * MARK_TRACKS entries and no NULL members. `frames` is clamped to
+ * MARK_BLOCK_FRAMES, as in mark_process.
+ *
+ * Two behavioural differences follow from one jack per track, and are
+ * deliberate rather than unimplemented:
+ *   - PAN is not applied. A mono output has nowhere to pan to. The `pan`
+ *     param still round-trips through state; it just does not affect audio.
+ *   - MONITOR passes that track's own input, not a shared one.
+ * Level, master gain, one-shot, reverse, undo and both FX paths behave
+ * exactly as in mark_process.
+ */
+void mark_process_multi(mark_t *m, const int16_t *const *in_ch,
+                        int16_t *const *out_ch, int frames);
 
 void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source);
 void mark_set_param(mark_t *m, const char *key, const char *val);

@@ -247,6 +247,10 @@ struct mark {
     int fx_thread_valid;
     int16_t fx_block[MARK_TRACKS][MARK_BLOCK_FRAMES * 2];
     float mix_l[MARK_BLOCK_FRAMES], mix_r[MARK_BLOCK_FRAMES];
+    /* Per-track bus, used only by mark_process_multi. Block-sized scratch:
+     * MARK_TRACKS * 128 * 4 B, i.e. 2 KB at 4 tracks — not a memory concern.
+     * Kept separate from mix_l/mix_r so the classic mix path is untouched. */
+    float tmix[MARK_TRACKS][MARK_BLOCK_FRAMES];
 };
 
 /* ------------------------------------------------------------------ */
@@ -1893,7 +1897,36 @@ static void track_fx_run(mark_t *m, mk_track_t *t, float *l, float *r) {
     }
 }
 
-void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
+/*
+ * Per-track I/O routing.
+ *
+ * The classic form is one stereo input every track records, and one stereo
+ * mix every track sums into. A panel with a jack per track wants the other
+ * shape: track i records in_ch[i] and appears alone on out_ch[i].
+ *
+ * Both run through process_common. rt == NULL selects the classic form, so
+ * mark_process is byte-for-byte the code it always was.
+ */
+typedef struct {
+    const int16_t *const *in_ch;   /* [MARK_TRACKS], mono, one per track */
+    int16_t *const *out_ch;        /* [MARK_TRACKS], mono, one per track */
+} mk_route_t;
+
+/* Track i's input for frame n, as a stereo pair. In multi mode the jack is
+ * mono, so both sides carry it — which is what the recorder and the overdub
+ * mixer expect, and what tbuf_store averages back down at MARK_CH=1. */
+static inline void route_in(const mk_route_t *rt, const int16_t *in,
+                            int i, int n, int16_t *l, int16_t *r) {
+    if (rt && rt->in_ch) {
+        *l = *r = rt->in_ch[i][n];
+    } else {
+        *l = in[n * 2];
+        *r = in[n * 2 + 1];
+    }
+}
+
+static void process_common(mark_t *m, const int16_t *in, int16_t *out,
+                           int frames, const mk_route_t *rt) {
     if (!m) return;
     if (frames > MARK_BLOCK_FRAMES) frames = MARK_BLOCK_FRAMES;
 
@@ -1912,12 +1945,17 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
             track_fx_prepare(t);
     }
 
+    if (rt && rt->out_ch)
+        for (int i = 0; i < MARK_TRACKS; i++)
+            memset(m->tmix[i], 0, (size_t)frames * sizeof(float));
+
     int paused = m->transport_paused;
     int use_measure_flag = m->measure_flag;
     m->measure_flag = 0;
 
     for (int n = 0; n < frames; n++) {
-        float inl = (float)in[n * 2], inr = (float)in[n * 2 + 1];
+        /* Input is read per track now — in multi mode each track has its own
+         * jack — so it lives inside the track loop below, not here. */
 
         /* --- pending scheduler: fire on the grid --- */
         int boundary = 0;
@@ -1940,9 +1978,15 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
         for (int i = 0; i < MARK_TRACKS; i++) {
             mk_track_t *t = &m->t[i];
 
+            /* This track's input for this frame. Identical to the shared
+             * stereo input in classic mode; this track's own jack in multi. */
+            int16_t si_l, si_r;
+            route_in(rt, in, i, n, &si_l, &si_r);
+            const float inl = (float)si_l, inr = (float)si_r;
+
             if (t->st == MK_REC) {
                 if (t->rec_len < m->track_frames) {
-                    tbuf_store(t->buf, t->rec_len, in[n * 2], in[n * 2 + 1]);
+                    tbuf_store(t->buf, t->rec_len, si_l, si_r);
                     t->rec_len++;
                 }
                 if (t->rec_target && t->rec_len >= t->rec_target) {
@@ -1969,8 +2013,12 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                     track_fx_run(m, t, &l, &r);
                     float gt = (float)t->level / 100.0f;
                     t->g_cur += (gt - t->g_cur) * 0.002f;
-                    outl += l * t->g_cur * t->pg[0];
-                    outr += r * t->g_cur * t->pg[1];
+                    if (rt && rt->out_ch) {
+                        m->tmix[i][n] += (l + r) * 0.5f * t->g_cur;
+                    } else {
+                        outl += l * t->g_cur * t->pg[0];
+                        outr += r * t->g_cur * t->pg[1];
+                    }
                 }
                 continue;
             }
@@ -1992,7 +2040,7 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                     m->undo_count++;
                 }
                 if (m->dub_mode) {   /* replace */
-                    tbuf_store(t->buf, ip, in[n * 2], in[n * 2 + 1]);
+                    tbuf_store(t->buf, ip, si_l, si_r);
                 } else {             /* overdub: layer on top */
                     tbuf_add(t->buf, ip, inl, inr);
                 }
@@ -2006,8 +2054,15 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                     track_fx_run(m, t, &l, &r);
                 float gt = (float)t->level / 100.0f;
                 t->g_cur += (gt - t->g_cur) * 0.002f;
-                outl += l * t->g_cur * t->pg[0];
-                outr += r * t->g_cur * t->pg[1];
+                /* Multi mode: this track owns an output jack, so it goes to
+                 * its own bus and pan is not applied — there is nowhere to
+                 * pan to. Classic mode sums into the shared stereo bus. */
+                if (rt && rt->out_ch) {
+                    m->tmix[i][n] += (l + r) * 0.5f * t->g_cur;
+                } else {
+                    outl += l * t->g_cur * t->pg[0];
+                    outr += r * t->g_cur * t->pg[1];
+                }
             }
 
             t->pos += 1.0;
@@ -2035,21 +2090,59 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
         float gt = (float)t->level / 100.0f;
         for (int n = 0; n < frames; n++) {
             t->g_cur += (gt - t->g_cur) * 0.002f;
-            m->mix_l[n] += (float)m->fx_block[i][n * 2]
-                         * t->g_cur * t->pg[0];
-            m->mix_r[n] += (float)m->fx_block[i][n * 2 + 1]
-                         * t->g_cur * t->pg[1];
+            if (rt && rt->out_ch) {
+                m->tmix[i][n] += ((float)m->fx_block[i][n * 2]
+                                + (float)m->fx_block[i][n * 2 + 1])
+                               * 0.5f * t->g_cur;
+            } else {
+                m->mix_l[n] += (float)m->fx_block[i][n * 2]
+                             * t->g_cur * t->pg[0];
+                m->mix_r[n] += (float)m->fx_block[i][n * 2 + 1]
+                             * t->g_cur * t->pg[1];
+            }
         }
     }
 
     float dry = m->monitor ? 1.0f : 0.0f;
-    for (int n = 0; n < frames; n++) {
-        out[n * 2] = clip16(m->mix_l[n] * m->master_g
-                            + (float)in[n * 2] * dry);
-        out[n * 2 + 1] = clip16(m->mix_r[n] * m->master_g
-                                + (float)in[n * 2 + 1] * dry);
+    if (rt && rt->out_ch) {
+        /* One jack per track. Master gain still applies, and monitor passes
+         * that track's own input through — the multi analogue of the shared
+         * dry path below. */
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            for (int n = 0; n < frames; n++) {
+                float d = 0.0f;
+                if (dry != 0.0f) {
+                    int16_t sl, sr;
+                    route_in(rt, in, i, n, &sl, &sr);
+                    d = ((float)sl + (float)sr) * 0.5f;
+                }
+                rt->out_ch[i][n] = clip16(m->tmix[i][n] * m->master_g + d * dry);
+            }
+        }
+    } else {
+        for (int n = 0; n < frames; n++) {
+            out[n * 2] = clip16(m->mix_l[n] * m->master_g
+                                + (float)in[n * 2] * dry);
+            out[n * 2 + 1] = clip16(m->mix_r[n] * m->master_g
+                                    + (float)in[n * 2 + 1] * dry);
+        }
     }
     m->global_frames += (uint64_t)frames;
+}
+
+void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
+    process_common(m, in, out, frames, NULL);
+}
+
+void mark_process_multi(mark_t *m, const int16_t *const *in_ch,
+                        int16_t *const *out_ch, int frames) {
+    if (!m || !in_ch || !out_ch) return;
+    mk_route_t rt = { in_ch, out_ch };
+    /* in/out are unused in this mode; route_in and the output stage both
+     * take the rt branch. Passing NULL would be a landmine if a future edit
+     * reached for them, so pass the engine's own silence instead. */
+    static const int16_t silence[MARK_BLOCK_FRAMES * 2] = {0};
+    process_common(m, silence, NULL, frames, &rt);
 }
 
 /* ------------------------------------------------------------------ */
