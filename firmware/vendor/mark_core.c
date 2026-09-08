@@ -1,0 +1,2741 @@
+/*
+ * Mark core engine. See mark_core.h for the model.
+ *
+ * v1 simplifications (documented follow-ups, not accidents):
+ *   - Playback is speed 1.0 only: no tempo-sync time-stretch or varispeed.
+ *     Tracks recorded at one tempo drift against a changed clock tempo.
+ *   - Record/pending actions land on a block boundary (<= 2.9 ms early/late)
+ *     when driven by the clocked measure flag; base-track boundaries are
+ *     frame-accurate.
+ *   - Overdubbing a reversed track is refused (the RC-505 does the same).
+ *   - Loop audio is not saved with presets; `state` carries settings only.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdatomic.h>
+
+#include "mark_core.h"
+/* Types only — stdint and plugin_api_v1.h, no POSIX — so the FX structs stay
+ * available even when plugin LOADING is compiled out. */
+#include "audio_fx_api_v2.h"
+
+/* Everything below this line is what a hosted OS provides and a bare-metal
+ * target does not. See MARK_HOSTED_FX / MARK_SESSIONS in mark_core.h. */
+#if MARK_NEEDS_THREADS
+#include <pthread.h>
+#include <sched.h>
+#else
+/* Single-threaded build. The reader counts these loops spin on are only
+ * ever raised by the audio callback, which cannot be mid-read while
+ * set_param runs on the same thread — so the wait is a no-op, not a
+ * busy-wait that never completes. */
+#define usleep(us) ((void)(us))
+#endif
+#if MARK_HOSTED_FX || MARK_SESSIONS
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#if MARK_HOSTED_FX
+#include <dirent.h>
+#include <dlfcn.h>
+#endif
+
+/* Allocation fallback ladder: first capacity that calloc grants wins. */
+static const int alloc_seconds[] = { MARK_MAX_SECONDS, 45, 30, 20, 15 };
+#define ALLOC_STEPS 5
+
+/* Incremental undo-swap budget per 128-frame block. 32768 frames is ~0.5 MB
+ * of traffic — comfortably inside the render budget, and a full 60 s swap
+ * completes in ~81 blocks (~0.24 s) with the track muted. */
+#define SWAP_FRAMES_PER_BLOCK 32768
+
+/* Per-track insert FX (the RC's Track FX, reduced to one slot per track).
+ * Codes are stable — the pad UI and web editor index into them. */
+typedef enum {
+    TFX_OFF = 0,
+    TFX_LPF,        /* param = cutoff, exponential ~60 Hz .. ~11 kHz */
+    TFX_HPF,        /* param = cutoff, exponential ~40 Hz .. ~10 kHz */
+    TFX_CRUSH,      /* param = sample-hold depth + bit quantize */
+    TFX_DELAY,      /* tempo-synced 8th echo, param = feedback/mix */
+    TFX_PHASER,     /* 4-stage allpass sweep, param = LFO rate */
+    TFX_RINGMOD,    /* sine ring mod, param = carrier freq */
+    TFX_COUNT
+} tfx_t;
+
+#define MARK_DLY_LEN 32768     /* 8th-note delay down through the UI's 50 BPM */
+#define MARK_SESSION_SLOTS 16
+#define MARK_BLOCK_FRAMES 128
+#define MARK_FX_CATALOG_MAX 48
+#define MARK_FX_ID_MAX 64
+#define MARK_FX_NAME_MAX 80
+#define MARK_FX_REQUESTS 32
+#define MARK_FX_STATE_MAX 8192
+
+typedef struct {
+    char id[MARK_FX_ID_MAX];
+    char name[MARK_FX_NAME_MAX];
+} mk_fx_catalog_t;
+
+/* A loaded Schwung audio-FX instance. Construction/destruction and manifest
+ * reads happen on fx_thread; only process_block/get/set/on_midi run on the
+ * audio thread after an atomic block-boundary handoff. */
+typedef struct mk_ext_fx {
+    void *handle;
+    audio_fx_api_v2_t *api;
+    void *instance;
+    char id[MARK_FX_ID_MAX];
+    char name[MARK_FX_NAME_MAX];
+    char *hierarchy;                 /* cached manifest ui_hierarchy JSON */
+} mk_ext_fx_t;
+
+typedef struct {
+    int track;
+    char id[MARK_FX_ID_MAX];         /* empty = unload / return to built-in */
+} mk_fx_request_t;
+
+typedef struct mk_fx_result {
+    int track;
+    int status;                      /* 0 unloaded, 2 ready, -1 load error */
+    int set_desired;                 /* session restore updates selection */
+    char id[MARK_FX_ID_MAX];
+    mk_ext_fx_t *next;
+    mk_ext_fx_t *retired;            /* filled by audio thread for cleanup */
+} mk_fx_result_t;
+
+/* RBJ biquad (smack pattern) for the LPF/HPF track FX */
+typedef struct { float b0, b1, b2, a1, a2, z1, z2; } mk_bq_t;
+
+static inline float bq_run(mk_bq_t *q, float x) {
+    float y = q->b0 * x + q->z1;
+    q->z1 = q->b1 * x - q->a1 * y + q->z2;
+    q->z2 = q->b2 * x - q->a2 * y;
+    return y;
+}
+
+static void bq_set(mk_bq_t *q, float freq, int highpass, float Q) {
+    float w0 = 6.2831853f * freq / (float)MARK_SR;
+    float cw = cosf(w0), sw = sinf(w0);
+    float alpha = sw / (2.0f * Q);
+    float inv = 1.0f / (1.0f + alpha);
+    if (highpass) {
+        q->b0 = (1.0f + cw) * 0.5f * inv;
+        q->b1 = -(1.0f + cw) * inv;
+        q->b2 = q->b0;
+    } else {
+        q->b0 = (1.0f - cw) * 0.5f * inv;
+        q->b1 = (1.0f - cw) * inv;
+        q->b2 = q->b0;
+    }
+    q->a1 = -2.0f * cw * inv;
+    q->a2 = (1.0f - alpha) * inv;
+}
+
+typedef struct {
+    int16_t *buf;          /* track_frames * 2, interleaved */
+    uint32_t len;          /* current loop frames, 0 = empty */
+    uint32_t full_len;     /* frames as finalized — trim can't exceed this */
+    uint32_t rec_len;      /* frames recorded so far while MK_REC */
+    uint32_t rec_target;   /* 0 = none; keep recording until this length */
+    int      rec_end;      /* state to enter when recording finalizes */
+    double   pos;          /* 0 .. len */
+    int      st;           /* mk_tstate_t */
+    int      pending;      /* 0 none, 1 = start record, 2 = start play */
+    int      level;        /* 0..200, 100 = unity (RC play level) */
+    int      pan;          /* 0..100, 50 = center */
+    int      rev, shot;
+    float    g_cur;        /* smoothed level gain */
+    float    pg[2];        /* balance gains L/R */
+
+    /* Track FX runtime */
+    int      fx;           /* tfx_t code, kept while switched off */
+    int      fx_on;
+    int      fxp;          /* 0..100 */
+    int      fx_dirty;     /* recompute filter coefficients in render */
+    char     fx_module[MARK_FX_ID_MAX]; /* empty = built-in tfx_t */
+    char     fx_active[MARK_FX_ID_MAX];
+    int      fx_status;    /* 0 built-in, 1 loading, 2 ready, -1 error */
+    mk_bq_t  bqL, bqR;
+    int      crush_cnt;
+    float    crush_l, crush_r;
+    float    *dly;         /* MARK_DLY_LEN * 2 floats, interleaved */
+    uint32_t dly_w;
+    float    ph_lfo;       /* phaser LFO phase 0..1 */
+    float    ph_x[2][4], ph_y[2][4];
+    float    rm_phase;
+} mk_track_t;
+
+struct mark {
+    const host_api_v1_t *host;
+    uint32_t track_frames;       /* per-track capacity actually allocated */
+
+    mk_track_t t[MARK_TRACKS];
+    int16_t *undo_buf;           /* track_frames * 2 */
+
+    /* Undo: single level, last record/overdub gesture wins.
+     * kind 0 = overdub (undo_buf holds the pre-dub audio for the covered
+     * region; undo = incremental swap, so redo is the same swap again).
+     * kind 1 = first recording (undo = clear, redo = restore length). */
+    int      undo_track;         /* -1 = none */
+    int      undo_kind;
+    int      undo_redo;          /* 0 = next undo press undoes, 1 = redoes */
+    int      undo_capturing;     /* copy-before-write active (dub gesture) */
+    uint32_t undo_start;         /* loop frame where the dub began */
+    uint32_t undo_count;         /* frames captured, capped at len */
+    uint32_t undo_saved_len;     /* kind 1: length to restore on redo */
+    int      swap_track;         /* -1 = no swap job running */
+    uint32_t swap_pos;
+
+    /* Clock (smack pattern). Global frame counter across all blocks. */
+    uint64_t global_frames;
+    double   frames_per_tick;    /* smoothed; 918.75 = 120 BPM */
+    uint64_t last_tick_global;
+    uint32_t tick_total;
+    int      clock_running;
+    int      clock_seen;
+    int      measure_flag;       /* set on tick_total % 96 == 0, consumed
+                                    by the pending scheduler */
+
+    /* MIDI CC control */
+    uint8_t  cc_last[3];         /* last external CC accepted (dup guard) */
+    uint64_t cc_last_frames;     /* global_frames when it was accepted */
+
+    /* Grid: frames per measure captured when the first track finalized.
+     * Used for quantization while free-running; a running clock always
+     * wins. Reset when every track is cleared. */
+    double   grid_unit;
+
+    /* Params */
+    int   quantize;              /* 0 off, 1 on (default) */
+    int   rec_grid;              /* quantize unit: 0 measure (default),
+                                    1 beat, 2 eighth, 3 sixteenth — finer
+                                    grids allow polymetric loops (15/16) */
+    int   rec_action;            /* 0 rec->play (default), 1 rec->dub */
+    int   dub_mode;              /* 0 overdub (default), 1 replace */
+    int   play_mode;             /* 0 multi (default); 1 single: starting a
+                                    track stops the others (song sections) */
+    int   master;                /* 0..200 */
+    float master_g;
+    int   monitor;               /* 0 = mute live input at the output */
+    int   hw_input;              /* set by the gen wrapper */
+    int   follow;                /* 1 = Move transport stop pauses loops */
+    int   transport_paused;
+    float bpm_override;          /* free-run tempo; 0 = project tempo */
+
+    /* Remote-UI sync: bumped on any state-visible edit; gates the browser
+     * editor's full-state refetch (schwung-manager polls rui_poll). */
+    _Atomic uint32_t edit_rev;
+
+    /* Sessions: loop audio + settings saved per slot (tN.wav + a flat
+     * session.json) under session_dir. File I/O runs on a joinable worker
+     * thread; io_busy gates every state-mutating action meanwhile. */
+    char session_dir[240];
+    _Atomic int io_busy;          /* 0 idle, 1 saving, 2 loading */
+    _Atomic int io_error;         /* last I/O op failed */
+#if MARK_NEEDS_THREADS
+    pthread_t io_thread;
+#endif
+    int io_thread_valid;
+
+    /* Per-track Schwung FX host. Requests are a fixed SPSC queue written by
+     * set_param on the audio thread and consumed by a normal-priority loader.
+     * Completed instances swap in at the next render block; the loader later
+     * destroys retired instances, so dlopen/malloc/file I/O never enter DSP. */
+    char module_dir[320];
+    char audio_fx_dir[320];
+    mk_fx_catalog_t fx_catalog[MARK_FX_CATALOG_MAX];
+    int fx_catalog_count;
+    mk_fx_request_t fx_requests[MARK_FX_REQUESTS];
+    _Atomic uint32_t fx_req_head;
+    _Atomic uint32_t fx_req_tail;
+    _Atomic(mk_ext_fx_t *) fx_active[MARK_TRACKS];
+    _Atomic(mk_fx_result_t *) fx_pending[MARK_TRACKS];
+    _Atomic(mk_fx_result_t *) fx_done[MARK_TRACKS];
+    /* get/set/on_midi may arrive on host control threads while the audio
+     * callback swaps fx_active. Readers enter before loading an active
+     * pointer; the loader waits for a zero-reader grace point before
+     * destroying a retired instance. An atomic pointer alone does not keep
+     * the object it names alive. */
+    _Atomic uint32_t fx_readers;
+    char session_fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
+    char session_fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
+    _Atomic int session_fx_ready[MARK_TRACKS];
+    _Atomic int fx_thread_stop;
+#if MARK_NEEDS_THREADS
+    pthread_t fx_thread;
+#endif
+    int fx_thread_valid;
+    int16_t fx_block[MARK_TRACKS][MARK_BLOCK_FRAMES * 2];
+    float mix_l[MARK_BLOCK_FRAMES], mix_r[MARK_BLOCK_FRAMES];
+    /* Per-track bus, used only by mark_process_multi. Block-sized scratch:
+     * MARK_TRACKS * 128 * 4 B, i.e. 2 KB at 4 tracks — not a memory concern.
+     * Kept separate from mix_l/mix_r so the classic mix path is untouched. */
+    float tmix[MARK_TRACKS][MARK_BLOCK_FRAMES];
+};
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static inline int16_t clip16(float v) {
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)v;
+}
+
+/* Bytes per frame in track storage — and therefore in the session WAVs, which
+ * are a straight dump of a track buffer. Anywhere a literal 4 appeared for
+ * "stereo int16 frame", it must be this instead, or a MARK_CH=1 build reads
+ * and writes twice the bytes the buffer actually holds. */
+#define MARK_BPF ((int)sizeof(int16_t) * MARK_CH)
+
+/*
+ * Track-storage accessors. See MARK_CH in mark_core.h for why storage width
+ * is separable from the audio path.
+ *
+ * At MARK_CH==2 every one of these compiles to exactly the expression it
+ * replaced, so the Move build is unchanged. At MARK_CH==1 storage holds the
+ * mono sum and playback feeds it to both sides — correct without qualification
+ * on a panel whose track input is a single mono jack, where l and r are equal
+ * and the average is the identity.
+ *
+ * Frame indices are FRAMES, never samples. That distinction is the bug this
+ * indirection is meant to make impossible to reintroduce.
+ */
+static inline void tbuf_store(int16_t *b, uint32_t f, int16_t l, int16_t r) {
+#if MARK_CH == 1
+    b[f] = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+#else
+    b[f * 2]     = l;
+    b[f * 2 + 1] = r;
+#endif
+}
+
+static inline void tbuf_load(const int16_t *b, uint32_t f, float *l, float *r) {
+#if MARK_CH == 1
+    *l = *r = (float)b[f];
+#else
+    *l = (float)b[f * 2];
+    *r = (float)b[f * 2 + 1];
+#endif
+}
+
+/* Overdub: layer on top of what is already stored. */
+static inline void tbuf_add(int16_t *b, uint32_t f, float l, float r) {
+#if MARK_CH == 1
+    b[f] = clip16((float)b[f] + (l + r) * 0.5f);
+#else
+    b[f * 2]     = clip16((float)b[f * 2] + l);
+    b[f * 2 + 1] = clip16((float)b[f * 2 + 1] + r);
+#endif
+}
+
+static inline void tbuf_copy(int16_t *dst, uint32_t df,
+                             const int16_t *src, uint32_t sf) {
+#if MARK_CH == 1
+    dst[df] = src[sf];
+#else
+    dst[df * 2]     = src[sf * 2];
+    dst[df * 2 + 1] = src[sf * 2 + 1];
+#endif
+}
+
+static inline void tbuf_swap(int16_t *a, uint32_t af, int16_t *b, uint32_t bf) {
+#if MARK_CH == 1
+    int16_t t = a[af]; a[af] = b[bf]; b[bf] = t;
+#else
+    int16_t tl = a[af * 2], tr = a[af * 2 + 1];
+    a[af * 2]     = b[bf * 2];
+    a[af * 2 + 1] = b[bf * 2 + 1];
+    b[bf * 2]     = tl;
+    b[bf * 2 + 1] = tr;
+#endif
+}
+
+/* snprintf returns the WOULD-HAVE-WRITTEN length — on truncation a raw
+ * `n += snprintf(...)` pushes n past buf_len and later appends write out
+ * of bounds. Every state append goes through this clamp (smack lesson). */
+static int nclamp(int n, int buf_len) {
+    return (n < 0) ? 0 : (n >= buf_len ? buf_len - 1 : n);
+}
+
+/* Trigger params fire on any ACTIVE value: UI pads send "1" (every press
+ * fires) and hierarchy trigger enums send the literal "trigger"; "0" and
+ * "idle" are the no-ops autosave restores send. */
+static int trig_active(const char *val) {
+    return atoi(val) != 0 || strcmp(val, "trigger") == 0;
+}
+
+static int json_int(const char *js, const char *key, int def) {
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(js, pat);
+    return p ? atoi(p + strlen(pat)) : def;
+}
+
+static int json_string(const char *js, const char *key,
+                       char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return -1;
+    p += strlen(pat);
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_len) out[n++] = *p++;
+    out[n] = '\0';
+    return *p == '"' ? 0 : -1;
+}
+
+#if MARK_SESSIONS
+static int json_object(const char *js, const char *key,
+                       char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = js;
+    for (;;) {
+        p = strstr(p, pat);
+        if (!p) return -1;
+        int depth = 0, quoted = 0, escaped = 0;
+        for (const char *q = js; q < p; q++) {
+            char c = *q;
+            if (quoted) {
+                if (escaped) escaped = 0;
+                else if (c == '\\') escaped = 1;
+                else if (c == '"') quoted = 0;
+            } else if (c == '"') quoted = 1;
+            else if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+        }
+        if (depth == 1) break;       /* session root, not a plugin state */
+        p += strlen(pat);
+    }
+    if (!(p = strchr(p + strlen(pat), ':'))) return -1;
+    do { p++; } while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n');
+    if (*p != '{' && *p != '[') return -1;
+    const char open = *p, close = open == '{' ? '}' : ']';
+    const char *start = p;
+    int depth = 0, quoted = 0, escaped = 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (quoted) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') quoted = 0;
+            continue;
+        }
+        if (c == '"') quoted = 1;
+        else if (c == open) depth++;
+        else if (c == close && --depth == 0) {
+            size_t n = (size_t)(p - start + 1);
+            if (n >= out_len) return -1;
+            memcpy(out, start, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+#endif
+
+static int json_csv_string(const char *js, const char *key, int index,
+                           char *out, size_t out_len) {
+    char all[MARK_TRACKS * MARK_FX_ID_MAX];
+    if (json_string(js, key, all, sizeof(all)) != 0) return -1;
+    const char *p = all;
+    for (int i = 0; i < index; i++) {
+        p = strchr(p, ',');
+        if (!p) return -1;
+        p++;
+    }
+    const char *end = strchr(p, ',');
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 0;
+}
+
+static void update_track_gains(mk_track_t *t) {
+    /* balance law: center passes both channels at unity */
+    t->pg[0] = t->pan <= 50 ? 1.0f : (float)(100 - t->pan) / 50.0f;
+    t->pg[1] = t->pan >= 50 ? 1.0f : (float)t->pan / 50.0f;
+}
+
+static void track_fx_reset(mk_track_t *t);
+
+/* ------------------------------------------------------------------ */
+/*  Clock                                                              */
+/* ------------------------------------------------------------------ */
+
+/* A RUNNING clock always wins. A stopped-but-seen clock keeps its
+ * remembered tempo unless the user set a bpm_override (smack lesson:
+ * clock_seen is sticky and would silently eat the override forever). */
+static int clock_governs(const mark_t *m) {
+    return m->clock_seen && (m->clock_running || m->bpm_override <= 0.0f);
+}
+
+static double frames_per_tick_now(const mark_t *m) {
+    if (clock_governs(m)) return m->frames_per_tick;
+    float bpm = 120.0f;
+    if (m->bpm_override > 0.0f) {
+        bpm = m->bpm_override;
+    } else if (m->host && m->host->get_bpm) {
+        float b = m->host->get_bpm();
+        if (b >= 20.0f && b <= 999.0f) bpm = b;
+    }
+    return (double)MARK_SR * 60.0 / ((double)bpm * 24.0);
+}
+
+static double frames_per_measure(const mark_t *m) {
+    return frames_per_tick_now(m) * 96.0;   /* 4/4, 24 ppqn */
+}
+
+/* Quantization grid in frames: running clock > session grid unit > tempo. */
+static double effective_grid(const mark_t *m) {
+    if (m->clock_seen && m->clock_running) return frames_per_measure(m);
+    if (m->grid_unit > 0.0) return m->grid_unit;
+    return frames_per_measure(m);
+}
+
+/* rec_grid divisor: units per measure (4/4) */
+static int grid_div(const mark_t *m) {
+    static const int div[4] = { 1, 4, 8, 16 };
+    return div[m->rec_grid & 3];
+}
+
+/* Record-length rounding unit, from the live grid. */
+static double live_unit(const mark_t *m) {
+    return effective_grid(m) / (double)grid_div(m);
+}
+
+/* Trim unit, locked to the session grid so edits are audio-exact. */
+static double locked_unit(const mark_t *m) {
+    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+    return g / (double)grid_div(m);
+}
+
+/* Lowest-numbered track currently playing or overdubbing — its position
+ * IS the live grid every pending action aligns to. */
+static mk_track_t *base_playing(mark_t *m) {
+    for (int i = 0; i < MARK_TRACKS; i++)
+        if (m->t[i].len > 0 && (m->t[i].st == MK_PLAY || m->t[i].st == MK_DUB))
+            return &m->t[i];
+    return NULL;
+}
+
+static int any_content(const mark_t *m) {
+    for (int i = 0; i < MARK_TRACKS; i++)
+        if (m->t[i].len > 0 || m->t[i].st == MK_REC) return 1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hosted Schwung audio FX                                             */
+/* ------------------------------------------------------------------ */
+
+static int valid_fx_id(const char *s) {
+    if (!s || !*s || strlen(s) >= MARK_FX_ID_MAX) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) return 0;
+    return 1;
+}
+
+#if MARK_HOSTED_FX
+static char *read_text_file(const char *path, size_t max_bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n <= 0 || (size_t)n > max_bytes || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) { free(buf); return NULL; }
+    buf[got] = '\0';
+    return buf;
+}
+#endif
+
+#if MARK_HOSTED_FX
+static int manifest_string(const char *js, const char *key,
+                           char *out, size_t out_len) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return -1;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return -1;
+    while (*++p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {}
+    if (*p != '"') return -1;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_len) {
+        if (*p == '\\' && p[1]) p++;  /* names only need simple unescape */
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return (*p == '"' && n > 0) ? 0 : -1;
+}
+#endif
+
+/* Copy the manifest's ui_hierarchy object for generic parameter editors.
+ * This is deliberately a balanced-object extractor rather than a JSON model:
+ * the browser/Move JS already understands the schema and the DSP only caches
+ * it outside the render thread. */
+#if MARK_HOSTED_FX
+static char *manifest_hierarchy(const char *js) {
+    const char *p = strstr(js, "\"ui_hierarchy\"");
+    if (!p || !(p = strchr(p, ':')) || !(p = strchr(p, '{'))) return NULL;
+    const char *start = p;
+    int depth = 0, quoted = 0, escaped = 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (quoted) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') quoted = 0;
+            continue;
+        }
+        if (c == '"') quoted = 1;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) {
+            size_t n = (size_t)(p - start + 1);
+            char *out = malloc(n + 1);
+            if (!out) return NULL;
+            memcpy(out, start, n);
+            out[n] = '\0';
+            return out;
+        }
+    }
+    return NULL;
+}
+#endif
+
+#if MARK_HOSTED_FX
+static int fx_catalog_cmp(const void *a, const void *b) {
+    const mk_fx_catalog_t *aa = (const mk_fx_catalog_t *)a;
+    const mk_fx_catalog_t *bb = (const mk_fx_catalog_t *)b;
+    return strcmp(aa->name, bb->name);
+}
+#endif
+
+static int fx_catalog_find(const mark_t *m, const char *id) {
+    for (int i = 0; i < m->fx_catalog_count; i++)
+        if (!strcmp(m->fx_catalog[i].id, id)) return i;
+    return -1;
+}
+
+#if MARK_HOSTED_FX
+static void fx_catalog_scan(mark_t *m) {
+    if (!m->audio_fx_dir[0]) return;
+    DIR *d = opendir(m->audio_fx_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) && m->fx_catalog_count < MARK_FX_CATALOG_MAX) {
+        if (de->d_name[0] == '.' || !valid_fx_id(de->d_name)) continue;
+        char so_path[760], json_path[760];
+        struct stat st;
+        snprintf(so_path, sizeof(so_path), "%s/%s/%s.so",
+                 m->audio_fx_dir, de->d_name, de->d_name);
+        if (stat(so_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        snprintf(json_path, sizeof(json_path), "%s/%s/module.json",
+                 m->audio_fx_dir, de->d_name);
+        char *js = read_text_file(json_path, 262144);
+        if (!js) continue;
+        /* The directory id is the ABI lookup key. Reject a manifest that
+         * claims a different id, matching Schwung catalog discovery rules. */
+        char manifest_id[MARK_FX_ID_MAX] = {0};
+        if (manifest_string(js, "id", manifest_id, sizeof(manifest_id)) != 0 ||
+            strcmp(manifest_id, de->d_name) != 0) {
+            free(js);
+            continue;
+        }
+        mk_fx_catalog_t *e = &m->fx_catalog[m->fx_catalog_count++];
+        snprintf(e->id, sizeof(e->id), "%s", de->d_name);
+        if (manifest_string(js, "name", e->name, sizeof(e->name)) != 0)
+            snprintf(e->name, sizeof(e->name), "%s", de->d_name);
+        for (char *p = e->name; *p; p++)
+            if (*p == '"' || *p == '\\' || *p == ',' || *p == '|' ||
+                (unsigned char)*p < 32) *p = ' ';
+        free(js);
+    }
+    closedir(d);
+    qsort(m->fx_catalog, (size_t)m->fx_catalog_count,
+          sizeof(m->fx_catalog[0]), fx_catalog_cmp);
+}
+#else
+/* No dlopen and no dirent: nothing to scan, so the catalog stays empty
+ * and every t*_fx_module request is refused by fx_catalog_find(). */
+static void fx_catalog_scan(mark_t *m) { (void)m; }
+#endif
+
+static void ext_fx_destroy(mk_ext_fx_t *fx) {
+    if (!fx) return;
+    if (fx->api && fx->instance && fx->api->destroy_instance)
+        fx->api->destroy_instance(fx->instance);
+#if MARK_HOSTED_FX
+    if (fx->handle) dlclose(fx->handle);
+#endif
+    free(fx->hierarchy);
+    free(fx);
+}
+
+#if MARK_HOSTED_FX
+static mk_ext_fx_t *ext_fx_load(mark_t *m, const char *id, const char *state) {
+    int ci = fx_catalog_find(m, id);
+    if (ci < 0) return NULL;
+    char so_path[760], fx_dir[700], json_path[760];
+    snprintf(fx_dir, sizeof(fx_dir), "%s/%s", m->audio_fx_dir, id);
+    snprintf(so_path, sizeof(so_path), "%s/%s.so", fx_dir, id);
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return NULL;
+    audio_fx_init_v2_fn init = (audio_fx_init_v2_fn)dlsym(
+        handle, AUDIO_FX_INIT_V2_SYMBOL);
+    if (!init) { dlclose(handle); return NULL; }
+    audio_fx_api_v2_t *api = init(m->host);
+    if (!api || api->api_version != AUDIO_FX_API_VERSION_2 ||
+        !api->create_instance || !api->destroy_instance || !api->process_block) {
+        dlclose(handle);
+        return NULL;
+    }
+    void *instance = api->create_instance(fx_dir, NULL);
+    if (!instance) { dlclose(handle); return NULL; }
+    if (state && state[0] && api->set_param)
+        api->set_param(instance, "state", state);
+
+    mk_ext_fx_t *fx = calloc(1, sizeof(*fx));
+    if (!fx) { api->destroy_instance(instance); dlclose(handle); return NULL; }
+    fx->handle = handle;
+    fx->api = api;
+    fx->instance = instance;
+    snprintf(fx->id, sizeof(fx->id), "%s", id);
+    snprintf(fx->name, sizeof(fx->name), "%s", m->fx_catalog[ci].name);
+    snprintf(json_path, sizeof(json_path), "%s/module.json", fx_dir);
+    char *js = read_text_file(json_path, 262144);
+    if (js) { fx->hierarchy = manifest_hierarchy(js); free(js); }
+    return fx;
+}
+#endif
+
+static void fx_reader_enter(mark_t *m) {
+    atomic_fetch_add_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_reader_leave(mark_t *m) {
+    atomic_fetch_sub_explicit(&m->fx_readers, 1, memory_order_seq_cst);
+}
+
+static void fx_wait_for_readers(mark_t *m) {
+    while (atomic_load_explicit(&m->fx_readers, memory_order_seq_cst) != 0)
+        usleep(100);
+}
+
+static int fx_enqueue(mark_t *m, int track, const char *id) {
+    uint32_t head = atomic_load_explicit(&m->fx_req_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&m->fx_req_tail, memory_order_acquire);
+    if (head - tail >= MARK_FX_REQUESTS) return -1;
+    mk_fx_request_t *r = &m->fx_requests[head % MARK_FX_REQUESTS];
+    r->track = track;
+    snprintf(r->id, sizeof(r->id), "%s", id ? id : "");
+    atomic_store_explicit(&m->fx_req_head, head + 1, memory_order_release);
+    return 0;
+}
+
+#if MARK_HOSTED_FX
+static mk_fx_result_t *fx_load_result(mark_t *m, int track, const char *id,
+                                      const char *state, int set_desired) {
+    mk_fx_result_t *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->track = track;
+    r->set_desired = set_desired;
+    snprintf(r->id, sizeof(r->id), "%s", id ? id : "");
+    if (!id || !id[0]) {
+        r->status = 0;
+    } else {
+        r->next = ext_fx_load(m, id, state);
+        r->status = r->next ? 2 : -1;
+    }
+    return r;
+}
+#endif
+
+#if MARK_HOSTED_FX
+static void fx_publish(mark_t *m, mk_fx_result_t *r) {
+    int ti = r->track;
+    while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire) &&
+           (atomic_load_explicit(&m->fx_pending[ti], memory_order_acquire) ||
+            atomic_load_explicit(&m->fx_done[ti], memory_order_acquire)))
+        usleep(1000);
+    if (atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
+        ext_fx_destroy(r->next);
+        free(r);
+        return;
+    }
+    atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
+}
+#endif
+
+#if MARK_HOSTED_FX
+static void *fx_worker(void *arg) {
+    mark_t *m = (mark_t *)arg;
+    /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
+     * inherit realtime scheduling and contend with the SPI callback. */
+    struct sched_param normal = {0};
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire)) {
+        int did_work = 0;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_fx_result_t *done = atomic_exchange_explicit(
+                &m->fx_done[i], NULL, memory_order_acq_rel);
+            if (done) {
+                /* A control/MIDI callback may have loaded the old active
+                 * pointer immediately before the audio-thread swap. Wait
+                 * until every such callback has returned before destroy or
+                 * dlclose makes its instance/API pointers invalid. */
+                if (done->retired) fx_wait_for_readers(m);
+                ext_fx_destroy(done->retired);
+                /* done->next is now owned by fx_active on a successful load. */
+                free(done);
+                did_work = 1;
+            }
+            if (atomic_exchange_explicit(&m->session_fx_ready[i], 0,
+                                         memory_order_acq_rel)) {
+                mk_fx_result_t *r = fx_load_result(m, i, m->session_fx_id[i],
+                                                   m->session_fx_state[i], 1);
+                if (r) fx_publish(m, r);
+                did_work = 1;
+            }
+        }
+
+        uint32_t tail = atomic_load_explicit(&m->fx_req_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&m->fx_req_head, memory_order_acquire);
+        if (tail != head) {
+            mk_fx_request_t req = m->fx_requests[tail % MARK_FX_REQUESTS];
+            atomic_store_explicit(&m->fx_req_tail, tail + 1, memory_order_release);
+            mk_fx_result_t *r = fx_load_result(m, req.track, req.id, NULL, 0);
+            if (r) fx_publish(m, r);
+            did_work = 1;
+        }
+        if (!did_work) usleep(10000);
+    }
+    return NULL;
+}
+#else
+/* no loader thread without hosted FX */
+#endif
+
+/* Audio-thread block boundary: install completed instances and hand the old
+ * one back to the loader for destruction. */
+static void fx_apply_pending(mark_t *m) {
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_fx_result_t *r = atomic_exchange_explicit(
+            &m->fx_pending[i], NULL, memory_order_acq_rel);
+        if (!r) continue;
+        mk_track_t *t = &m->t[i];
+        if (r->set_desired)
+            snprintf(t->fx_module, sizeof(t->fx_module), "%s", r->id);
+        if (r->status >= 0) {
+            r->retired = atomic_exchange_explicit(
+                &m->fx_active[i], r->next, memory_order_acq_rel);
+            if (r->status == 2)
+                snprintf(t->fx_active, sizeof(t->fx_active), "%s", r->id);
+            else
+                t->fx_active[0] = '\0';
+        }
+        t->fx_status = r->status;
+        m->edit_rev++;
+        atomic_store_explicit(&m->fx_done[i], r, memory_order_release);
+    }
+}
+
+static void request_fx_module(mark_t *m, int track, const char *id) {
+    mk_track_t *t = &m->t[track];
+    if (id && id[0] && (!valid_fx_id(id) || fx_catalog_find(m, id) < 0)) {
+        t->fx_status = -1;
+        m->edit_rev++;
+        return;
+    }
+    if (!id) id = "";
+    if (!strcmp(t->fx_module, id) && t->fx_status >= 0) return;
+    snprintf(t->fx_module, sizeof(t->fx_module), "%s", id);
+    mk_ext_fx_t *active = atomic_load_explicit(&m->fx_active[track],
+                                                memory_order_acquire);
+    if (!id[0] && !active) {
+        t->fx_status = 0;
+        t->fx_active[0] = '\0';
+    } else {
+        t->fx_status = 1;
+        if (fx_enqueue(m, track, id) != 0) t->fx_status = -1;
+    }
+    m->edit_rev++;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Create / destroy                                                   */
+/* ------------------------------------------------------------------ */
+
+mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
+    mark_t *m = calloc(1, sizeof(mark_t));
+    if (!m) return NULL;
+
+    for (int step = 0; step < ALLOC_STEPS; step++) {
+        uint32_t frames = (uint32_t)alloc_seconds[step] * MARK_SR;
+        int16_t *bufs[MARK_TRACKS + 1];
+        int ok = 1;
+        for (int i = 0; i <= MARK_TRACKS; i++) {
+            bufs[i] = calloc((size_t)frames * MARK_CH, sizeof(int16_t));
+            if (!bufs[i]) {
+                for (int j = 0; j < i; j++) free(bufs[j]);
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            m->track_frames = frames;
+            for (int i = 0; i < MARK_TRACKS; i++) m->t[i].buf = bufs[i];
+            m->undo_buf = bufs[MARK_TRACKS];
+            break;
+        }
+    }
+    if (!m->track_frames) { free(m); return NULL; }
+
+    m->frames_per_tick = 918.75;   /* 120 BPM */
+    m->undo_track = -1;
+    m->swap_track = -1;
+    m->quantize = 1;
+    m->master = 100;
+    m->master_g = 1.0f;
+    m->monitor = 1;
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        m->t[i].level = 100;
+        m->t[i].pan = 50;
+        m->t[i].g_cur = 1.0f;
+        m->t[i].fx = TFX_LPF;      /* a sensible default once switched on */
+        m->t[i].fxp = 50;
+        m->t[i].fx_dirty = 1;
+        m->t[i].dly = calloc((size_t)MARK_DLY_LEN * 2, sizeof(float));
+        update_track_gains(&m->t[i]);
+        if (!m->t[i].dly) {
+            for (int j = 0; j <= i; j++) free(m->t[j].dly);
+            for (int j = 0; j < MARK_TRACKS; j++) free(m->t[j].buf);
+            free(m->undo_buf);
+            free(m);
+            return NULL;
+        }
+    }
+    m->host = host;
+    if (module_dir && module_dir[0]) {
+        snprintf(m->module_dir, sizeof(m->module_dir), "%s", module_dir);
+        snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
+                 module_dir);
+        fx_catalog_scan(m);
+#if MARK_HOSTED_FX
+        if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
+            m->fx_thread_valid = 1;
+#endif
+    }
+    return m;
+}
+
+mark_t *mark_create(const host_api_v1_t *host) {
+    return mark_create_in_dir(host, NULL);
+}
+
+void mark_destroy(mark_t *m) {
+    if (!m) return;
+    /* The worker owns this instance until it returns. Joining makes destroy
+     * safe even when slow storage takes longer than an arbitrary timeout. */
+#if MARK_NEEDS_THREADS
+    if (m->io_thread_valid) pthread_join(m->io_thread, NULL);
+    if (m->fx_thread_valid) {
+        atomic_store_explicit(&m->fx_thread_stop, 1, memory_order_release);
+        pthread_join(m->fx_thread, NULL);
+    }
+#endif
+    fx_wait_for_readers(m);
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_fx_result_t *pending = atomic_exchange(&m->fx_pending[i], NULL);
+        if (pending) {
+            ext_fx_destroy(pending->next);
+            ext_fx_destroy(pending->retired);
+            free(pending);
+        }
+        mk_fx_result_t *done = atomic_exchange(&m->fx_done[i], NULL);
+        if (done) { ext_fx_destroy(done->retired); free(done); }
+        ext_fx_destroy(atomic_exchange(&m->fx_active[i], NULL));
+    }
+    for (int i = 0; i < MARK_TRACKS; i++) { free(m->t[i].buf); free(m->t[i].dly); }
+    free(m->undo_buf);
+    free(m);
+}
+
+/* ------------------------------------------------------------------ */
+/*  MIDI (clock + transport)                                           */
+/* ------------------------------------------------------------------ */
+
+/* --- MIDI CC control ----------------------------------------------- */
+/* External controllers (USB-A) drive the performance surface, column per
+ * track (Launch Control style). Routed through mark_set_param so CC edits
+ * share every rule with the UI (trig_active, io_busy, edit_rev, RC dub
+ * constraints). See README for the user-facing table.
+ *   20-24 t level   25 master     30-34 t pan    40-44 t fxp
+ *   50-54 t btn     55 all_btn    60-64 t stop   65 undo   70-74 t clear
+ *   80-84 t rev     85-89 t shot  90-94 t fx_on
+ *   102 quantize  103 dub_mode  104 play_mode  105 follow  106 monitor
+ * Continuous 0-127 scales into the param range; buttons act at value>=64
+ * (triggers fire on press, release is a no-op; toggles follow the value). */
+static void cc_track(mark_t *m, int ti, const char *k, const char *val) {
+    char key[16];
+    snprintf(key, sizeof key, "t%d_%s", ti + 1, k);
+    mark_set_param(m, key, val);
+}
+
+static void mark_handle_cc(mark_t *m, int cc, int v) {
+    char val[8];
+    int on = v >= 64;
+    if (cc >= 20 && cc <= 24) {
+        snprintf(val, sizeof val, "%d", (v * 200 + 63) / 127);
+        cc_track(m, cc - 20, "level", val);
+    } else if (cc == 25) {
+        snprintf(val, sizeof val, "%d", (v * 200 + 63) / 127);
+        mark_set_param(m, "master", val);
+    } else if (cc >= 30 && cc <= 34) {
+        snprintf(val, sizeof val, "%d", (v * 100 + 63) / 127);
+        cc_track(m, cc - 30, "pan", val);
+    } else if (cc >= 40 && cc <= 44) {
+        snprintf(val, sizeof val, "%d", (v * 100 + 63) / 127);
+        cc_track(m, cc - 40, "fxp", val);
+    } else if (cc >= 50 && cc <= 54) {
+        if (on) cc_track(m, cc - 50, "btn", "1");
+    } else if (cc == 55) {
+        if (on) mark_set_param(m, "all_btn", "1");
+    } else if (cc >= 60 && cc <= 64) {
+        if (on) cc_track(m, cc - 60, "stop", "1");
+    } else if (cc == 65) {
+        if (on) mark_set_param(m, "undo", "1");
+    } else if (cc >= 70 && cc <= 74) {
+        if (on) cc_track(m, cc - 70, "clear", "1");
+    } else if (cc >= 80 && cc <= 84) {
+        cc_track(m, cc - 80, "rev", on ? "1" : "0");
+    } else if (cc >= 85 && cc <= 89) {
+        cc_track(m, cc - 85, "shot", on ? "1" : "0");
+    } else if (cc >= 90 && cc <= 94) {
+        cc_track(m, cc - 90, "fx_on", on ? "1" : "0");
+    } else if (cc == 102) {
+        mark_set_param(m, "quantize", on ? "1" : "0");
+    } else if (cc == 103) {
+        mark_set_param(m, "dub_mode", on ? "1" : "0");
+    } else if (cc == 104) {
+        mark_set_param(m, "play_mode", on ? "1" : "0");
+    } else if (cc == 105) {
+        mark_set_param(m, "follow", on ? "1" : "0");
+    } else if (cc == 106) {
+        mark_set_param(m, "monitor", on ? "1" : "0");
+    }
+}
+
+void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
+    if (!m || len < 1) return;
+    switch (msg[0]) {
+    case 0xFA: /* start */
+    case 0xFB: /* continue: treated as downbeat too (pushnpull convention) */
+        m->tick_total = 0;
+        m->clock_running = 1;
+        m->measure_flag = 1;
+        if (m->transport_paused) {   /* resume every loop from its top */
+            m->transport_paused = 0;
+            for (int i = 0; i < MARK_TRACKS; i++)
+                if (m->t[i].st == MK_PLAY || m->t[i].st == MK_DUB)
+                    m->t[i].pos = 0.0;
+        }
+        break;
+    case 0xFC:
+        m->clock_running = 0;
+        if (m->follow && base_playing(m)) m->transport_paused = 1;
+        break;
+    case 0xF8:
+        if (m->clock_seen && m->global_frames > m->last_tick_global) {
+            double d = (double)(m->global_frames - m->last_tick_global);
+            if (d > 100.0 && d < 20000.0)
+                m->frames_per_tick = 0.9 * m->frames_per_tick + 0.1 * d;
+        }
+        m->last_tick_global = m->global_frames;
+        m->clock_seen = 1;
+        m->tick_total++;
+        if (m->tick_total % 96 == 0) m->measure_flag = 1;
+        break;
+    default: break;
+    }
+    /* External CC control. Internal MIDI (Move's own encoders/buttons)
+     * never acts as CC; a channel-matched chain slot can deliver one
+     * external CC twice (channel dispatch + FX broadcast), so identical
+     * messages within ~2 blocks are dropped. */
+    if (len >= 3 && (msg[0] & 0xF0) == 0xB0 &&
+        (source == MOVE_MIDI_SOURCE_EXTERNAL ||
+         source == MOVE_MIDI_SOURCE_FX_BROADCAST)) {
+        if (!(msg[0] == m->cc_last[0] && msg[1] == m->cc_last[1] &&
+              msg[2] == m->cc_last[2] &&
+              m->global_frames - m->cc_last_frames <= 256)) {
+            m->cc_last[0] = msg[0];
+            m->cc_last[1] = msg[1];
+            m->cc_last[2] = msg[2];
+            m->cc_last_frames = m->global_frames;
+            mark_handle_cc(m, msg[1], msg[2]);
+        }
+    }
+    /* Hosted effects receive the same clock/transport stream a normal
+     * Schwung Chain slot would. UI performance messages can also reach
+     * effects that opt into on_midi. */
+    fx_reader_enter(m);
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[i],
+                                                memory_order_acquire);
+        if (fx && fx->api && fx->api->on_midi)
+            fx->api->on_midi(fx->instance, msg, len, source);
+    }
+    fx_reader_leave(m);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Track actions                                                      */
+/* ------------------------------------------------------------------ */
+
+static void reset_undo(mark_t *m) {
+    m->undo_track = -1;
+    m->undo_capturing = 0;
+    m->undo_redo = 0;
+    m->undo_count = 0;
+    if (m->swap_track >= 0) m->swap_track = -1;
+}
+
+/* Undo capture belongs to the most recently started dub gesture. Stopping
+ * some other track must not silently truncate that owner's undo region. */
+static void end_dub_capture(mark_t *m, int ti) {
+    if (m->undo_track == ti) m->undo_capturing = 0;
+}
+
+static void begin_dub_gesture(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    m->undo_track = ti;
+    m->undo_kind = 0;
+    m->undo_redo = 0;
+    m->undo_capturing = 1;
+    m->undo_start = (uint32_t)t->pos;
+    m->undo_count = 0;
+    m->swap_track = -1;
+}
+
+/* SINGLE play mode: when a track starts playing, every other playing
+ * track stops — the RC's PLAY MODE SINGLE, i.e. song sections A-E. */
+static void solo_stop_others(mark_t *m, int ti) {
+    if (!m->play_mode) return;
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        if (i == ti) continue;
+        mk_track_t *o = &m->t[i];
+        if (o->st == MK_PLAY || o->st == MK_DUB) {
+            if (o->st == MK_DUB) end_dub_capture(m, i);
+            o->st = MK_STOP;
+            o->pos = 0.0;
+        }
+    }
+}
+
+static void apply_start_record(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    t->st = MK_REC;
+    t->rec_len = 0;
+    t->rec_target = 0;
+    t->rec_end = MK_PLAY;
+    t->pending = 0;
+    m->edit_rev++;
+}
+
+static void apply_start_play(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    solo_stop_others(m, ti);
+    t->st = MK_PLAY;
+    t->pos = 0.0;
+    t->pending = 0;
+    m->edit_rev++;
+}
+
+static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state) {
+    mk_track_t *t = &m->t[ti];
+    t->len = final_len;
+    t->rec_target = 0;
+    if (final_len == 0) {
+        t->st = MK_EMPTY;
+        return;
+    }
+    t->full_len = final_len;
+    /* first finalized loop anchors the session grid for free-run sync.
+     * Derive the MEASURE from the rounding unit actually used, so a
+     * 15/16 polymetric first loop still anchors a true measure grid. */
+    if (m->grid_unit <= 0.0) {
+        double u = frames_per_measure(m) / (double)grid_div(m);
+        double k = floor(((double)final_len / u) + 0.5);
+        if (k < 1.0) k = 1.0;
+        m->grid_unit = ((double)final_len / k) * (double)grid_div(m);
+    }
+    /* undo of a first recording = clear it (redo restores) */
+    m->undo_track = ti;
+    m->undo_kind = 1;
+    m->undo_redo = 0;
+    m->undo_capturing = 0;
+    m->undo_saved_len = final_len;
+    m->swap_track = -1;
+
+    t->pos = 0.0;
+    t->st = end_state;
+    if (end_state == MK_DUB) {
+        if (t->rev) t->st = MK_PLAY;    /* no overdub on reversed tracks */
+        else begin_dub_gesture(m, ti);
+    }
+    if (t->st == MK_PLAY || t->st == MK_DUB) solo_stop_others(m, ti);
+    m->edit_rev++;
+}
+
+/* Button-stop of an in-progress recording: quantize the length. If the
+ * grid-rounded target is longer than what's recorded, keep recording
+ * until the target (the RC records to the end of the measure); shorter
+ * targets truncate immediately. */
+static void request_finish(mark_t *m, int ti, int end_state) {
+    mk_track_t *t = &m->t[ti];
+    uint32_t target = t->rec_len;
+    if (m->quantize) {
+        double g = live_unit(m);
+        if (g >= 32.0) {
+            double k = floor(((double)t->rec_len / g) + 0.5);
+            if (k < 1.0) k = 1.0;
+            double f = k * g;
+            while (f > (double)m->track_frames && k > 1.0) { k -= 1.0; f = k * g; }
+            target = (uint32_t)(f + 0.5);   /* round: units can be x.5 frames */
+        }
+    }
+    if (target > m->track_frames) target = m->track_frames;
+    if (target == 0) {   /* stopped instantly: nothing worth keeping */
+        t->st = MK_EMPTY;
+        t->rec_len = 0;
+        return;
+    }
+    if (target <= t->rec_len) {
+        finalize_record(m, ti, target, end_state);
+    } else {
+        t->rec_target = target;
+        t->rec_end = end_state;
+    }
+}
+
+/* Schedule (or immediately apply) a quantized action. Immediate when
+ * quantize is off, or when nothing is playing and the clock is stopped —
+ * the RC's rule: quantize corrects timing only against a running rhythm,
+ * a synced track, or MIDI sync. */
+static void schedule(mark_t *m, int ti, int action /* 1 rec, 2 play */) {
+    int quantized = m->quantize && (base_playing(m) != NULL || m->clock_running);
+    if (!quantized) {
+        if (action == 1) apply_start_record(m, ti);
+        else apply_start_play(m, ti);
+    } else {
+        m->t[ti].pending = action;
+    }
+}
+
+/* The RC's [>/o] button cycle for one track. */
+static void track_button(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    if (m->swap_track == ti || m->io_busy) return;   /* swap or file I/O */
+    if (t->pending) { t->pending = 0; m->edit_rev++; return; }
+    switch (t->st) {
+    case MK_EMPTY:
+        schedule(m, ti, 1);
+        break;
+    case MK_REC:
+        request_finish(m, ti, m->rec_action ? MK_DUB : MK_PLAY);
+        break;
+    case MK_PLAY:
+        if (t->rev) break;                    /* no overdub on reversed tracks */
+        t->st = MK_DUB;
+        begin_dub_gesture(m, ti);
+        m->edit_rev++;
+        break;
+    case MK_DUB:
+        t->st = MK_PLAY;
+        end_dub_capture(m, ti);
+        m->edit_rev++;
+        break;
+    case MK_STOP:
+        schedule(m, ti, 2);
+        break;
+    default: break;
+    }
+}
+
+static void track_stop(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    if (m->swap_track == ti || m->io_busy) return;
+    if (t->pending) { t->pending = 0; m->edit_rev++; return; }
+    switch (t->st) {
+    case MK_REC:
+        request_finish(m, ti, MK_STOP);
+        break;
+    case MK_PLAY:
+    case MK_DUB:
+        if (t->st == MK_DUB) end_dub_capture(m, ti);
+        t->st = MK_STOP;
+        t->pos = 0.0;
+        m->edit_rev++;
+        break;
+    default: break;
+    }
+}
+
+/* Post-record loop trim ("effectively shortening the loop"): grow or
+ * shrink len by one rec_grid unit, locked to the session grid. Trims
+ * never exceed the finalized length; re-lengthening restores audio. */
+static void track_trim(mark_t *m, int ti, int delta) {
+    mk_track_t *t = &m->t[ti];
+    if (m->io_busy || m->swap_track == ti) return;
+    if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
+    double u = locked_unit(m);
+    if (u < 32.0) return;
+    int cur = (int)floor((double)t->len / u + 0.5);
+    int full = (int)floor((double)t->full_len / u + 0.5);
+    if (cur < 1) cur = 1;
+    if (full < 1) full = 1;
+    int nu = clampi(cur + delta, 1, full);
+    if (nu == cur) return;
+    uint32_t nl = (uint32_t)((double)nu * u + 0.5);
+    if (nl > t->full_len) nl = t->full_len;
+    if (nl < 64) nl = 64;
+    if (t->st == MK_DUB) {   /* dub write head would cross the new edge */
+        t->st = MK_PLAY;
+        end_dub_capture(m, ti);
+    }
+    if (m->undo_track == ti) reset_undo(m);   /* indexes tied to old len */
+    t->len = nl;
+    if (t->pos >= (double)nl) t->pos = fmod(t->pos, (double)nl);
+    m->edit_rev++;
+}
+
+/* Absolute length set in SIXTEENTHS of a measure — the step buttons'
+ * unit (step 5 = a 5/16 loop), independent of rec_grid. */
+static void track_setlen16(mark_t *m, int ti, int n16) {
+    mk_track_t *t = &m->t[ti];
+    if (m->io_busy || m->swap_track == ti) return;
+    if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
+    if (n16 < 1 || n16 > 16) return;
+    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+    double u = g / 16.0;
+    if (u < 32.0) return;
+    uint32_t nl = (uint32_t)((double)n16 * u + 0.5);
+    if (nl > t->full_len) nl = t->full_len;
+    if (nl < 64) nl = 64;
+    if (nl == t->len) return;
+    if (t->st == MK_DUB) {
+        t->st = MK_PLAY;
+        end_dub_capture(m, ti);
+    }
+    if (m->undo_track == ti) reset_undo(m);
+    t->len = nl;
+    if (t->pos >= (double)nl) t->pos = fmod(t->pos, (double)nl);
+    m->edit_rev++;
+}
+
+static void track_clear(mark_t *m, int ti) {
+    mk_track_t *t = &m->t[ti];
+    if (m->io_busy) return;
+    if (m->swap_track == ti) m->swap_track = -1;
+    t->st = MK_EMPTY;
+    t->len = 0;
+    t->full_len = 0;
+    t->rec_len = 0;
+    t->rec_target = 0;
+    t->pending = 0;
+    t->pos = 0.0;
+    track_fx_reset(t);
+    if (m->undo_track == ti) reset_undo(m);
+    if (!any_content(m)) {
+        m->grid_unit = 0.0;
+        m->transport_paused = 0;
+    }
+    m->edit_rev++;
+}
+
+/* One button: if anything plays, stop everything (and cancel pendings);
+ * otherwise start every non-empty track together from the top — or just
+ * the first one in SINGLE mode. */
+static void all_button(mark_t *m) {
+    if (m->io_busy) return;
+    if (base_playing(m)) {
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+            t->pending = 0;
+            if (t->st == MK_REC) request_finish(m, i, MK_STOP);
+            else if (t->st == MK_PLAY || t->st == MK_DUB) {
+                if (t->st == MK_DUB) end_dub_capture(m, i);
+                t->st = MK_STOP;
+                t->pos = 0.0;
+            }
+        }
+        m->edit_rev++;
+    } else {
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            if (m->t[i].len > 0 && m->t[i].st == MK_STOP) {
+                apply_start_play(m, i);
+                if (m->play_mode) break;      /* single: sections are exclusive */
+            }
+        }
+    }
+}
+
+static void undo_press(mark_t *m) {
+    if (m->undo_track < 0 || m->swap_track >= 0 || m->io_busy) return;
+    mk_track_t *t = &m->t[m->undo_track];
+    if (m->undo_kind == 1) {
+        if (!m->undo_redo) {          /* undo the first recording: clear */
+            m->undo_saved_len = t->len;
+            t->len = 0;
+            t->st = MK_EMPTY;
+            t->pos = 0.0;
+            m->undo_redo = 1;
+            m->edit_rev++;
+            if (!any_content(m)) m->grid_unit = 0.0;
+        } else {                      /* redo: bring it back, stopped */
+            t->len = m->undo_saved_len;
+            t->st = MK_STOP;
+            t->pos = 0.0;
+            m->undo_redo = 0;
+            m->edit_rev++;
+            if (m->grid_unit <= 0.0 && t->len) {
+                double g = frames_per_measure(m);
+                double k = floor(((double)t->len / g) + 0.5);
+                if (k < 1.0) k = 1.0;
+                m->grid_unit = (double)t->len / k;
+            }
+        }
+        return;
+    }
+    /* kind 0: overdub — swap the captured region back in, incrementally.
+     * Ignored while the same track is still overdubbing (leave dub first). */
+    if (t->st == MK_DUB || t->len == 0 || m->undo_count == 0) return;
+    m->undo_capturing = 0;
+    m->swap_track = m->undo_track;
+    m->swap_pos = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Rendering                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Incremental undo swap: exchange track audio with the undo buffer over
+ * the captured region, a bounded slice per block. The track is skipped
+ * (muted) while the job runs; on completion undo becomes redo. */
+static void swap_step(mark_t *m) {
+    if (m->swap_track < 0) return;
+    mk_track_t *t = &m->t[m->swap_track];
+    uint32_t n = SWAP_FRAMES_PER_BLOCK;
+    if (m->swap_pos + n > m->undo_count) n = m->undo_count - m->swap_pos;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t idx = (m->undo_start + m->swap_pos + k) % t->len;
+        tbuf_swap(t->buf, idx, m->undo_buf, idx);
+    }
+    m->swap_pos += n;
+    if (m->swap_pos >= m->undo_count) {
+        m->swap_track = -1;
+        m->undo_redo = !m->undo_redo;
+        m->edit_rev++;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sessions (save/load loop audio + settings, worker thread)          */
+/* ------------------------------------------------------------------ */
+
+#if MARK_SESSIONS
+static int wav_write(const char *path, const int16_t *data, uint32_t frames) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t data_bytes = frames * (uint32_t)MARK_BPF;
+    uint32_t riff = 36 + data_bytes;
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4);
+    memcpy(h + 4, &riff, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    uint32_t fmt_len = 16;   memcpy(h + 16, &fmt_len, 4);
+    uint16_t pcm = 1;        memcpy(h + 20, &pcm, 2);
+    uint16_t ch = MARK_CH;   memcpy(h + 22, &ch, 2);
+    uint32_t sr = MARK_SR;   memcpy(h + 24, &sr, 4);
+    uint32_t br = MARK_SR * (uint32_t)MARK_BPF; memcpy(h + 28, &br, 4);
+    uint16_t ba = MARK_BPF;  memcpy(h + 32, &ba, 2);
+    uint16_t bits = 16;      memcpy(h + 34, &bits, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &data_bytes, 4);
+    int ok = fwrite(h, 1, 44, f) == 44 &&
+             fwrite(data, (size_t)MARK_BPF, frames, f) == frames;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+/* Minimal reader for the files wav_write produces (44.1k/16-bit/stereo);
+ * walks chunks to find "data". Returns frames read or -1. */
+static long wav_read(const char *path, int16_t *data, uint32_t max_frames) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
+        fclose(f);
+        return -1;
+    }
+    long frames = -1;
+    uint8_t ch[8];
+    while (fread(ch, 1, 8, f) == 8) {
+        uint32_t sz;
+        memcpy(&sz, ch + 4, 4);
+        if (!memcmp(ch, "data", 4)) {
+            uint32_t want = sz / (uint32_t)MARK_BPF;
+            if (want > max_frames) want = max_frames;
+            frames = (long)fread(data, (size_t)MARK_BPF, want, f);
+            break;
+        }
+        if (fseek(f, (long)((sz + 1) & ~1u), SEEK_CUR) != 0) break;
+    }
+    fclose(f);
+    return frames;
+}
+
+/* Validate the complete file before a load is allowed to detach the live
+ * performance. In addition to the RIFF tags, verify the PCM format and that
+ * the declared data chunk is actually present on disk. */
+static int wav_probe(const char *path, uint32_t *frames_out) {
+    FILE *f = fopen(path, "rb");
+    struct stat st;
+    if (!f || stat(path, &st) != 0) { if (f) fclose(f); return -1; }
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) ||
+        memcmp(h + 8, "WAVE", 4)) {
+        fclose(f);
+        return -1;
+    }
+    int fmt_ok = 0, data_ok = 0;
+    uint32_t data_frames = 0;
+    uint8_t chdr[8];
+    while (fread(chdr, 1, 8, f) == 8) {
+        uint32_t sz;
+        memcpy(&sz, chdr + 4, 4);
+        long payload = ftell(f);
+        if (payload < 0 || (uint64_t)payload + sz > (uint64_t)st.st_size) break;
+        if (!memcmp(chdr, "fmt ", 4)) {
+            uint8_t fmt[16];
+            if (sz < sizeof(fmt) || fread(fmt, 1, sizeof(fmt), f) != sizeof(fmt)) break;
+            uint16_t pcm, channels, align, bits;
+            uint32_t sr;
+            memcpy(&pcm, fmt, 2); memcpy(&channels, fmt + 2, 2);
+            memcpy(&sr, fmt + 4, 4); memcpy(&align, fmt + 12, 2);
+            memcpy(&bits, fmt + 14, 2);
+            fmt_ok = pcm == 1 && channels == MARK_CH && sr == MARK_SR &&
+                     align == MARK_BPF && bits == 16;
+        } else if (!memcmp(chdr, "data", 4)) {
+            if ((sz % (uint32_t)MARK_BPF) != 0) break;
+            data_frames = sz / (uint32_t)MARK_BPF;
+            data_ok = 1;
+        }
+        long next = payload + (long)((sz + 1u) & ~1u);
+        if (fseek(f, next, SEEK_SET) != 0) break;
+    }
+    fclose(f);
+    if (!fmt_ok || !data_ok) return -1;
+    *frames_out = data_frames;
+    return 0;
+}
+
+typedef struct {
+    mark_t *m;
+    int slot;
+    int op;                              /* 1 save, 2 load */
+    char fx_id[MARK_TRACKS][MARK_FX_ID_MAX];
+    char fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
+} mk_job_t;
+
+#endif
+#if MARK_SESSIONS
+static void session_path(const mark_t *m, int slot, const char *file,
+                         char *buf, size_t len) {
+    snprintf(buf, len, "%s/slot%02d%s%s", m->session_dir, slot,
+             file ? "/" : "", file ? file : "");
+}
+#endif
+
+#if MARK_SESSIONS
+static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
+    char path[320];
+    session_path(m, slot, "session.json", path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(js, 1, cap - 1, f);
+    int bad = ferror(f) || (n == cap - 1 && !feof(f));
+    fclose(f);
+    js[n] = 0;
+    if (bad || !strstr(js, "\"v\":") || !strchr(js, '}')) return -1;
+    return 0;
+}
+
+/* Header-only preflight runs before live tracks are cleared. Missing,
+ * truncated, or incompatible session files therefore leave the current
+ * loops and mixer settings untouched. */
+static int session_preflight(const mark_t *m, int slot) {
+    char js[65536], path[320];
+    if (session_read_json(m, slot, js, sizeof(js)) != 0) return -1;
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        char k[8], wname[16];
+        snprintf(k, sizeof(k), "l%d", i + 1);
+        long lval = json_int(js, k, 0);
+        snprintf(k, sizeof(k), "F%d", i + 1);
+        long want = lval > 0 ? json_int(js, k, (int)lval) : 0;
+        if (lval < 0 || want < lval || want > (long)m->track_frames) return -1;
+        if (want == 0) continue;
+        snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+        session_path(m, slot, wname, path, sizeof(path));
+        uint32_t have = 0;
+        if (wav_probe(path, &have) != 0 || have < (uint32_t)want) return -1;
+    }
+    return 0;
+}
+
+static void *io_worker(void *arg) {
+    mk_job_t *job = (mk_job_t *)arg;
+    mark_t *m = job->m;
+    struct sched_param normal = {0};
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    char path[320];
+    int err = 0;
+
+    if (job->op == 1) {   /* ---- save ---- */
+        mkdir(m->session_dir, 0755);
+        session_path(m, job->slot, NULL, path, sizeof(path));
+        mkdir(path, 0755);
+        /* Stage every payload first. session.json is renamed last, so a
+         * failed write never advertises an incomplete new session. */
+        for (int i = 0; i < MARK_TRACKS && !err; i++) {
+            char wname[20];
+            snprintf(wname, sizeof(wname), "t%d.wav.tmp", i + 1);
+            session_path(m, job->slot, wname, path, sizeof(path));
+            if (m->t[i].len > 0) {
+                uint32_t wf = m->t[i].full_len > m->t[i].len
+                                ? m->t[i].full_len : m->t[i].len;
+                if (wav_write(path, m->t[i].buf, wf) != 0) err = 1;
+            } else {
+                unlink(path);
+            }
+        }
+        session_path(m, job->slot, "session.json.tmp", path, sizeof(path));
+        FILE *f = err ? NULL : fopen(path, "w");
+        if (!f) {
+            err = 1;
+        } else {
+            fprintf(f, "{\"v\":1,\"gu\":%ld,\"q\":%d,\"gd\":%d,\"ra\":%d,"
+                       "\"dm\":%d,\"pm\":%d,\"mst\":%d,\"flw\":%d",
+                    (long)(m->grid_unit + 0.5), m->quantize, m->rec_grid,
+                    m->rec_action, m->dub_mode, m->play_mode, m->master,
+                    m->follow);
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                const mk_track_t *t = &m->t[i];
+                uint32_t full = t->len > 0
+                    ? (t->full_len > t->len ? t->full_len : t->len) : 0;
+                fprintf(f, ",\"l%d\":%u,\"F%d\":%u,\"v%d\":%d,\"p%d\":%d,"
+                           "\"r%d\":%d,\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,"
+                           "\"g%d\":%d,\"x%d\":\"%s\"",
+                        i + 1, t->len, i + 1, full, i + 1, t->level,
+                        i + 1, t->pan, i + 1, t->rev, i + 1, t->shot,
+                        i + 1, t->fx, i + 1, t->fx_on, i + 1, t->fxp,
+                        i + 1, job->fx_id[i]);
+            }
+            for (int i = 0; i < MARK_TRACKS; i++)
+                if (job->fx_state[i][0])
+                    fprintf(f, ",\"z%d\":%s", i + 1, job->fx_state[i]);
+            fprintf(f, "}");
+            if (fclose(f) != 0) err = 1;
+        }
+        for (int i = 0; i < MARK_TRACKS && !err; i++) {
+            char wtmp[20], wname[16], tmppath[320], finalpath[320];
+            snprintf(wtmp, sizeof(wtmp), "t%d.wav.tmp", i + 1);
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, job->slot, wtmp, tmppath, sizeof(tmppath));
+            session_path(m, job->slot, wname, finalpath, sizeof(finalpath));
+            if (m->t[i].len > 0) {
+                if (rename(tmppath, finalpath) != 0) err = 1;
+            } else {
+                unlink(finalpath);
+            }
+        }
+        if (!err) {
+            char tmppath[320], finalpath[320];
+            session_path(m, job->slot, "session.json.tmp", tmppath, sizeof(tmppath));
+            session_path(m, job->slot, "session.json", finalpath, sizeof(finalpath));
+            if (rename(tmppath, finalpath) != 0) err = 1;
+        }
+        if (err) {
+            session_path(m, job->slot, "session.json.tmp", path, sizeof(path));
+            unlink(path);
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                char wtmp[20];
+                snprintf(wtmp, sizeof(wtmp), "t%d.wav.tmp", i + 1);
+                session_path(m, job->slot, wtmp, path, sizeof(path));
+                unlink(path);
+            }
+        }
+    } else {              /* ---- load ---- */
+        char js[65536];
+        if (session_read_json(m, job->slot, js, sizeof(js)) != 0) {
+            err = 1;
+        } else {
+            long gu = json_int(js, "gu", 0);
+            m->quantize   = json_int(js, "q", 1) ? 1 : 0;
+            m->rec_grid   = clampi(json_int(js, "gd", 0), 0, 3);
+            m->rec_action = json_int(js, "ra", 0) ? 1 : 0;
+            m->dub_mode   = json_int(js, "dm", 0) ? 1 : 0;
+            m->play_mode  = json_int(js, "pm", 0) ? 1 : 0;
+            m->master     = clampi(json_int(js, "mst", 100), 0, 200);
+            m->master_g   = (float)m->master / 100.0f;
+            m->follow     = json_int(js, "flw", 0) ? 1 : 0;
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                mk_track_t *t = &m->t[i];
+                char k[8];
+                snprintf(k, sizeof(k), "v%d", i + 1);
+                t->level = clampi(json_int(js, k, 100), 0, 200);
+                snprintf(k, sizeof(k), "p%d", i + 1);
+                t->pan = clampi(json_int(js, k, 50), 0, 100);
+                update_track_gains(t);
+                snprintf(k, sizeof(k), "r%d", i + 1);
+                t->rev = json_int(js, k, 0) ? 1 : 0;
+                snprintf(k, sizeof(k), "s%d", i + 1);
+                t->shot = json_int(js, k, 0) ? 1 : 0;
+                snprintf(k, sizeof(k), "f%d", i + 1);
+                t->fx = clampi(json_int(js, k, TFX_LPF), 0, TFX_COUNT - 1);
+                snprintf(k, sizeof(k), "o%d", i + 1);
+                t->fx_on = json_int(js, k, 0) ? 1 : 0;
+                snprintf(k, sizeof(k), "g%d", i + 1);
+                t->fxp = clampi(json_int(js, k, 50), 0, 100);
+                t->fx_dirty = 1;
+                snprintf(k, sizeof(k), "x%d", i + 1);
+                char fx_id[MARK_FX_ID_MAX] = {0};
+                if (json_string(js, k, fx_id, sizeof(fx_id)) != 0)
+                    fx_id[0] = '\0';
+                snprintf(m->session_fx_id[i], sizeof(m->session_fx_id[i]),
+                         "%s", fx_id);
+                snprintf(k, sizeof(k), "z%d", i + 1);
+                if (json_object(js, k, m->session_fx_state[i],
+                                sizeof(m->session_fx_state[i])) != 0)
+                    m->session_fx_state[i][0] = '\0';
+                atomic_store_explicit(&m->session_fx_ready[i], 1,
+                                      memory_order_release);
+
+                snprintf(k, sizeof(k), "l%d", i + 1);
+                long lval = json_int(js, k, 0);
+                snprintf(k, sizeof(k), "F%d", i + 1);
+                long want = lval > 0 ? json_int(js, k, (int)lval) : 0;
+                if (want < lval) want = lval;
+                if (want > (long)m->track_frames) want = (long)m->track_frames;
+                if (want > 0) {
+                    char wname[16];
+                    snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+                    session_path(m, job->slot, wname, path, sizeof(path));
+                    long got = wav_read(path, t->buf, (uint32_t)want);
+                    if (got == want) {
+                        t->full_len = (uint32_t)got;
+                        t->len = (lval > 0 && lval <= got) ? (uint32_t)lval
+                                                           : (uint32_t)got;
+                        t->pos = 0.0;
+                        t->st = MK_STOP;   /* set last: render gates on it */
+                    } else {
+                        err = 1;
+                        break;
+                    }
+                }
+            }
+            m->grid_unit = gu > 0 ? (double)gu : 0.0;
+        }
+    }
+
+    m->io_error = err;
+    m->edit_rev++;
+    m->io_busy = 0;       /* release last */
+    free(job);
+    return NULL;
+}
+
+static void session_start(mark_t *m, int slot, int op) {
+    if (m->io_busy || slot < 1 || slot > MARK_SESSION_SLOTS) return;
+    if (!m->session_dir[0]) { m->io_error = 1; return; }
+    if (m->io_thread_valid) {
+        pthread_join(m->io_thread, NULL);
+        m->io_thread_valid = 0;
+    }
+    mk_job_t *job = calloc(1, sizeof(mk_job_t));
+    if (!job) { m->io_error = 1; return; }
+    job->m = m;
+    job->slot = slot;
+    job->op = op;
+    if (op == 2) {
+        if (session_preflight(m, slot) != 0) {
+            m->io_error = 1;
+            m->edit_rev++;
+            free(job);
+            return;
+        }
+        /* Validation succeeded. Silence + detach every track before the
+         * worker touches buffers, preserving the render-thread contract. */
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+            t->st = MK_EMPTY;
+            t->len = 0;
+            t->full_len = 0;
+            t->pos = 0.0;
+            t->rec_len = 0;
+            t->rec_target = 0;
+            t->pending = 0;
+            track_fx_reset(t);
+        }
+        reset_undo(m);
+        m->grid_unit = 0.0;
+    } else {
+        /* saving while overdubbing/recording would race the writer — leave
+         * dub, and finalize a recording at what's already down (no
+         * extend-to-measure: that would keep writing during the save) */
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+            if (t->st == MK_DUB) {
+                t->st = MK_PLAY;
+                end_dub_capture(m, i);
+            } else if (t->st == MK_REC) {
+                uint32_t final_len = t->rec_len;
+                double g = effective_grid(m);
+                if (m->quantize && g >= 256.0 && (double)final_len >= g)
+                    final_len = (uint32_t)(floor((double)final_len / g) * g);
+                finalize_record(m, i, final_len, MK_PLAY);
+            }
+        }
+        /* Snapshot plugin settings on the audio/parameter thread before the
+         * file worker starts. The worker never calls into a live DSP instance;
+         * session JSON receives the module's normal `state` blob verbatim. */
+        fx_reader_enter(m);
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+            snprintf(job->fx_id[i], sizeof(job->fx_id[i]), "%s", t->fx_module);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[i],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->get_param) {
+                int n = fx->api->get_param(fx->instance, "state",
+                                            job->fx_state[i],
+                                            sizeof(job->fx_state[i]));
+                if (n <= 0 || n >= (int)sizeof(job->fx_state[i]) ||
+                    (job->fx_state[i][0] != '{' && job->fx_state[i][0] != '['))
+                    job->fx_state[i][0] = '\0';
+            }
+        }
+        fx_reader_leave(m);
+    }
+    m->io_error = 0;
+    m->io_busy = op;
+    m->edit_rev++;
+    if (pthread_create(&m->io_thread, NULL, io_worker, job) != 0) {
+        /* Thread exhaustion must not strand a validated load after its live
+         * tracks were detached. Complete the same job synchronously. */
+        io_worker(job);
+    } else {
+        m->io_thread_valid = 1;
+    }
+}
+#else
+/* No filesystem: save and load are refused, and the UI sees the error
+ * flag exactly as it would after a failed disk op. */
+static void session_start(mark_t *m, int slot, int op) {
+    (void)slot; (void)op;
+    if (m) atomic_store_explicit(&m->io_error, 1, memory_order_release);
+}
+#endif
+
+/* Track FX: one insert per track, applied post-read / pre-fader. Filter
+ * coefficients recompute lazily on the render thread when fx_dirty. */
+static void track_fx_reset(mk_track_t *t) {
+    t->bqL.z1 = t->bqL.z2 = t->bqR.z1 = t->bqR.z2 = 0.0f;
+    t->crush_cnt = 0;
+    t->crush_l = t->crush_r = 0.0f;
+    if (t->dly) memset(t->dly, 0, (size_t)MARK_DLY_LEN * 2 * sizeof(float));
+    t->dly_w = 0;
+    t->ph_lfo = 0.0f;
+    memset(t->ph_x, 0, sizeof(t->ph_x));
+    memset(t->ph_y, 0, sizeof(t->ph_y));
+    t->rm_phase = 0.0f;
+}
+
+static void track_fx_prepare(mk_track_t *t) {
+    if (!t->fx_dirty) return;
+    t->fx_dirty = 0;
+    switch (t->fx) {
+    case TFX_LPF:
+        bq_set(&t->bqL, 60.0f * powf(2.0f, (float)t->fxp * 0.075f), 0, 0.9f);
+        t->bqR = t->bqL;
+        break;
+    case TFX_HPF:
+        bq_set(&t->bqL, 40.0f * powf(2.0f, (float)t->fxp * 0.08f), 1, 0.9f);
+        t->bqR = t->bqL;
+        break;
+    default: break;
+    }
+}
+
+static void track_fx_run(mark_t *m, mk_track_t *t, float *l, float *r) {
+    switch (t->fx) {
+    case TFX_LPF:
+    case TFX_HPF:
+        *l = bq_run(&t->bqL, *l);
+        *r = bq_run(&t->bqR, *r);
+        break;
+    case TFX_CRUSH: {
+        /* sample-hold rate reduce + coarser quantize as param rises */
+        int hold = 1 + (t->fxp * 30) / 100;              /* 1..31 */
+        float quant = (float)(1 << (2 + t->fxp / 25));   /* 4..64 */
+        if (--t->crush_cnt <= 0) {
+            t->crush_cnt = hold;
+            t->crush_l = floorf(*l / quant) * quant;
+            t->crush_r = floorf(*r / quant) * quant;
+        }
+        *l = t->crush_l;
+        *r = t->crush_r;
+        break;
+    }
+    case TFX_DELAY: {
+        /* tempo-synced 8th-note echo; param drives feedback + mix */
+        uint32_t d = (uint32_t)(frames_per_measure(m) / 8.0);
+        if (d >= MARK_DLY_LEN) d = MARK_DLY_LEN - 1;
+        if (d < 64) d = 64;
+        float fb = 0.15f + 0.55f * (float)t->fxp / 100.0f;
+        float mix = 0.25f + 0.50f * (float)t->fxp / 100.0f;
+        uint32_t rdi = (t->dly_w + MARK_DLY_LEN - d) % MARK_DLY_LEN;
+        float dl = t->dly[rdi * 2], dr = t->dly[rdi * 2 + 1];
+        t->dly[t->dly_w * 2]     = *l + dl * fb;
+        t->dly[t->dly_w * 2 + 1] = *r + dr * fb;
+        t->dly_w = (t->dly_w + 1) % MARK_DLY_LEN;
+        *l += dl * mix;
+        *r += dr * mix;
+        break;
+    }
+    case TFX_PHASER: {
+        /* 4-stage allpass, LFO rate from param (~0.05 .. ~2.5 Hz) */
+        float rate = 0.05f + 2.45f * (float)t->fxp / 100.0f;
+        t->ph_lfo += rate / (float)MARK_SR;
+        if (t->ph_lfo >= 1.0f) t->ph_lfo -= 1.0f;
+        float sweep = 0.55f + 0.4f * sinf(6.2831853f * t->ph_lfo);
+        float in2[2] = { *l, *r };
+        for (int c = 0; c < 2; c++) {
+            float x = in2[c];
+            for (int st = 0; st < 4; st++) {
+                float y = -sweep * x + t->ph_x[c][st] + sweep * t->ph_y[c][st];
+                t->ph_x[c][st] = x;
+                t->ph_y[c][st] = y;
+                x = y;
+            }
+            in2[c] = 0.5f * (in2[c] + x);
+        }
+        *l = in2[0];
+        *r = in2[1];
+        break;
+    }
+    case TFX_RINGMOD: {
+        /* carrier ~30 Hz .. ~1 kHz, exponential */
+        float freq = 30.0f * powf(2.0f, (float)t->fxp / 20.0f);
+        t->rm_phase += freq / (float)MARK_SR;
+        if (t->rm_phase >= 1.0f) t->rm_phase -= 1.0f;
+        float c = sinf(6.2831853f * t->rm_phase);
+        *l *= c;
+        *r *= c;
+        break;
+    }
+    default: break;
+    }
+}
+
+/*
+ * Per-track I/O routing.
+ *
+ * The classic form is one stereo input every track records, and one stereo
+ * mix every track sums into. A panel with a jack per track wants the other
+ * shape: track i records in_ch[i] and appears alone on out_ch[i].
+ *
+ * Both run through process_common. rt == NULL selects the classic form, so
+ * mark_process is byte-for-byte the code it always was.
+ */
+typedef struct {
+    const int16_t *const *in_ch;   /* [MARK_TRACKS], mono, one per track */
+    int16_t *const *out_ch;        /* [MARK_TRACKS], mono, one per track */
+} mk_route_t;
+
+/* Track i's input for frame n, as a stereo pair. In multi mode the jack is
+ * mono, so both sides carry it — which is what the recorder and the overdub
+ * mixer expect, and what tbuf_store averages back down at MARK_CH=1. */
+static inline void route_in(const mk_route_t *rt, const int16_t *in,
+                            int i, int n, int16_t *l, int16_t *r) {
+    if (rt && rt->in_ch) {
+        *l = *r = rt->in_ch[i][n];
+    } else {
+        *l = in[n * 2];
+        *r = in[n * 2 + 1];
+    }
+}
+
+static void process_common(mark_t *m, const int16_t *in, int16_t *out,
+                           int frames, const mk_route_t *rt) {
+    if (!m) return;
+    if (frames > MARK_BLOCK_FRAMES) frames = MARK_BLOCK_FRAMES;
+
+    fx_apply_pending(m);
+    swap_step(m);
+    mk_ext_fx_t *block_fx[MARK_TRACKS] = {0};
+    int use_ext[MARK_TRACKS] = {0};
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_track_t *t = &m->t[i];
+        block_fx[i] = atomic_load_explicit(&m->fx_active[i], memory_order_acquire);
+        use_ext[i] = t->fx_on && t->fx_module[0] && block_fx[i] &&
+                     !strcmp(t->fx_module, block_fx[i]->id);
+        if (use_ext[i])
+            memset(m->fx_block[i], 0, (size_t)frames * 2 * sizeof(int16_t));
+        else if (t->fx_on && !t->fx_module[0])
+            track_fx_prepare(t);
+    }
+
+    if (rt && rt->out_ch)
+        for (int i = 0; i < MARK_TRACKS; i++)
+            memset(m->tmix[i], 0, (size_t)frames * sizeof(float));
+
+    int paused = m->transport_paused;
+    int use_measure_flag = m->measure_flag;
+    m->measure_flag = 0;
+
+    for (int n = 0; n < frames; n++) {
+        /* Input is read per track now — in multi mode each track has its own
+         * jack — so it lives inside the track loop below, not here. */
+
+        /* --- pending scheduler: fire on the grid --- */
+        int boundary = 0;
+        mk_track_t *base = base_playing(m);
+        if (base && !paused) {
+            double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+            if (g >= 1.0 && fmod(base->pos, g) < 1.0) boundary = 1;
+        } else if (use_measure_flag && n == 0) {
+            boundary = 1;
+        }
+        if (boundary) {
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                if (m->t[i].pending == 1) apply_start_record(m, i);
+                else if (m->t[i].pending == 2) apply_start_play(m, i);
+            }
+        }
+
+        /* --- render/record each track --- */
+        float outl = 0.0f, outr = 0.0f;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            mk_track_t *t = &m->t[i];
+
+            /* This track's input for this frame. Identical to the shared
+             * stereo input in classic mode; this track's own jack in multi. */
+            int16_t si_l, si_r;
+            route_in(rt, in, i, n, &si_l, &si_r);
+            const float inl = (float)si_l, inr = (float)si_r;
+
+            if (t->st == MK_REC) {
+                if (t->rec_len < m->track_frames) {
+                    tbuf_store(t->buf, t->rec_len, si_l, si_r);
+                    t->rec_len++;
+                }
+                if (t->rec_target && t->rec_len >= t->rec_target) {
+                    finalize_record(m, i, t->rec_target, t->rec_end);
+                } else if (t->rec_len >= m->track_frames) {
+                    /* buffer full: keep whole grid multiples if we have any */
+                    uint32_t final_len = m->track_frames;
+                    double g = live_unit(m);
+                    if (m->quantize && g >= 32.0 && (double)final_len >= g)
+                        final_len = (uint32_t)(floor((double)final_len / g) * g);
+                    finalize_record(m, i, final_len, m->rec_action ? MK_DUB : MK_PLAY);
+                }
+                continue;
+            }
+
+            if ((t->st != MK_PLAY && t->st != MK_DUB) || t->len == 0 || paused) {
+                /* Delay is the one track FX with an audible tail. Keep its
+                 * feedback network advancing after a per-track stop instead
+                 * of freezing stale audio for the next restart. */
+                if (!paused && t->st == MK_STOP && t->len > 0 &&
+                    t->fx_on && !t->fx_module[0] && t->fx == TFX_DELAY &&
+                    m->swap_track != i) {
+                    float l = 0.0f, r = 0.0f;
+                    track_fx_run(m, t, &l, &r);
+                    float gt = (float)t->level / 100.0f;
+                    t->g_cur += (gt - t->g_cur) * 0.002f;
+                    if (rt && rt->out_ch) {
+                        m->tmix[i][n] += (l + r) * 0.5f * t->g_cur;
+                    } else {
+                        outl += l * t->g_cur * t->pg[0];
+                        outr += r * t->g_cur * t->pg[1];
+                    }
+                }
+                continue;
+            }
+            if (m->swap_track == i)   /* undo swap in flight: track muted */
+                continue;
+
+            uint32_t ip = (uint32_t)t->pos;
+            if (ip >= t->len) ip = t->len - 1;
+            uint32_t rp = t->rev ? (t->len - 1 - ip) : ip;
+            float l, r;
+            tbuf_load(t->buf, rp, &l, &r);
+
+            if (t->st == MK_DUB) {
+                /* capture-before-write; writes run sequentially from the
+                 * gesture start, so the captured region stays contiguous */
+                if (m->undo_capturing && m->undo_track == i &&
+                    m->undo_count < t->len) {
+                    tbuf_copy(m->undo_buf, ip, t->buf, ip);
+                    m->undo_count++;
+                }
+                if (m->dub_mode) {   /* replace */
+                    tbuf_store(t->buf, ip, si_l, si_r);
+                } else {             /* overdub: layer on top */
+                    tbuf_add(t->buf, ip, inl, inr);
+                }
+            }
+
+            if (use_ext[i]) {
+                m->fx_block[i][n * 2] = clip16(l);
+                m->fx_block[i][n * 2 + 1] = clip16(r);
+            } else {
+                if (t->fx_on && !t->fx_module[0] && t->fx != TFX_OFF)
+                    track_fx_run(m, t, &l, &r);
+                float gt = (float)t->level / 100.0f;
+                t->g_cur += (gt - t->g_cur) * 0.002f;
+                /* Multi mode: this track owns an output jack, so it goes to
+                 * its own bus and pan is not applied — there is nowhere to
+                 * pan to. Classic mode sums into the shared stereo bus. */
+                if (rt && rt->out_ch) {
+                    m->tmix[i][n] += (l + r) * 0.5f * t->g_cur;
+                } else {
+                    outl += l * t->g_cur * t->pg[0];
+                    outr += r * t->g_cur * t->pg[1];
+                }
+            }
+
+            t->pos += 1.0;
+            if (t->pos >= (double)t->len) {
+                t->pos = 0.0;
+                if (t->shot) {       /* one-shot: play once, then stop */
+                    if (t->st == MK_DUB) end_dub_capture(m, i);
+                    t->st = MK_STOP;
+                }
+            }
+        }
+
+        m->mix_l[n] = outl;
+        m->mix_r[n] = outr;
+    }
+
+    /* Audio-FX v2 is block-based. Process each selected track in-place, then
+     * add it to the float mix before MARK's fader/pan/master stages. A stopped
+     * track supplies silence, allowing reverb/delay tails to decay naturally. */
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        if (!use_ext[i]) continue;
+        mk_track_t *t = &m->t[i];
+        block_fx[i]->api->process_block(block_fx[i]->instance,
+                                        m->fx_block[i], frames);
+        float gt = (float)t->level / 100.0f;
+        for (int n = 0; n < frames; n++) {
+            t->g_cur += (gt - t->g_cur) * 0.002f;
+            if (rt && rt->out_ch) {
+                m->tmix[i][n] += ((float)m->fx_block[i][n * 2]
+                                + (float)m->fx_block[i][n * 2 + 1])
+                               * 0.5f * t->g_cur;
+            } else {
+                m->mix_l[n] += (float)m->fx_block[i][n * 2]
+                             * t->g_cur * t->pg[0];
+                m->mix_r[n] += (float)m->fx_block[i][n * 2 + 1]
+                             * t->g_cur * t->pg[1];
+            }
+        }
+    }
+
+    float dry = m->monitor ? 1.0f : 0.0f;
+    if (rt && rt->out_ch) {
+        /* One jack per track. Master gain still applies, and monitor passes
+         * that track's own input through — the multi analogue of the shared
+         * dry path below. */
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            for (int n = 0; n < frames; n++) {
+                float d = 0.0f;
+                if (dry != 0.0f) {
+                    int16_t sl, sr;
+                    route_in(rt, in, i, n, &sl, &sr);
+                    d = ((float)sl + (float)sr) * 0.5f;
+                }
+                rt->out_ch[i][n] = clip16(m->tmix[i][n] * m->master_g + d * dry);
+            }
+        }
+    } else {
+        for (int n = 0; n < frames; n++) {
+            out[n * 2] = clip16(m->mix_l[n] * m->master_g
+                                + (float)in[n * 2] * dry);
+            out[n * 2 + 1] = clip16(m->mix_r[n] * m->master_g
+                                    + (float)in[n * 2 + 1] * dry);
+        }
+    }
+    m->global_frames += (uint64_t)frames;
+}
+
+void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
+    process_common(m, in, out, frames, NULL);
+}
+
+void mark_process_multi(mark_t *m, const int16_t *const *in_ch,
+                        int16_t *const *out_ch, int frames) {
+    if (!m || !in_ch || !out_ch) return;
+    mk_route_t rt = { in_ch, out_ch };
+    /* in/out are unused in this mode; route_in and the output stage both
+     * take the rt branch. Passing NULL would be a landmine if a future edit
+     * reached for them, so pass the engine's own silence instead. */
+    static const int16_t silence[MARK_BLOCK_FRAMES * 2] = {0};
+    process_common(m, silence, NULL, frames, &rt);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Params                                                             */
+/* ------------------------------------------------------------------ */
+
+void mark_set_param(mark_t *m, const char *key, const char *val) {
+    if (!m || !key || !val) return;
+    if (!strcmp(key, "rui_set")) {
+        const char *separator = strchr(val, ':');
+        size_t key_len = separator ? (size_t)(separator - val) : 0;
+        char routed_key[128];
+        if (!separator || key_len == 0 || key_len >= sizeof(routed_key)) return;
+        memcpy(routed_key, val, key_len);
+        routed_key[key_len] = '\0';
+        if (!strcmp(routed_key, "rui_set")) return;
+        mark_set_param(m, routed_key, separator + 1);
+        return;
+    }
+    if (m->io_busy) return;
+
+    /* per-track keys: t<1-5>_... */
+    if (key[0] == 't' && key[1] >= '1' && key[1] <= '5' && key[2] == '_') {
+        int ti = key[1] - '1';
+        const char *k = key + 3;
+        mk_track_t *t = &m->t[ti];
+        if (!strcmp(k, "btn"))   { if (trig_active(val)) track_button(m, ti); return; }
+        if (!strcmp(k, "stop"))  { if (trig_active(val)) track_stop(m, ti);   return; }
+        if (!strcmp(k, "clear")) { if (trig_active(val)) track_clear(m, ti);  return; }
+        if (!strcmp(k, "trim"))  { track_trim(m, ti, atoi(val)); return; }
+        if (!strcmp(k, "len16")) { track_setlen16(m, ti, atoi(val)); return; }
+        if (!strcmp(k, "level")) { t->level = clampi(atoi(val), 0, 200); m->edit_rev++; return; }
+        if (!strcmp(k, "pan"))   { t->pan = clampi(atoi(val), 0, 100); update_track_gains(t); m->edit_rev++; return; }
+        if (!strcmp(k, "rev")) {
+            t->rev = atoi(val) ? 1 : 0;
+            if (t->rev && t->st == MK_DUB) {   /* RC rule: no dub while reversed */
+                t->st = MK_PLAY;
+                end_dub_capture(m, ti);
+            }
+            m->edit_rev++;
+            return;
+        }
+        if (!strcmp(k, "shot"))  { t->shot = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+        if (!strcmp(k, "fx")) {
+            int fx = clampi(atoi(val), 0, TFX_COUNT - 1);
+            if (fx != t->fx) track_fx_reset(t);
+            t->fx = fx;
+            t->fx_dirty = 1;
+            if (t->fx_module[0]) request_fx_module(m, ti, "");
+            m->edit_rev++;
+            return;
+        }
+        if (!strcmp(k, "fx_module")) {
+            request_fx_module(m, ti, val);
+            return;
+        }
+        if (!strcmp(k, "fx_on")) {
+            int on = atoi(val) ? 1 : 0;
+            if (on != t->fx_on) track_fx_reset(t);
+            t->fx_on = on;
+            t->fx_dirty = 1;
+            m->edit_rev++;
+            return;
+        }
+        if (!strcmp(k, "fxp"))   { t->fxp = clampi(atoi(val), 0, 100); t->fx_dirty = 1; m->edit_rev++; return; }
+        if (!strncmp(k, "mod_", 4)) {
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->set_param) {
+                fx->api->set_param(fx->instance, k + 4, val);
+                m->edit_rev++;
+            }
+            fx_reader_leave(m);
+            return;
+        }
+        return;
+    }
+
+    if (!strcmp(key, "all_btn"))  { if (trig_active(val)) all_button(m); return; }
+    if (!strcmp(key, "undo"))     { if (trig_active(val)) undo_press(m); return; }
+    if (!strcmp(key, "quantize")) { m->quantize = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "rec_grid")) { m->rec_grid = clampi(atoi(val), 0, 3); m->edit_rev++; return; }
+    if (!strcmp(key, "rec_action")) { m->rec_action = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "dub_mode")) { m->dub_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "play_mode")) { m->play_mode = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "master"))   { m->master = clampi(atoi(val), 0, 200);
+                                    m->master_g = (float)m->master / 100.0f;
+                                    m->edit_rev++; return; }
+    if (!strcmp(key, "monitor"))  { m->monitor = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+    if (!strcmp(key, "hw_input")) { m->hw_input = atoi(val) ? 1 : 0; return; }
+    if (!strcmp(key, "follow")) {
+        m->follow = atoi(val) ? 1 : 0;
+        if (!m->follow) m->transport_paused = 0;
+        m->edit_rev++;
+        return;
+    }
+    if (!strcmp(key, "bpm_override")) {
+        float b = (float)atof(val);
+        m->bpm_override = (b >= 20.0f && b <= 999.0f) ? b : 0.0f;
+        m->edit_rev++;
+        return;
+    }
+    if (!strcmp(key, "session_dir")) {
+        snprintf(m->session_dir, sizeof(m->session_dir), "%s", val);
+        return;
+    }
+    if (!strcmp(key, "save_session")) {
+        int slot = atoi(val);
+        if (slot >= 1) session_start(m, slot, 1);
+        return;
+    }
+    if (!strcmp(key, "load_session")) {
+        int slot = atoi(val);
+        if (slot >= 1) session_start(m, slot, 2);
+        return;
+    }
+#if MARK_SESSIONS
+    if (!strcmp(key, "delete_session")) {
+        /* deletion is a handful of unlinks — safe synchronously on the UI
+         * thread, but never while a save/load worker owns the directory */
+        int slot = atoi(val);
+        if (slot < 1 || slot > MARK_SESSION_SLOTS || m->io_busy ||
+            !m->session_dir[0])
+            return;
+        char path[320];
+        session_path(m, slot, "session.json", path, sizeof(path));
+        unlink(path);
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            char wname[16];
+            snprintf(wname, sizeof(wname), "t%d.wav", i + 1);
+            session_path(m, slot, wname, path, sizeof(path));
+            unlink(path);
+        }
+        session_path(m, slot, NULL, path, sizeof(path));
+        rmdir(path);
+        m->edit_rev++;
+        return;
+    }
+#endif
+
+    if (!strcmp(key, "state")) {
+        /* settings-only preset blob; loop audio is never saved. Display
+         * fields the getter emits (run/ts/ms/un/sess/bpm/sec) are ignored
+         * here on purpose. */
+        m->quantize   = json_int(val, "q",  m->quantize) ? 1 : 0;
+        m->rec_grid   = clampi(json_int(val, "gd", m->rec_grid), 0, 3);
+        m->rec_action = json_int(val, "ra", m->rec_action) ? 1 : 0;
+        m->dub_mode   = json_int(val, "dm", m->dub_mode) ? 1 : 0;
+        m->play_mode  = json_int(val, "pm", m->play_mode) ? 1 : 0;
+        m->master     = clampi(json_int(val, "mst", m->master), 0, 200);
+        m->master_g   = (float)m->master / 100.0f;
+        m->follow     = json_int(val, "flw", m->follow) ? 1 : 0;
+        const char *arr;
+        struct { const char *key; int which; } fields[] = {
+            { "\"lv\":\"", 0 }, { "\"pn\":\"", 1 },
+            { "\"rv\":\"", 2 }, { "\"sh\":\"", 3 },
+            { "\"fx\":\"", 4 }, { "\"fo\":\"", 5 }, { "\"fp\":\"", 6 },
+        };
+        for (int f = 0; f < 7; f++) {
+            arr = strstr(val, fields[f].key);
+            if (!arr) continue;
+            arr += strlen(fields[f].key);
+            for (int i = 0; i < MARK_TRACKS && *arr && *arr != '"'; i++) {
+                char *end;
+                long v = strtol(arr, &end, 10);
+                if (end == arr) break;
+                mk_track_t *t = &m->t[i];
+                switch (fields[f].which) {
+                case 0: t->level = clampi((int)v, 0, 200); break;
+                case 1: t->pan = clampi((int)v, 0, 100); update_track_gains(t); break;
+                case 2: t->rev = v ? 1 : 0; break;
+                case 3: t->shot = v ? 1 : 0; break;
+                case 4: {
+                    int fx = clampi((int)v, 0, TFX_COUNT - 1);
+                    if (fx != t->fx) track_fx_reset(t);
+                    t->fx = fx;
+                    t->fx_dirty = 1;
+                    break;
+                }
+                case 5: {
+                    int on = v ? 1 : 0;
+                    if (on != t->fx_on) track_fx_reset(t);
+                    t->fx_on = on;
+                    t->fx_dirty = 1;
+                    break;
+                }
+                case 6: t->fxp = clampi((int)v, 0, 100); t->fx_dirty = 1; break;
+                }
+                arr = (*end == ',') ? end + 1 : end;
+            }
+        }
+        if (strstr(val, "\"xm\":\"")) {
+            for (int i = 0; i < MARK_TRACKS; i++) {
+                char id[MARK_FX_ID_MAX];
+                if (json_csv_string(val, "xm", i, id, sizeof(id)) == 0)
+                    request_fx_module(m, i, id);
+            }
+        }
+        m->edit_rev++;
+        return;
+    }
+}
+
+/* csv of one per-track int, appended into a state blob or returned raw */
+static int track_csv(const mark_t *m, char *buf, int buf_len,
+                     int (*get)(const mk_track_t *)) {
+    int n = 0;
+    for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++)
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                i ? "," : "", get(&m->t[i])), buf_len);
+    return n;
+}
+
+static int g_level(const mk_track_t *t) { return t->level; }
+static int g_pan(const mk_track_t *t)   { return t->pan; }
+static int g_rev(const mk_track_t *t)   { return t->rev; }
+static int g_shot(const mk_track_t *t)  { return t->shot; }
+static int g_state(const mk_track_t *t) { return t->st; }
+static int g_pend(const mk_track_t *t)  { return t->pending; }
+static int g_fx(const mk_track_t *t)    { return t->fx; }
+static int g_fxon(const mk_track_t *t)  { return t->fx_on; }
+static int g_fxp(const mk_track_t *t)   { return t->fxp; }
+
+int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
+    if (!m || !key || !buf || buf_len < 2) return -1;
+
+    if (key[0] == 't' && key[1] >= '1' && key[1] <= '5' && key[2] == '_') {
+        int ti = key[1] - '1';
+        const char *k = key + 3;
+        const mk_track_t *t = &m->t[ti];
+        if (!strcmp(k, "level")) return snprintf(buf, (size_t)buf_len, "%d", t->level);
+        if (!strcmp(k, "pan"))   return snprintf(buf, (size_t)buf_len, "%d", t->pan);
+        if (!strcmp(k, "rev"))   return snprintf(buf, (size_t)buf_len, "%d", t->rev);
+        if (!strcmp(k, "shot"))  return snprintf(buf, (size_t)buf_len, "%d", t->shot);
+        if (!strcmp(k, "len"))   return snprintf(buf, (size_t)buf_len, "%u", t->len);
+        if (!strcmp(k, "state")) return snprintf(buf, (size_t)buf_len, "%d", t->st);
+        if (!strcmp(k, "fx"))    return snprintf(buf, (size_t)buf_len, "%d", t->fx);
+        if (!strcmp(k, "fx_on")) return snprintf(buf, (size_t)buf_len, "%d", t->fx_on);
+        if (!strcmp(k, "fxp"))   return snprintf(buf, (size_t)buf_len, "%d", t->fxp);
+        if (!strcmp(k, "fx_module"))
+            return snprintf(buf, (size_t)buf_len, "%s", t->fx_module);
+        if (!strcmp(k, "fx_status"))
+            return snprintf(buf, (size_t)buf_len, "%d", t->fx_status);
+        if (!strcmp(k, "fx_active"))
+            return snprintf(buf, (size_t)buf_len, "%s", t->fx_active);
+        if (!strcmp(k, "mod_hierarchy")) {
+            int result = -1;
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->hierarchy) {
+                size_t n = strlen(fx->hierarchy);
+                if (n < (size_t)buf_len) {
+                    memcpy(buf, fx->hierarchy, n + 1);
+                    result = (int)n;
+                }
+            }
+            fx_reader_leave(m);
+            return result;
+        }
+        if (!strncmp(k, "mod_", 4)) {
+            int result = -1;
+            fx_reader_enter(m);
+            mk_ext_fx_t *fx = atomic_load_explicit(&m->fx_active[ti],
+                                                    memory_order_acquire);
+            if (fx && !strcmp(fx->id, t->fx_module) && fx->api->get_param)
+                result = fx->api->get_param(fx->instance, k + 4, buf, buf_len);
+            fx_reader_leave(m);
+            return result;
+        }
+        /* trigger params read back inactive */
+        if (!strcmp(k, "btn") || !strcmp(k, "stop") || !strcmp(k, "clear"))
+            return snprintf(buf, (size_t)buf_len, "0");
+        return -1;
+    }
+
+    if (!strcmp(key, "tstates")) return track_csv(m, buf, buf_len, g_state);
+    if (!strcmp(key, "fx_catalog")) {
+        int n = 0;
+        for (int i = 0; i < m->fx_catalog_count && n < buf_len - 8; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                    "%s%s|%s", i ? "," : "",
+                                    m->fx_catalog[i].id,
+                                    m->fx_catalog[i].name), buf_len);
+        return n;
+    }
+    if (!strcmp(key, "fx_module_count"))
+        return snprintf(buf, (size_t)buf_len, "%d", m->fx_catalog_count);
+    if (!strcmp(key, "tpend"))   return track_csv(m, buf, buf_len, g_pend);
+    if (!strcmp(key, "tpos")) {
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int v = 0;
+            if (m->t[i].len > 0)
+                v = (int)(m->t[i].pos * 128.0 / (double)m->t[i].len);
+            if (v > 127) v = 127;
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        return n;
+    }
+    if (!strcmp(key, "tmeas")) {
+        double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int meas = 0;
+            if (m->t[i].len > 0 && g >= 1.0)
+                meas = (int)floor(((double)m->t[i].len / g) + 0.5);
+            if (m->t[i].len > 0 && meas < 1) meas = 1;
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", meas), buf_len);
+        }
+        return n;
+    }
+
+    /* one poll per UI tick: states|pending|pos|undo|swap */
+    if (!strcmp(key, "status")) {
+        int n = 0;
+        n = nclamp(n + track_csv(m, buf + n, buf_len - n, g_state), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|"), buf_len);
+        n = nclamp(n + track_csv(m, buf + n, buf_len - n, g_pend), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|"), buf_len);
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            int v = 0;
+            if (m->t[i].len > 0)
+                v = (int)(m->t[i].pos * 128.0 / (double)m->t[i].len);
+            if (v > 127) v = 127;
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        int undo_avail = 0;
+        if (m->undo_track >= 0 && m->swap_track < 0)
+            undo_avail = m->undo_redo ? 2 : 1;
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|%d|%d|",
+                                undo_avail, m->swap_track >= 0 ? 1 : 0), buf_len);
+        if (n < buf_len - 16) {
+            int w = mark_get_param(m, "tunits", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "|"), buf_len);
+        if (n < buf_len - 16) {
+            int w = mark_get_param(m, "tlen16", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        return n;
+    }
+
+    if (!strcmp(key, "run_state")) {
+        int rs = 0;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            if (m->t[i].st == MK_REC || m->t[i].st == MK_DUB) { rs = 2; break; }
+            if (m->t[i].st == MK_PLAY) rs = 3;
+            else if (m->t[i].pending && rs == 0) rs = 1;
+        }
+        return snprintf(buf, (size_t)buf_len, "%d", rs);
+    }
+    if (!strcmp(key, "quantize"))   return snprintf(buf, (size_t)buf_len, "%d", m->quantize);
+    if (!strcmp(key, "rec_grid"))   return snprintf(buf, (size_t)buf_len, "%d", m->rec_grid);
+    if (!strcmp(key, "tunits")) {
+        /* per-track length in current rec_grid units (0 = empty) */
+        double u = locked_unit(m);
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int v = 0;
+            if (m->t[i].len > 0 && u >= 32.0) {
+                v = (int)floor((double)m->t[i].len / u + 0.5);
+                if (v < 1) v = 1;
+            }
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        return n;
+    }
+    if (!strcmp(key, "tlen16")) {
+        /* per-track length in 16ths of a measure — the step buttons' unit */
+        double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+        double u = g / 16.0;
+        int n = 0;
+        for (int i = 0; i < MARK_TRACKS && n < buf_len - 8; i++) {
+            int v = 0;
+            if (m->t[i].len > 0 && u >= 32.0) {
+                v = (int)floor((double)m->t[i].len / u + 0.5);
+                if (v < 1) v = 1;
+                if (v > 999) v = 999;
+            }
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", v), buf_len);
+        }
+        return n;
+    }
+    if (!strcmp(key, "rec_action")) return snprintf(buf, (size_t)buf_len, "%d", m->rec_action);
+    if (!strcmp(key, "dub_mode"))   return snprintf(buf, (size_t)buf_len, "%d", m->dub_mode);
+    if (!strcmp(key, "play_mode"))  return snprintf(buf, (size_t)buf_len, "%d", m->play_mode);
+    if (!strcmp(key, "edit_rev"))   return snprintf(buf, (size_t)buf_len, "%u", m->edit_rev);
+    if (!strcmp(key, "session_status")) {
+        const char *s = m->io_busy == 1 ? "saving"
+                      : m->io_busy == 2 ? "loading"
+                      : m->io_error ? "error" : "idle";
+        return snprintf(buf, (size_t)buf_len, "%s", s);
+    }
+    if (!strcmp(key, "session_slots")) {
+        /* csv of 0/1 per slot; stat() runs on the UI thread, not audio */
+        int n = 0;
+        for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++) {
+            int have = 0;
+#if MARK_SESSIONS
+            if (m->session_dir[0]) {
+                char path[320];
+                struct stat st;
+                session_path(m, i, "session.json", path, sizeof(path));
+                have = stat(path, &st) == 0;
+            }
+#endif   /* no filesystem: every slot reports empty */
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i > 1 ? "," : "", have), buf_len);
+        }
+        return n;
+    }
+    if (!strcmp(key, "rui_poll")) {
+        /* schwung-manager Remote-UI poll digest "rev:on:tick:bpm"
+         * (remote_ui.go parseRuiPoll): rev gates the heavy full-state
+         * refetch, tick drives the browser playhead between edits. */
+        mk_track_t *base = base_playing(m);
+        int on = (base && !m->transport_paused) ? 1 : 0;
+        int tick = -1;
+        if (on && base->len > 0) {
+            tick = (int)(base->pos * 128.0 / (double)base->len);
+            if (tick > 127) tick = 127;
+        }
+        double fpt = frames_per_tick_now(m);
+        int bpm = fpt > 0.0
+            ? (int)((double)MARK_SR * 60.0 / (fpt * 24.0) + 0.5) : 0;
+        return snprintf(buf, (size_t)buf_len, "%u:%d:%d:%d",
+                        m->edit_rev, on, tick, bpm);
+    }
+    if (!strcmp(key, "master"))     return snprintf(buf, (size_t)buf_len, "%d", m->master);
+    if (!strcmp(key, "monitor"))    return snprintf(buf, (size_t)buf_len, "%d", m->monitor);
+    if (!strcmp(key, "hw_input"))   return snprintf(buf, (size_t)buf_len, "%d", m->hw_input);
+    if (!strcmp(key, "follow"))     return snprintf(buf, (size_t)buf_len, "%d", m->follow);
+    if (!strcmp(key, "bpm_override"))
+        return snprintf(buf, (size_t)buf_len, "%d", (int)(m->bpm_override + 0.5f));
+    if (!strcmp(key, "grid_bpm")) {
+        double fpt = frames_per_tick_now(m);
+        return snprintf(buf, (size_t)buf_len, "%d",
+                        (int)((double)MARK_SR * 60.0 / (fpt * 24.0) + 0.5));
+    }
+    if (!strcmp(key, "track_seconds"))
+        return snprintf(buf, (size_t)buf_len, "%u", m->track_frames / MARK_SR);
+    if (!strcmp(key, "undo_avail")) {
+        int v = 0;
+        if (m->undo_track >= 0 && m->swap_track < 0) v = m->undo_redo ? 2 : 1;
+        return snprintf(buf, (size_t)buf_len, "%d", v);
+    }
+    if (!strcmp(key, "all_btn") || !strcmp(key, "undo"))
+        return snprintf(buf, (size_t)buf_len, "0");
+
+    if (!strcmp(key, "state")) {
+        /* settings (restored by the setter) + read-only display fields for
+         * the browser editor (run/ts/ms/un/io/sess/bpm/sec — the setter
+         * ignores them). The manager flattens this JSON into M.* keys. */
+        int n = 0;
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                "{\"q\":%d,\"gd\":%d,\"ra\":%d,\"dm\":%d,\"pm\":%d,"
+                                "\"mst\":%d,\"flw\":%d",
+                                m->quantize, m->rec_grid, m->rec_action,
+                                m->dub_mode, m->play_mode, m->master,
+                                m->follow), buf_len);
+        struct { const char *key; int (*get)(const mk_track_t *); } arrs[] = {
+            { "lv", g_level }, { "pn", g_pan }, { "rv", g_rev }, { "sh", g_shot },
+            { "fx", g_fx }, { "fo", g_fxon }, { "fp", g_fxp }, { "ts", g_state },
+        };
+        for (int f = 0; f < 8; f++) {
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                    ",\"%s\":\"", arrs[f].key), buf_len);
+            n = nclamp(n + track_csv(m, buf + n, buf_len - n, arrs[f].get), buf_len);
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\""), buf_len);
+        }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), ",\"xm\":\""), buf_len);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%s",
+                                    i ? "," : "", m->t[i].fx_module), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\",\"xs\":\""), buf_len);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
+                                    i ? "," : "", m->t[i].fx_status), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\""), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), ",\"ms\":\""), buf_len);
+        if (n < buf_len - 24) {
+            int w = mark_get_param(m, "tmeas", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\",\"tu\":\""), buf_len);
+        if (n < buf_len - 24) {
+            int w = mark_get_param(m, "tunits", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        int run = 0;
+        for (int i = 0; i < MARK_TRACKS; i++) {
+            if (m->t[i].st == MK_REC || m->t[i].st == MK_DUB) { run = 2; break; }
+            if (m->t[i].st == MK_PLAY) run = 3;
+        }
+        int undo_avail = 0;
+        if (m->undo_track >= 0 && m->swap_track < 0)
+            undo_avail = m->undo_redo ? 2 : 1;
+        double fpt = frames_per_tick_now(m);
+        int bpm = fpt > 0.0
+            ? (int)((double)MARK_SR * 60.0 / (fpt * 24.0) + 0.5) : 0;
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                "\",\"run\":%d,\"un\":%d,\"io\":%d,\"mon\":%d,"
+                                "\"bpm\":%d,\"sec\":%u,\"fc\":\"",
+                                run, undo_avail, m->io_busy, m->monitor,
+                                bpm, m->track_frames / MARK_SR), buf_len);
+        for (int i = 0; i < m->fx_catalog_count; i++)
+            n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                    "%s%s|%s", i ? "," : "",
+                                    m->fx_catalog[i].id,
+                                    m->fx_catalog[i].name), buf_len);
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
+                                "\",\"sess\":\""), buf_len);
+        if (n < buf_len - 40) {
+            int w = mark_get_param(m, "session_slots", buf + n, buf_len - n);
+            if (w > 0) n = nclamp(n + w, buf_len);
+        }
+        n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "\"}"), buf_len);
+        return n;
+    }
+
+    return -1;
+}
