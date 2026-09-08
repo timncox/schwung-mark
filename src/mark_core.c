@@ -14,16 +14,33 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <dlfcn.h>
-#include <sched.h>
 
 #include "mark_core.h"
+/* Types only — stdint and plugin_api_v1.h, no POSIX — so the FX structs stay
+ * available even when plugin LOADING is compiled out. */
 #include "audio_fx_api_v2.h"
+
+/* Everything below this line is what a hosted OS provides and a bare-metal
+ * target does not. See MARK_HOSTED_FX / MARK_SESSIONS in mark_core.h. */
+#if MARK_NEEDS_THREADS
+#include <pthread.h>
+#include <sched.h>
+#else
+/* Single-threaded build. The reader counts these loops spin on are only
+ * ever raised by the audio callback, which cannot be mid-read while
+ * set_param runs on the same thread — so the wait is a no-op, not a
+ * busy-wait that never completes. */
+#define usleep(us) ((void)(us))
+#endif
+#if MARK_HOSTED_FX || MARK_SESSIONS
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#if MARK_HOSTED_FX
+#include <dirent.h>
+#include <dlfcn.h>
+#endif
 
 /* Allocation fallback ladder: first capacity that calloc grants wins. */
 static const int alloc_seconds[] = { MARK_MAX_SECONDS, 45, 30, 20, 15 };
@@ -216,7 +233,9 @@ struct mark {
     char session_dir[240];
     _Atomic int io_busy;          /* 0 idle, 1 saving, 2 loading */
     _Atomic int io_error;         /* last I/O op failed */
+#if MARK_NEEDS_THREADS
     pthread_t io_thread;
+#endif
     int io_thread_valid;
 
     /* Per-track Schwung FX host. Requests are a fixed SPSC queue written by
@@ -243,7 +262,9 @@ struct mark {
     char session_fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
     _Atomic int session_fx_ready[MARK_TRACKS];
     _Atomic int fx_thread_stop;
+#if MARK_NEEDS_THREADS
     pthread_t fx_thread;
+#endif
     int fx_thread_valid;
     int16_t fx_block[MARK_TRACKS][MARK_BLOCK_FRAMES * 2];
     float mix_l[MARK_BLOCK_FRAMES], mix_r[MARK_BLOCK_FRAMES];
@@ -368,6 +389,7 @@ static int json_string(const char *js, const char *key,
     return *p == '"' ? 0 : -1;
 }
 
+#if MARK_SESSIONS
 static int json_object(const char *js, const char *key,
                        char *out, size_t out_len) {
     char pat[80];
@@ -416,6 +438,7 @@ static int json_object(const char *js, const char *key,
     }
     return -1;
 }
+#endif
 
 static int json_csv_string(const char *js, const char *key, int index,
                            char *out, size_t out_len) {
@@ -521,6 +544,7 @@ static int valid_fx_id(const char *s) {
     return 1;
 }
 
+#if MARK_HOSTED_FX
 static char *read_text_file(const char *path, size_t max_bytes) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -538,7 +562,9 @@ static char *read_text_file(const char *path, size_t max_bytes) {
     buf[got] = '\0';
     return buf;
 }
+#endif
 
+#if MARK_HOSTED_FX
 static int manifest_string(const char *js, const char *key,
                            char *out, size_t out_len) {
     char pat[80];
@@ -558,11 +584,13 @@ static int manifest_string(const char *js, const char *key,
     out[n] = '\0';
     return (*p == '"' && n > 0) ? 0 : -1;
 }
+#endif
 
 /* Copy the manifest's ui_hierarchy object for generic parameter editors.
  * This is deliberately a balanced-object extractor rather than a JSON model:
  * the browser/Move JS already understands the schema and the DSP only caches
  * it outside the render thread. */
+#if MARK_HOSTED_FX
 static char *manifest_hierarchy(const char *js) {
     const char *p = strstr(js, "\"ui_hierarchy\"");
     if (!p || !(p = strchr(p, ':')) || !(p = strchr(p, '{'))) return NULL;
@@ -589,12 +617,15 @@ static char *manifest_hierarchy(const char *js) {
     }
     return NULL;
 }
+#endif
 
+#if MARK_HOSTED_FX
 static int fx_catalog_cmp(const void *a, const void *b) {
     const mk_fx_catalog_t *aa = (const mk_fx_catalog_t *)a;
     const mk_fx_catalog_t *bb = (const mk_fx_catalog_t *)b;
     return strcmp(aa->name, bb->name);
 }
+#endif
 
 static int fx_catalog_find(const mark_t *m, const char *id) {
     for (int i = 0; i < m->fx_catalog_count; i++)
@@ -602,6 +633,7 @@ static int fx_catalog_find(const mark_t *m, const char *id) {
     return -1;
 }
 
+#if MARK_HOSTED_FX
 static void fx_catalog_scan(mark_t *m) {
     if (!m->audio_fx_dir[0]) return;
     DIR *d = opendir(m->audio_fx_dir);
@@ -639,16 +671,24 @@ static void fx_catalog_scan(mark_t *m) {
     qsort(m->fx_catalog, (size_t)m->fx_catalog_count,
           sizeof(m->fx_catalog[0]), fx_catalog_cmp);
 }
+#else
+/* No dlopen and no dirent: nothing to scan, so the catalog stays empty
+ * and every t*_fx_module request is refused by fx_catalog_find(). */
+static void fx_catalog_scan(mark_t *m) { (void)m; }
+#endif
 
 static void ext_fx_destroy(mk_ext_fx_t *fx) {
     if (!fx) return;
     if (fx->api && fx->instance && fx->api->destroy_instance)
         fx->api->destroy_instance(fx->instance);
+#if MARK_HOSTED_FX
     if (fx->handle) dlclose(fx->handle);
+#endif
     free(fx->hierarchy);
     free(fx);
 }
 
+#if MARK_HOSTED_FX
 static mk_ext_fx_t *ext_fx_load(mark_t *m, const char *id, const char *state) {
     int ci = fx_catalog_find(m, id);
     if (ci < 0) return NULL;
@@ -683,6 +723,7 @@ static mk_ext_fx_t *ext_fx_load(mark_t *m, const char *id, const char *state) {
     if (js) { fx->hierarchy = manifest_hierarchy(js); free(js); }
     return fx;
 }
+#endif
 
 static void fx_reader_enter(mark_t *m) {
     atomic_fetch_add_explicit(&m->fx_readers, 1, memory_order_seq_cst);
@@ -708,6 +749,7 @@ static int fx_enqueue(mark_t *m, int track, const char *id) {
     return 0;
 }
 
+#if MARK_HOSTED_FX
 static mk_fx_result_t *fx_load_result(mark_t *m, int track, const char *id,
                                       const char *state, int set_desired) {
     mk_fx_result_t *r = calloc(1, sizeof(*r));
@@ -723,7 +765,9 @@ static mk_fx_result_t *fx_load_result(mark_t *m, int track, const char *id,
     }
     return r;
 }
+#endif
 
+#if MARK_HOSTED_FX
 static void fx_publish(mark_t *m, mk_fx_result_t *r) {
     int ti = r->track;
     while (!atomic_load_explicit(&m->fx_thread_stop, memory_order_acquire) &&
@@ -737,7 +781,9 @@ static void fx_publish(mark_t *m, mk_fx_result_t *r) {
     }
     atomic_store_explicit(&m->fx_pending[ti], r, memory_order_release);
 }
+#endif
 
+#if MARK_HOSTED_FX
 static void *fx_worker(void *arg) {
     mark_t *m = (mark_t *)arg;
     /* MoveOriginal's audio thread is FIFO. Never let a dlopen/file-I/O worker
@@ -782,6 +828,9 @@ static void *fx_worker(void *arg) {
     }
     return NULL;
 }
+#else
+/* no loader thread without hosted FX */
+#endif
 
 /* Audio-thread block boundary: install completed instances and hand the old
  * one back to the loader for destruction. */
@@ -888,8 +937,10 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         snprintf(m->audio_fx_dir, sizeof(m->audio_fx_dir), "%s/../../audio_fx",
                  module_dir);
         fx_catalog_scan(m);
+#if MARK_HOSTED_FX
         if (pthread_create(&m->fx_thread, NULL, fx_worker, m) == 0)
             m->fx_thread_valid = 1;
+#endif
     }
     return m;
 }
@@ -902,11 +953,13 @@ void mark_destroy(mark_t *m) {
     if (!m) return;
     /* The worker owns this instance until it returns. Joining makes destroy
      * safe even when slow storage takes longer than an arbitrary timeout. */
+#if MARK_NEEDS_THREADS
     if (m->io_thread_valid) pthread_join(m->io_thread, NULL);
     if (m->fx_thread_valid) {
         atomic_store_explicit(&m->fx_thread_stop, 1, memory_order_release);
         pthread_join(m->fx_thread, NULL);
     }
+#endif
     fx_wait_for_readers(m);
     for (int i = 0; i < MARK_TRACKS; i++) {
         mk_fx_result_t *pending = atomic_exchange(&m->fx_pending[i], NULL);
@@ -1406,6 +1459,7 @@ static void swap_step(mark_t *m) {
 /*  Sessions (save/load loop audio + settings, worker thread)          */
 /* ------------------------------------------------------------------ */
 
+#if MARK_SESSIONS
 static int wav_write(const char *path, const int16_t *data, uint32_t frames) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -1510,12 +1564,16 @@ typedef struct {
     char fx_state[MARK_TRACKS][MARK_FX_STATE_MAX];
 } mk_job_t;
 
+#endif
+#if MARK_SESSIONS
 static void session_path(const mark_t *m, int slot, const char *file,
                          char *buf, size_t len) {
     snprintf(buf, len, "%s/slot%02d%s%s", m->session_dir, slot,
              file ? "/" : "", file ? file : "");
 }
+#endif
 
+#if MARK_SESSIONS
 static int session_read_json(const mark_t *m, int slot, char *js, size_t cap) {
     char path[320];
     session_path(m, slot, "session.json", path, sizeof(path));
@@ -1795,6 +1853,14 @@ static void session_start(mark_t *m, int slot, int op) {
         m->io_thread_valid = 1;
     }
 }
+#else
+/* No filesystem: save and load are refused, and the UI sees the error
+ * flag exactly as it would after a failed disk op. */
+static void session_start(mark_t *m, int slot, int op) {
+    (void)slot; (void)op;
+    if (m) atomic_store_explicit(&m->io_error, 1, memory_order_release);
+}
+#endif
 
 /* Track FX: one insert per track, applied post-read / pre-fader. Filter
  * coefficients recompute lazily on the render thread when fx_dirty. */
@@ -2260,6 +2326,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         if (slot >= 1) session_start(m, slot, 2);
         return;
     }
+#if MARK_SESSIONS
     if (!strcmp(key, "delete_session")) {
         /* deletion is a handful of unlinks — safe synchronously on the UI
          * thread, but never while a save/load worker owns the directory */
@@ -2281,6 +2348,7 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         m->edit_rev++;
         return;
     }
+#endif
 
     if (!strcmp(key, "state")) {
         /* settings-only preset blob; loop audio is never saved. Display
@@ -2547,12 +2615,14 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         int n = 0;
         for (int i = 1; i <= MARK_SESSION_SLOTS && n < buf_len - 4; i++) {
             int have = 0;
+#if MARK_SESSIONS
             if (m->session_dir[0]) {
                 char path[320];
                 struct stat st;
                 session_path(m, i, "session.json", path, sizeof(path));
                 have = stat(path, &st) == 0;
             }
+#endif   /* no filesystem: every slot reports empty */
             n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n), "%s%d",
                                     i > 1 ? "," : "", have), buf_len);
         }

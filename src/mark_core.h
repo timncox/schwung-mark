@@ -50,6 +50,38 @@
 #define MARK_CH      2
 #endif
 
+/*
+ * Optional subsystems, both on by default.
+ *
+ * They are separable because each is the only reason the engine needs a
+ * hosted OS. Turning both off leaves pure C with libc and no pthread, dlfcn,
+ * dirent, sys/stat or file I/O — which is what a bare-metal target needs.
+ *
+ *   MARK_HOSTED_FX  loading audio_fx v2 plugins from disk (dlopen + dirent,
+ *                   and the worker thread that keeps dlopen off the audio
+ *                   path). With it off, no external module ever loads and
+ *                   every track falls through to the built-in FX — the same
+ *                   runtime state as a hosted build with nothing loaded, so
+ *                   no other code changes.
+ *
+ *   MARK_SESSIONS   saving and loading loops as WAVs (stdio + mkdir/unlink,
+ *                   and the worker thread that keeps that off the audio
+ *                   path). With it off, save/load report failure.
+ *
+ * The Daisy Patch build sets both to 0. Its SD card could back MARK_SESSIONS
+ * later through libDaisy's FatFS, which is why this is a flag and not a
+ * deletion.
+ */
+#ifndef MARK_HOSTED_FX
+#define MARK_HOSTED_FX 1
+#endif
+
+#ifndef MARK_SESSIONS
+#define MARK_SESSIONS  1
+#endif
+
+#define MARK_NEEDS_THREADS (MARK_HOSTED_FX || MARK_SESSIONS)
+
 /* Per-track capacity target, seconds. At MARK_CH=2, 60 s stereo int16 is
  * ~10.6 MB per track (44.1k) and 5 tracks + 1 undo buffer is ~63 MB.
  * At MARK_CH=1 and 4 tracks that same 60 s costs ~23 MB at 48 kHz.
