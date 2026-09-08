@@ -261,6 +261,75 @@ static inline int16_t clip16(float v) {
     return (int16_t)v;
 }
 
+/* Bytes per frame in track storage — and therefore in the session WAVs, which
+ * are a straight dump of a track buffer. Anywhere a literal 4 appeared for
+ * "stereo int16 frame", it must be this instead, or a MARK_CH=1 build reads
+ * and writes twice the bytes the buffer actually holds. */
+#define MARK_BPF ((int)sizeof(int16_t) * MARK_CH)
+
+/*
+ * Track-storage accessors. See MARK_CH in mark_core.h for why storage width
+ * is separable from the audio path.
+ *
+ * At MARK_CH==2 every one of these compiles to exactly the expression it
+ * replaced, so the Move build is unchanged. At MARK_CH==1 storage holds the
+ * mono sum and playback feeds it to both sides — correct without qualification
+ * on a panel whose track input is a single mono jack, where l and r are equal
+ * and the average is the identity.
+ *
+ * Frame indices are FRAMES, never samples. That distinction is the bug this
+ * indirection is meant to make impossible to reintroduce.
+ */
+static inline void tbuf_store(int16_t *b, uint32_t f, int16_t l, int16_t r) {
+#if MARK_CH == 1
+    b[f] = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+#else
+    b[f * 2]     = l;
+    b[f * 2 + 1] = r;
+#endif
+}
+
+static inline void tbuf_load(const int16_t *b, uint32_t f, float *l, float *r) {
+#if MARK_CH == 1
+    *l = *r = (float)b[f];
+#else
+    *l = (float)b[f * 2];
+    *r = (float)b[f * 2 + 1];
+#endif
+}
+
+/* Overdub: layer on top of what is already stored. */
+static inline void tbuf_add(int16_t *b, uint32_t f, float l, float r) {
+#if MARK_CH == 1
+    b[f] = clip16((float)b[f] + (l + r) * 0.5f);
+#else
+    b[f * 2]     = clip16((float)b[f * 2] + l);
+    b[f * 2 + 1] = clip16((float)b[f * 2 + 1] + r);
+#endif
+}
+
+static inline void tbuf_copy(int16_t *dst, uint32_t df,
+                             const int16_t *src, uint32_t sf) {
+#if MARK_CH == 1
+    dst[df] = src[sf];
+#else
+    dst[df * 2]     = src[sf * 2];
+    dst[df * 2 + 1] = src[sf * 2 + 1];
+#endif
+}
+
+static inline void tbuf_swap(int16_t *a, uint32_t af, int16_t *b, uint32_t bf) {
+#if MARK_CH == 1
+    int16_t t = a[af]; a[af] = b[bf]; b[bf] = t;
+#else
+    int16_t tl = a[af * 2], tr = a[af * 2 + 1];
+    a[af * 2]     = b[bf * 2];
+    a[af * 2 + 1] = b[bf * 2 + 1];
+    b[bf * 2]     = tl;
+    b[bf * 2 + 1] = tr;
+#endif
+}
+
 /* snprintf returns the WOULD-HAVE-WRITTEN length — on truncation a raw
  * `n += snprintf(...)` pushes n past buf_len and later appends write out
  * of bounds. Every state append goes through this clamp (smack lesson). */
@@ -769,7 +838,7 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         int16_t *bufs[MARK_TRACKS + 1];
         int ok = 1;
         for (int i = 0; i <= MARK_TRACKS; i++) {
-            bufs[i] = calloc((size_t)frames * 2, sizeof(int16_t));
+            bufs[i] = calloc((size_t)frames * MARK_CH, sizeof(int16_t));
             if (!bufs[i]) {
                 for (int j = 0; j < i; j++) free(bufs[j]);
                 ok = 0;
@@ -1319,11 +1388,7 @@ static void swap_step(mark_t *m) {
     if (m->swap_pos + n > m->undo_count) n = m->undo_count - m->swap_pos;
     for (uint32_t k = 0; k < n; k++) {
         uint32_t idx = (m->undo_start + m->swap_pos + k) % t->len;
-        int16_t tl = t->buf[idx * 2], tr = t->buf[idx * 2 + 1];
-        t->buf[idx * 2]     = m->undo_buf[idx * 2];
-        t->buf[idx * 2 + 1] = m->undo_buf[idx * 2 + 1];
-        m->undo_buf[idx * 2]     = tl;
-        m->undo_buf[idx * 2 + 1] = tr;
+        tbuf_swap(t->buf, idx, m->undo_buf, idx);
     }
     m->swap_pos += n;
     if (m->swap_pos >= m->undo_count) {
@@ -1340,7 +1405,7 @@ static void swap_step(mark_t *m) {
 static int wav_write(const char *path, const int16_t *data, uint32_t frames) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    uint32_t data_bytes = frames * 4;
+    uint32_t data_bytes = frames * (uint32_t)MARK_BPF;
     uint32_t riff = 36 + data_bytes;
     uint8_t h[44];
     memcpy(h, "RIFF", 4);
@@ -1348,15 +1413,15 @@ static int wav_write(const char *path, const int16_t *data, uint32_t frames) {
     memcpy(h + 8, "WAVEfmt ", 8);
     uint32_t fmt_len = 16;   memcpy(h + 16, &fmt_len, 4);
     uint16_t pcm = 1;        memcpy(h + 20, &pcm, 2);
-    uint16_t ch = 2;         memcpy(h + 22, &ch, 2);
+    uint16_t ch = MARK_CH;   memcpy(h + 22, &ch, 2);
     uint32_t sr = MARK_SR;   memcpy(h + 24, &sr, 4);
-    uint32_t br = MARK_SR * 4; memcpy(h + 28, &br, 4);
-    uint16_t ba = 4;         memcpy(h + 32, &ba, 2);
+    uint32_t br = MARK_SR * (uint32_t)MARK_BPF; memcpy(h + 28, &br, 4);
+    uint16_t ba = MARK_BPF;  memcpy(h + 32, &ba, 2);
     uint16_t bits = 16;      memcpy(h + 34, &bits, 2);
     memcpy(h + 36, "data", 4);
     memcpy(h + 40, &data_bytes, 4);
     int ok = fwrite(h, 1, 44, f) == 44 &&
-             fwrite(data, 4, frames, f) == frames;
+             fwrite(data, (size_t)MARK_BPF, frames, f) == frames;
     fclose(f);
     return ok ? 0 : -1;
 }
@@ -1377,9 +1442,9 @@ static long wav_read(const char *path, int16_t *data, uint32_t max_frames) {
         uint32_t sz;
         memcpy(&sz, ch + 4, 4);
         if (!memcmp(ch, "data", 4)) {
-            uint32_t want = sz / 4;
+            uint32_t want = sz / (uint32_t)MARK_BPF;
             if (want > max_frames) want = max_frames;
-            frames = (long)fread(data, 4, want, f);
+            frames = (long)fread(data, (size_t)MARK_BPF, want, f);
             break;
         }
         if (fseek(f, (long)((sz + 1) & ~1u), SEEK_CUR) != 0) break;
@@ -1417,11 +1482,11 @@ static int wav_probe(const char *path, uint32_t *frames_out) {
             memcpy(&pcm, fmt, 2); memcpy(&channels, fmt + 2, 2);
             memcpy(&sr, fmt + 4, 4); memcpy(&align, fmt + 12, 2);
             memcpy(&bits, fmt + 14, 2);
-            fmt_ok = pcm == 1 && channels == 2 && sr == MARK_SR &&
-                     align == 4 && bits == 16;
+            fmt_ok = pcm == 1 && channels == MARK_CH && sr == MARK_SR &&
+                     align == MARK_BPF && bits == 16;
         } else if (!memcmp(chdr, "data", 4)) {
-            if ((sz & 3u) != 0) break;
-            data_frames = sz / 4;
+            if ((sz % (uint32_t)MARK_BPF) != 0) break;
+            data_frames = sz / (uint32_t)MARK_BPF;
             data_ok = 1;
         }
         long next = payload + (long)((sz + 1u) & ~1u);
@@ -1877,8 +1942,7 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
             if (t->st == MK_REC) {
                 if (t->rec_len < m->track_frames) {
-                    t->buf[t->rec_len * 2]     = in[n * 2];
-                    t->buf[t->rec_len * 2 + 1] = in[n * 2 + 1];
+                    tbuf_store(t->buf, t->rec_len, in[n * 2], in[n * 2 + 1]);
                     t->rec_len++;
                 }
                 if (t->rec_target && t->rec_len >= t->rec_target) {
@@ -1916,24 +1980,21 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
             uint32_t ip = (uint32_t)t->pos;
             if (ip >= t->len) ip = t->len - 1;
             uint32_t rp = t->rev ? (t->len - 1 - ip) : ip;
-            float l = (float)t->buf[rp * 2];
-            float r = (float)t->buf[rp * 2 + 1];
+            float l, r;
+            tbuf_load(t->buf, rp, &l, &r);
 
             if (t->st == MK_DUB) {
                 /* capture-before-write; writes run sequentially from the
                  * gesture start, so the captured region stays contiguous */
                 if (m->undo_capturing && m->undo_track == i &&
                     m->undo_count < t->len) {
-                    m->undo_buf[ip * 2]     = t->buf[ip * 2];
-                    m->undo_buf[ip * 2 + 1] = t->buf[ip * 2 + 1];
+                    tbuf_copy(m->undo_buf, ip, t->buf, ip);
                     m->undo_count++;
                 }
                 if (m->dub_mode) {   /* replace */
-                    t->buf[ip * 2]     = in[n * 2];
-                    t->buf[ip * 2 + 1] = in[n * 2 + 1];
+                    tbuf_store(t->buf, ip, in[n * 2], in[n * 2 + 1]);
                 } else {             /* overdub: layer on top */
-                    t->buf[ip * 2]     = clip16((float)t->buf[ip * 2] + inl);
-                    t->buf[ip * 2 + 1] = clip16((float)t->buf[ip * 2 + 1] + inr);
+                    tbuf_add(t->buf, ip, inl, inr);
                 }
             }
 

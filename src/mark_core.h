@@ -20,12 +20,44 @@
 #include <stdint.h>
 #include "plugin_api_v1.h"
 
+/* All four are overridable at build time so one engine serves several panels.
+ * Move is the default and must stay bit-identical: 44100 / 5 tracks / stereo.
+ * The Daisy Patch build passes -DMARK_SR=48000 -DMARK_TRACKS=4 -DMARK_CH=1. */
+#ifndef MARK_SR
 #define MARK_SR      44100
+#endif
+
+#ifndef MARK_TRACKS
 #define MARK_TRACKS  5
-/* Per-track capacity target, seconds. 60 s stereo int16 = ~10.6 MB per
- * track; 5 tracks + 1 undo buffer = ~63 MB. mark_create() falls back to
- * smaller capacities if allocation fails (see mark_alloc_seconds). */
+#endif
+
+/*
+ * Channels held in TRACK STORAGE (t->buf and undo_buf). NOT the width of the
+ * audio path — that is always stereo, so pan, the per-track delay and the FX
+ * chain are unaffected by this.
+ *
+ * It is a separate knob because storage is where all the memory is. The delay
+ * lines are 256 KB per track and fx_block is 2 KB total; the track buffers are
+ * 11.5 MB each at 60 s / 48 kHz. On a panel whose tracks are fed by one mono
+ * jack each, storing two identical channels doubles the only allocation that
+ * matters, so MARK_CH=1 halves the module's footprint and buys twice the loop
+ * length for the same SDRAM.
+ *
+ * Every access goes through the tbuf_* accessors below, which at MARK_CH==2
+ * compile to exactly the expressions they replaced.
+ */
+#ifndef MARK_CH
+#define MARK_CH      2
+#endif
+
+/* Per-track capacity target, seconds. At MARK_CH=2, 60 s stereo int16 is
+ * ~10.6 MB per track (44.1k) and 5 tracks + 1 undo buffer is ~63 MB.
+ * At MARK_CH=1 and 4 tracks that same 60 s costs ~23 MB at 48 kHz.
+ * mark_create() falls back to smaller capacities if allocation fails
+ * (see mark_alloc_seconds). */
+#ifndef MARK_MAX_SECONDS
 #define MARK_MAX_SECONDS 60
+#endif
 
 /* Track states, exposed via the `tstates` getter in this order. */
 typedef enum {
