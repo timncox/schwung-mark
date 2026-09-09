@@ -170,7 +170,11 @@ bool scan(List &out)
     {
         memset(&g_fno, 0, sizeof(g_fno));
         if(f_readdir(&g_dir, &g_fno) != FR_OK || g_fno.fname[0] == '\0') break;
-        if(g_fno.fattrib & AM_DIR) continue;
+        if(g_fno.fattrib & (AM_DIR | AM_HID)) continue;
+        /* macOS writes an AppleDouble "._name.bin" next to every file it
+         * copies to FAT. Those end in .bin too; the vector-table check would
+         * refuse them, but they should not be on the list at all. */
+        if(g_fno.fname[0] == '.') continue;
         const char *fn = g_fno.fname;
         size_t      L  = strlen(fn);
         if(L < 5 || strcasecmp(fn + L - 4, ".bin") != 0) continue;
