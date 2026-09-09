@@ -181,17 +181,30 @@ static void menu_edit(int inc)
     if(item < M_GLOBALS)
     {
         int v = clampi(menu_get(item) + inc, GLOBAL_LO[item], GLOBAL_HI[item]);
-        if(GLOBAL_KEY[item]) set_int(GLOBAL_KEY[item], v);
-        else                 g_cvmode = v;
+        if(GLOBAL_KEY[item])
+        {
+            set_int(GLOBAL_KEY[item], v);
+        }
+        else
+        {
+            g_cvmode = v;
+            /* Entering trigger mode: seed the schmitt state from where the
+             * channels already sit, or every knob above the threshold would
+             * read as a rising edge on the next pass and arm its track. */
+            if(v == 0)
+                for(int k = 0; k < MARK_TRACKS; k++)
+                    g_cv_prev[k] = hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_TRIG_ON;
+        }
     }
     else
     {
-        int  t = item - M_GLOBALS;
+        /* g_last_level is deliberately NOT updated here: it tracks the last
+         * KNOB reading, so the knob re-takes the level only when its own
+         * reading changes. Setting it to the menu value would make the very
+         * next dispatch see knob != last and overwrite this edit at once. */
         char key[16];
-        track_key(key, sizeof(key), t, "level");
-        int v = clampi(menu_get(item) + inc, 0, 200);
-        set_int(key, v);
-        g_last_level[t] = v;   /* the knob re-takes only when it moves */
+        track_key(key, sizeof(key), item - M_GLOBALS, "level");
+        set_int(key, clampi(menu_get(item) + inc, 0, 200));
     }
 }
 
