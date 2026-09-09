@@ -30,14 +30,14 @@ bootloader install, no QSPI write.
 |---|---|
 | Audio In 1–4 | Track 1–4 record source |
 | Audio Out 1–4 | Track 1–4 playback |
-| CV In 1–4 | See `cvmode` below |
+| **Knob 1–4 + CV In 1–4** | Track 1–4: level in `cvmode 1`, record/play trigger in `cvmode 0`. Knob and jack are one channel — see below |
 | Gate In 1 | All start / stop |
 | Gate In 2 | Undo / redo |
 | **Gate Out** | **Track 1 loop boundary** |
 | **CV Out 1 / 2** | **Track 1 / 2 playhead, 0–5 V ramp per loop** |
-| Encoder turn | Page: `LEVEL` / `GLOBAL` |
-| Encoder press | All start / stop |
-| Knobs 1–4 | The current page's four params |
+| Encoder turn | Menu cursor: `mast` / `qnt` / `grid` / `cvmd` / `lvl1`–`lvl4` |
+| **Encoder push + turn** | Edit the selected menu item |
+| Encoder tap | All start / stop — fires on release, so a push-and-turn is never a transport toggle; Gate In 1 is the tight one |
 | MIDI In | CC to the engine |
 
 The gate output and CV outputs are the reason to run Mark here rather than on
@@ -45,22 +45,45 @@ the Move. A looper that emits its own loop-boundary trigger and playhead ramps
 drives the rest of the rack at exactly the loop length the player recorded —
 which no amount of dividing a master clock will give you.
 
+## Screen
+
+128×64, `Font_6x8`. Tracks on the left — number, state (`-` empty, `R` rec,
+`P` play, `D` dub, `S` stop), level, and a playhead spinner; the encoder menu
+on the right with a `>` cursor, scrolling to reach `lvl1`–`lvl4`. The header
+is the four states at a glance, the `cvmode`, and the park warning.
+
+```
+RP-S  cv1
+1R 100 |  >mast 200
+2P  80 /   qnt    1
+3-   0     grid   0
+4S 100 -   cvmd   1
+           lvl1 100
+```
+
 ## `cvmode` — what the four CV inputs do
 
 Runtime, not build-time, because both jobs are legitimate and which is right
-depends on the patch. Set it on the `GLOBAL` page, knob 4.
+depends on the patch. Set it on the menu (`cvmd`).
 
-**`cvmode 1` (default) — LEVEL.** Each CV input rides its own track's level,
-knob and CV summing as the hardware intends. Transport comes from the gate
-inputs, which is the footswitch workflow anyway.
+First the hardware fact everything else follows from: libDaisy's `DaisyPatch`
+exposes four analog controls, not eight — **each CV jack is summed with its
+knob before the ADC**, so knob N and CV N are one channel, and that channel
+belongs to track N. There are no knob pages. The first cut paged the knobs
+between track levels and the global params, and in trigger mode that was a bug
+twice over: the CV pulse that triggered a track also "moved" its knob, so the
+track's level chased the parked pot to zero; and on the GLOBAL page the same
+pulse would have hit master. The global params now live on the encoder menu.
 
-**`cvmode 0` — TRANSPORT.** Each CV input is a threshold trigger for its own
-track's record/play button, giving per-track control from a sequencer.
+**`cvmode 1` (default) — LEVEL.** Knob + CV is the track's level, summing as
+the hardware intends. Transport comes from the gate inputs, which is the
+footswitch workflow anyway. Levels are also on the menu; a menu edit holds
+until the knob next moves.
 
-The catch is hardware, and it is why this is a mode rather than the default:
-**on the Daisy Patch each CV jack is summed with its knob.** In `cvmode 0` the
-knobs must sit near zero or they hold the trigger permanently high. The display
-warns (`park N knobs`) when a knob is too high for the mode to work.
+**`cvmode 0` — TRANSPORT.** Knob + CV is a threshold trigger for the track's
+record/play button, giving per-track control from a sequencer. The knobs must
+sit near zero or they hold the trigger permanently high — the header warns
+(`park N`) when one is too high — and levels come from the menu only.
 
 ## Build configuration
 

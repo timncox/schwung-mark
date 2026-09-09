@@ -18,14 +18,15 @@
  *
  *   Audio In 1-4   track 1-4 record source          mark_process_multi
  *   Audio Out 1-4  track 1-4 playback               mark_process_multi
- *   CV In 1-4      cvmode-dependent, see below
+ *   Knob 1-4       track 1-4, plus CV In 1-4 summed in hardware:
+ *                  level in cvmode 1, record/play trigger in cvmode 0
  *   Gate In 1      all start / stop                 "all_btn"
  *   Gate In 2      undo / redo                      "undo"
  *   Gate Out       track 1 loop boundary            a rack-wide sync pulse
  *   CV Out 1/2     track 1/2 playhead position      0-5V ramp per loop
- *   Encoder turn   page
- *   Encoder press  all start / stop
- *   Knobs 1-4      the current page's four params
+ *   Encoder turn   menu cursor
+ *   Encoder push + turn   edit the selected menu item
+ *   Encoder tap    all start / stop
  *   MIDI In        CC to the engine
  *
  * The gate output and the two CV outputs are the reason to run Mark here
@@ -62,55 +63,37 @@ static uint8_t DSY_SDRAM_BSS g_pool[POOL_BYTES];
 /* ---- control surface ---------------------------------------------------- */
 
 /*
- * cvmode — which job the four CV inputs do. Runtime, not build-time, because
+ * The Patch has four knobs and four CV inputs, and libDaisy exposes them as
+ * FOUR analog controls, not eight (DaisyPatch::CTRL_LAST == 4): each CV jack
+ * is summed with its knob before the ADC, so a CV input can only ever be read
+ * together with its knob. So knob N and CV N are one channel, and that channel
+ * belongs to track N. There are no knob pages: the first cut paged the knobs
+ * between track levels and the global params, and in trigger mode that was a
+ * bug twice over -- the CV pulse that triggered a track also "moved" its knob,
+ * so the track's level chased the parked pot to zero, and on the GLOBAL page
+ * the same pulse would have hit master. The global params now live on the
+ * encoder menu, which is what the screen is for.
+ *
+ * cvmode -- which job the four channels do. Runtime, not build-time, because
  * both are legitimate and which one is right depends on the patch.
  *
- *   0  TRANSPORT.  Each CV input is a threshold trigger for its own track's
- *      record/play button. Per-track control from a sequencer. The catch is
- *      hardware: on the Patch each CV jack is SUMMED WITH ITS KNOB, so the
- *      knob has to sit near zero or it holds the trigger permanently high.
- *      The display warns when a knob is parked too high to be safe.
+ *   1  LEVEL (default).  Knob + CV is the track's level, summing as the
+ *      hardware intends. Transport comes from the gate inputs, which is the
+ *      footswitch workflow anyway. Levels are also on the menu.
  *
- *   1  LEVEL (default).  Each CV input rides its own track's level, knob and
- *      CV summing as the hardware intends. Transport comes from the gate
- *      inputs instead, which is the footswitch workflow anyway.
+ *   0  TRANSPORT.  Knob + CV is a threshold trigger for the track's
+ *      record/play button: per-track control from a sequencer. The knob has
+ *      to sit near zero or it holds the trigger permanently high, and the
+ *      display says so. Levels come from the menu only.
  */
 static int  g_cvmode = 1;
-static bool g_cv_prev[4];
+static bool g_cv_prev[MARK_TRACKS];
 
 #define CV_TRIG_ON   0.55f   /* schmitt, in normalised ADC units */
 #define CV_TRIG_OFF  0.35f
 #define CV_PARK_MAX  0.15f   /* a knob above this makes cvmode 0 unusable */
 
-enum { PG_LEVEL = 0, PG_GLOBAL, PG_COUNT };
-static const char *const PAGE_NAME[PG_COUNT] = { "LEVEL", "GLOBAL" };
-static int g_page;
-
-/* Page 1 params, in knob order. */
-struct GParam { const char *key; const char *label; int lo, hi; };
-static const GParam GPARAM[4] = {
-    { "master",   "mast", 0, 200 },
-    { "quantize", "qnt",  0, 1   },
-    { "rec_grid", "grid", 0, 3   },
-    { NULL,       "cvmd", 0, 1   },   /* cvmode is shim-side, not an engine param */
-};
-
-/* Knob pickup: absolute pots across pages, same reasoning as the Belt and
- * Smack ports. A knob is inert until it crosses the value it takes over. */
-static bool  g_live[4];
-static float g_knob_at[4];
-static int   g_last[4];
-#define PICKUP_SLOP 0.02f
-
-static void page_reset(void)
-{
-    for(int k = 0; k < 4; k++)
-    {
-        g_live[k]    = false;
-        g_knob_at[k] = hw.GetKnobValue((DaisyPatch::Ctrl)k);
-        g_last[k]    = -32768;
-    }
-}
+static int g_last_level[MARK_TRACKS];   /* last level dispatched; -32768 = never */
 
 /* ---- engine helpers ----------------------------------------------------- */
 
@@ -128,6 +111,13 @@ static int get_csv_int(const char *key, int idx)
     return atoi(p);
 }
 
+static int get_int(const char *key)
+{
+    char buf[16];
+    if(mark_get_param(M, key, buf, sizeof(buf)) < 0) return 0;
+    return atoi(buf);
+}
+
 static void set_int(const char *key, int v)
 {
     char b[16];
@@ -135,9 +125,144 @@ static void set_int(const char *key, int v)
     mark_set_param(M, key, b);
 }
 
+static int clampi(int v, int lo, int hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
 static void track_key(char *out, size_t n, int track, const char *suffix)
 {
-    snprintf(out, n, "t%d_%s", track + 1, suffix);
+    /* Clamped so the track number is one digit and the 16-byte key buffers
+     * at the call sites provably fit (-Wformat-truncation). */
+    snprintf(out, n, "t%d_%s", clampi(track, 0, 8) + 1, suffix);
+}
+
+/* ---- encoder menu ------------------------------------------------------- */
+
+/*
+ * Turn selects, push-and-turn edits. Values are read back from the engine for
+ * display rather than mirrored here, so a MIDI CC or a state restore shows up
+ * without bookkeeping. cvmode is the one shim-side item.
+ *
+ * Four global items, then one level per track. In cvmode 1 a level edited
+ * here holds until its knob next moves (last touched wins); in cvmode 0 the
+ * menu is the only level control.
+ */
+#define M_GLOBALS 4
+#define M_COUNT   (M_GLOBALS + MARK_TRACKS)
+#define M_VISIBLE 5
+
+static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd" };
+static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL };
+static const int         GLOBAL_LO[M_GLOBALS]    = { 0, 0, 0, 0 };
+static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1 };
+
+static int g_menu_sel;
+static int g_menu_top;   /* first visible item */
+
+static void menu_label(int item, char *out, size_t n)
+{
+    if(item < M_GLOBALS) snprintf(out, n, "%s", GLOBAL_LABEL[item]);
+    else                 snprintf(out, n, "lvl%d", item - M_GLOBALS + 1);
+}
+
+static int menu_get(int item)
+{
+    if(item < M_GLOBALS)
+        return GLOBAL_KEY[item] ? get_int(GLOBAL_KEY[item]) : g_cvmode;
+    char key[16];
+    track_key(key, sizeof(key), item - M_GLOBALS, "level");
+    return get_int(key);
+}
+
+static void menu_edit(int inc)
+{
+    int item = g_menu_sel;
+    if(item < M_GLOBALS)
+    {
+        int v = clampi(menu_get(item) + inc, GLOBAL_LO[item], GLOBAL_HI[item]);
+        if(GLOBAL_KEY[item]) set_int(GLOBAL_KEY[item], v);
+        else                 g_cvmode = v;
+    }
+    else
+    {
+        int  t = item - M_GLOBALS;
+        char key[16];
+        track_key(key, sizeof(key), t, "level");
+        int v = clampi(menu_get(item) + inc, 0, 200);
+        set_int(key, v);
+        g_last_level[t] = v;   /* the knob re-takes only when it moves */
+    }
+}
+
+static bool enc_down;
+static bool enc_turned;
+
+/* Encoder tap fires all start/stop on RELEASE, not on press -- a press that
+ * turns is a menu edit and must not also toggle the transport. That costs a
+ * plain tap the time between press and release; Gate In 1 is the tight
+ * transport input, and quantized starts land on the grid regardless. */
+static void encoder(void)
+{
+    if(hw.encoder.RisingEdge())
+    {
+        enc_down   = true;
+        enc_turned = false;
+    }
+
+    int inc = hw.encoder.Increment();
+    if(inc)
+    {
+        if(enc_down && hw.encoder.Pressed())
+        {
+            menu_edit(inc);
+            enc_turned = true;
+        }
+        else
+        {
+            g_menu_sel = clampi(g_menu_sel + inc, 0, M_COUNT - 1);
+            if(g_menu_sel < g_menu_top)               g_menu_top = g_menu_sel;
+            if(g_menu_sel >= g_menu_top + M_VISIBLE)  g_menu_top = g_menu_sel - M_VISIBLE + 1;
+        }
+    }
+
+    if(enc_down && !hw.encoder.Pressed())
+    {
+        enc_down = false;
+        if(!enc_turned) mark_set_param(M, "all_btn", "1");
+    }
+}
+
+/* ---- knobs + CV inputs -------------------------------------------------- */
+
+static void dispatch_channels(void)
+{
+    for(int k = 0; k < MARK_TRACKS; k++)
+    {
+        float norm = hw.GetKnobValue((DaisyPatch::Ctrl)k);
+        if(norm < 0.0f) norm = 0.0f;
+        if(norm > 1.0f) norm = 1.0f;
+
+        if(g_cvmode == 0)
+        {
+            bool on = g_cv_prev[k] ? (norm > CV_TRIG_OFF) : (norm > CV_TRIG_ON);
+            if(on && !g_cv_prev[k])
+            {
+                char key[16];
+                track_key(key, sizeof(key), k, "btn");
+                mark_set_param(M, key, "1");
+            }
+            g_cv_prev[k] = on;
+            continue;   /* levels are menu-only in this mode */
+        }
+
+        int v = (int)(norm * 200.0f + 0.5f);
+        if(v == g_last_level[k]) continue;
+        g_last_level[k] = v;
+        char key[16];
+        track_key(key, sizeof(key), k, "level");
+        set_int(key, v);
+    }
 }
 
 /* ---- audio -------------------------------------------------------------- */
@@ -206,73 +331,68 @@ static void update_cv_outs(void)
 
 /* ---- display ------------------------------------------------------------ */
 
+/*
+ * 128x64, Font_6x8: 21 columns, rows at y = 0, 16, 26, 36, 46, 56.
+ *
+ *   RP-S  cv1            <- the four track states, cvmode, park warning
+ *   1R 100 |  >mast 200  <- tracks on the left: state, level, playhead
+ *   2P  80 /   qnt    1     menu on the right, '>' is the cursor,
+ *   3-   0 |   grid   0     scrolls to show lvl1-4
+ *   4S 100 -   cvmd   1
+ *              lvl1 100
+ */
 static const char *STATE_CH = "-RPDS";   /* EMPTY REC PLAY DUB STOP */
+static const char *SPIN_CH  = "|/-\\";
+#define MENU_X 66
 
 static void draw(void)
 {
-    char line[32];
+    char line[32], label[8];
     hw.display.Fill(false);
 
-    /* Header: page, the four track states at a glance, cvmode. */
-    char st[8];
+    char st[MARK_TRACKS + 1];
     for(int t = 0; t < MARK_TRACKS; t++)
     {
         int s = get_csv_int("tstates", t);
         st[t] = (s >= 0 && s <= 4) ? STATE_CH[s] : '?';
     }
     st[MARK_TRACKS] = '\0';
-    snprintf(line, sizeof(line), "%-6s %s  cv%d", PAGE_NAME[g_page], st, g_cvmode);
-    hw.display.SetCursor(0, 0);
-    hw.display.WriteString(line, Font_6x8, true);
-
-    if(g_page == PG_LEVEL)
-    {
-        for(int t = 0; t < MARK_TRACKS; t++)
-        {
-            char key[16], val[16];
-            track_key(key, sizeof(key), t, "level");
-            if(mark_get_param(M, key, val, sizeof(val)) < 0) strcpy(val, "?");
-            snprintf(line, sizeof(line), "t%d %-4s%s", t + 1, val,
-                     g_live[t] ? "" : " *");
-            hw.display.SetCursor(0, 16 + t * 10);
-            hw.display.WriteString(line, Font_6x8, true);
-        }
-    }
-    else
-    {
-        for(int k = 0; k < 4; k++)
-        {
-            char val[16];
-            if(GPARAM[k].key)
-            {
-                if(mark_get_param(M, GPARAM[k].key, val, sizeof(val)) < 0)
-                    strcpy(val, "?");
-            }
-            else
-            {
-                snprintf(val, sizeof(val), "%d", g_cvmode);
-            }
-            snprintf(line, sizeof(line), "%-4s %-4s%s", GPARAM[k].label, val,
-                     g_live[k] ? "" : " *");
-            hw.display.SetCursor(0, 16 + k * 10);
-            hw.display.WriteString(line, Font_6x8, true);
-        }
-    }
 
     /* cvmode 0 only works with the knobs parked, because each CV jack sums
      * with its knob in hardware. Say so rather than let it misbehave. */
+    int parked_high = 0;
     if(g_cvmode == 0)
+        for(int k = 0; k < MARK_TRACKS; k++)
+            if(hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_PARK_MAX) parked_high++;
+
+    if(parked_high)
+        snprintf(line, sizeof(line), "%s  cv%d  park %d", st, g_cvmode, parked_high);
+    else
+        snprintf(line, sizeof(line), "%s  cv%d", st, g_cvmode);
+    hw.display.SetCursor(0, 0);
+    hw.display.WriteString(line, Font_6x8, true);
+
+    for(int t = 0; t < MARK_TRACKS && t < 4; t++)
     {
-        int bad = 0;
-        for(int k = 0; k < 4; k++)
-            if(hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_PARK_MAX) bad++;
-        if(bad)
-        {
-            snprintf(line, sizeof(line), "park %d knob%s", bad,
-                     bad > 1 ? "s" : "");
-            hw.display.SetCursor(64, 0);
-            hw.display.WriteString(line, Font_6x8, true);
-        }
+        char key[16];
+        track_key(key, sizeof(key), t, "level");
+        int pos = get_csv_int("tpos", t);
+        if(pos < 0) pos = 0;
+        snprintf(line, sizeof(line), "%d%c %3d %c", t + 1, st[t], get_int(key),
+                 st[t] == '-' ? ' ' : SPIN_CH[(pos * 4) / 128]);
+        hw.display.SetCursor(0, 16 + t * 10);
+        hw.display.WriteString(line, Font_6x8, true);
+    }
+
+    for(int row = 0; row < M_VISIBLE; row++)
+    {
+        int item = g_menu_top + row;
+        if(item >= M_COUNT) break;
+        menu_label(item, label, sizeof(label));
+        snprintf(line, sizeof(line), "%c%-4s %3d",
+                 item == g_menu_sel ? '>' : ' ', label, menu_get(item));
+        hw.display.SetCursor(MENU_X, 16 + row * 10);
+        hw.display.WriteString(line, Font_6x8, true);
     }
 
     hw.display.Update();
@@ -309,96 +429,25 @@ int main(void)
         for(;;) {}
     }
 
-    for(int t = 0; t < MARK_TRACKS; t++) { tinp[t] = tin[t]; toutp[t] = tout[t]; }
+    for(int t = 0; t < MARK_TRACKS; t++)
+    {
+        tinp[t]         = tin[t];
+        toutp[t]        = tout[t];
+        g_last_level[t] = -32768;
+    }
 
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
     hw.midi.StartReceive();
 
-    page_reset();
     uint32_t last_draw = System::GetNow();
 
     for(;;)
     {
         hw.ProcessAllControls();
 
-        int inc = hw.encoder.Increment();
-        if(inc)
-        {
-            g_page += inc;
-            while(g_page < 0)        g_page += PG_COUNT;
-            while(g_page >= PG_COUNT) g_page -= PG_COUNT;
-            page_reset();
-        }
-        if(hw.encoder.RisingEdge()) mark_set_param(M, "all_btn", "1");
-
-        /* Knobs, with pickup. */
-        for(int k = 0; k < 4; k++)
-        {
-            float norm = hw.GetKnobValue((DaisyPatch::Ctrl)k);
-            int   lo, hi;
-            if(g_page == PG_LEVEL) { lo = 0; hi = 200; }
-            else                   { lo = GPARAM[k].lo; hi = GPARAM[k].hi; }
-
-            int v = lo + (int)(norm * (float)(hi - lo) + 0.5f);
-            if(v < lo) v = lo;
-            if(v > hi) v = hi;
-
-            if(!g_live[k])
-            {
-                if(g_last[k] == -32768)
-                {
-                    if(fabsf(norm - g_knob_at[k]) > PICKUP_SLOP) g_live[k] = true;
-                }
-                else
-                {
-                    float at = (float)(g_last[k] - lo) / (float)(hi - lo);
-                    if((g_knob_at[k] <= at && norm >= at)
-                       || (g_knob_at[k] >= at && norm <= at))
-                        g_live[k] = true;
-                }
-                g_knob_at[k] = norm;
-                if(!g_live[k]) continue;
-            }
-            g_knob_at[k] = norm;
-            if(v == g_last[k]) continue;
-            g_last[k] = v;
-
-            if(g_page == PG_LEVEL)
-            {
-                char key[16];
-                track_key(key, sizeof(key), k, "level");
-                set_int(key, v);
-            }
-            else if(GPARAM[k].key)
-            {
-                set_int(GPARAM[k].key, v);
-            }
-            else
-            {
-                g_cvmode = v;
-            }
-        }
-
-        /* CV inputs, per cvmode. NOTE these read the same ADCs as the knobs —
-         * the Patch sums jack and pot in hardware — which is exactly why
-         * cvmode 0 needs the knobs parked. */
-        for(int k = 0; k < 4 && k < MARK_TRACKS; k++)
-        {
-            float cv = hw.GetKnobValue((DaisyPatch::Ctrl)k);
-            if(g_cvmode == 0)
-            {
-                bool on = g_cv_prev[k] ? (cv > CV_TRIG_OFF) : (cv > CV_TRIG_ON);
-                if(on && !g_cv_prev[k])
-                {
-                    char key[16];
-                    track_key(key, sizeof(key), k, "btn");
-                    mark_set_param(M, key, "1");
-                }
-                g_cv_prev[k] = on;
-            }
-            /* cvmode 1: the knob loop above already sent it as level. */
-        }
+        encoder();
+        dispatch_channels();
 
         /* Gates: global transport, so a footswitch works in either cvmode. */
         if(hw.gate_input[0].Trig()) mark_set_param(M, "all_btn", "1");
