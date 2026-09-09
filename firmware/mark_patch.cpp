@@ -20,14 +20,15 @@
  *   Audio Out 1-4  track 1-4 playback               mark_process_multi
  *   Knob 1-4       track 1-4, plus CV In 1-4 summed in hardware:
  *                  level in cvmode 1, record/play trigger in cvmode 0
- *   Gate In 1      all start / stop                 "all_btn"
- *   Gate In 2      undo / redo                      "undo"
+ *   Gate In 1      clock                            see "clock in" below
+ *   Gate In 2      all start / stop                 "all_btn"
  *   Gate Out       track 1 loop boundary            a rack-wide sync pulse
  *   CV Out 1/2     track 1/2 playhead position      0-5V ramp per loop
  *   Encoder turn   menu cursor
  *   Encoder push + turn   edit the selected menu item
  *   Encoder tap    all start / stop
- *   MIDI In        CC to the engine
+ *   Encoder hold   undo / redo
+ *   MIDI In        clock, and CC to the engine
  *
  * The gate output and the two CV outputs are the reason to run Mark here
  * rather than on the Move: a looper that emits its own loop-boundary trigger
@@ -39,6 +40,7 @@
 extern "C" {
 #include "vendor/mark_core.h"
 #include "vendor/plugin_api_v1.h"
+#include "clock_adapter.h"
 }
 
 #include <stdio.h>
@@ -47,9 +49,10 @@ extern "C" {
 
 using namespace daisy;
 
-static DaisyPatch    hw;
-static mark_t       *M;
-static host_api_v1_t HOST;
+static DaisyPatch      hw;
+static mark_t         *M;
+static host_api_v1_t   HOST;
+static clock_adapter_t CLK;
 
 #define BLOCK_SIZE 128
 
@@ -59,6 +62,86 @@ static host_api_v1_t HOST;
  * its own alloc_seconds ladder if even that does not fit. */
 #define POOL_BYTES (32u * 1024u * 1024u)
 static uint8_t DSY_SDRAM_BSS g_pool[POOL_BYTES];
+
+/* ---- clock in ----------------------------------------------------------- */
+
+/*
+ * Mark quantizes record start and stop to a measure grid, and before any loop
+ * exists the grid comes from the tempo. On the Move that tempo came from the
+ * host; here the host stub has none, so the engine assumes 120 BPM and the
+ * first loop would snap to 2.0 s bars regardless of what was played. A clock
+ * fixes that at the source: with one running, every start and stop lands on
+ * the rack's bar line -- the RC-505-with-MIDI-sync behaviour Mark was
+ * modelled on. (Mark plays at fixed speed: the clock sets the grid at record
+ * time; it does not stretch loops if the tempo changes afterwards.)
+ *
+ * Two sources, one owner at a time:
+ *
+ *   Gate In 1   through smack-versio's clock adapter, which turns gate edges
+ *               into the 24 ppqn MIDI clock the engine already speaks. Ratio
+ *               and mode are on the menu as on Smack; INF mode is tap tempo
+ *               from a footswitch.
+ *   MIDI In     TRS MIDI clock, forwarded as-is.
+ *
+ * The gate owns the engine while it is locked; otherwise MIDI clock, if any
+ * is arriving; otherwise nothing. Changing owner sends the engine 0xFA (new
+ * downbeat) or 0xFC (clock gone), so it never quantizes against a clock that
+ * has stopped. The adapter free-runs at 120 when unpatched; those ticks are
+ * dropped rather than fed to the engine as a phantom clock.
+ *
+ * Realtime bytes reach the engine only from the audio callback: the adapter
+ * emits there, and everything the main loop wants to send is queued and
+ * drained there, so tick counting is never interleaved across threads.
+ */
+enum { SRC_NONE = 0, SRC_GATE, SRC_MIDI };
+static volatile int      g_clk_src = SRC_NONE;
+static volatile bool     g_gate_edge;          /* main -> audio: a gate 1 rising edge */
+static uint32_t          g_midi_tick_last;     /* GetNow() of the last TRS clock tick */
+static bool              g_midi_seen;
+#define MIDI_CLOCK_TIMEOUT_MS 2000u            /* same idle bound the adapter uses */
+
+#define RT_QUEUE 32
+static volatile uint8_t  g_rt_q[RT_QUEUE];
+static volatile uint32_t g_rt_head, g_rt_tail;
+
+static void rt_push(uint8_t b)                 /* main thread */
+{
+    uint32_t h = g_rt_head;
+    if(((h + 1) % RT_QUEUE) == g_rt_tail) return;   /* full: drop */
+    g_rt_q[h]  = b;
+    g_rt_head  = (h + 1) % RT_QUEUE;
+}
+
+static void rt_drain(void)                     /* audio thread */
+{
+    while(g_rt_tail != g_rt_head)
+    {
+        uint8_t b = g_rt_q[g_rt_tail];
+        g_rt_tail = (g_rt_tail + 1) % RT_QUEUE;
+        mark_on_midi(M, &b, 1, 3);             /* source 3 = host, as on Move */
+    }
+}
+
+static void emit_gate_clock(void *ctx, uint8_t byte)   /* audio thread */
+{
+    if(g_clk_src != SRC_GATE) return;
+    /* The adapter's own 0xFA fires on its first edge, before it is locked and
+     * before this source owns the engine; the owner switch sends its own. */
+    if(byte == 0xFA) return;
+    mark_on_midi((mark_t *)ctx, &byte, 1, 3);
+}
+
+static void update_clock_source(uint32_t now)  /* main thread */
+{
+    int want = SRC_NONE;
+    if(clk_locked(&CLK))
+        want = SRC_GATE;
+    else if(g_midi_seen && now - g_midi_tick_last < MIDI_CLOCK_TIMEOUT_MS)
+        want = SRC_MIDI;
+    if(want == g_clk_src) return;
+    g_clk_src = want;
+    rt_push(want == SRC_NONE ? 0xFC : 0xFA);
+}
 
 /* ---- control surface ---------------------------------------------------- */
 
@@ -93,7 +176,7 @@ static bool g_cv_prev[MARK_TRACKS];
 #define CV_TRIG_OFF  0.35f
 #define CV_PARK_MAX  0.15f   /* a knob above this makes cvmode 0 unusable */
 
-static int g_last_level[MARK_TRACKS];   /* last level dispatched; -32768 = never */
+static int g_last_level[MARK_TRACKS];   /* last KNOB reading dispatched; -32768 = never */
 
 /* ---- engine helpers ----------------------------------------------------- */
 
@@ -140,25 +223,39 @@ static void track_key(char *out, size_t n, int track, const char *suffix)
 /* ---- encoder menu ------------------------------------------------------- */
 
 /*
- * Turn selects, push-and-turn edits. Values are read back from the engine for
- * display rather than mirrored here, so a MIDI CC or a state restore shows up
- * without bookkeeping. cvmode is the one shim-side item.
+ * Turn selects, push-and-turn edits. Engine values are read back from the
+ * engine for display rather than mirrored here, so a MIDI CC or a state
+ * restore shows up without bookkeeping. cvmode, clock ratio and clock mode
+ * are shim-side.
  *
- * Four global items, then one level per track. In cvmode 1 a level edited
+ * Six global items, then one level per track. In cvmode 1 a level edited
  * here holds until its knob next moves (last touched wins); in cvmode 0 the
  * menu is the only level control.
  */
-#define M_GLOBALS 4
+enum { MI_MASTER = 0, MI_QNT, MI_GRID, MI_CVMODE, MI_RATIO, MI_CLKMODE, M_GLOBALS };
 #define M_COUNT   (M_GLOBALS + MARK_TRACKS)
 #define M_VISIBLE 5
 
-static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd" };
-static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL };
-static const int         GLOBAL_LO[M_GLOBALS]    = { 0, 0, 0, 0 };
-static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1 };
+static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd", "rat", "clk" };
+static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL, NULL, NULL };
+static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1, 2, 2 };
+
+static int g_ratio_sel = 1, g_mode_sel = 2;
+static const char *const RATIO_NAME[3] = { "/2", "=1", "x2" };
+static const char *const MODE_NAME[3]  = { "EXT", "INF", "AUTO" };
 
 static int g_menu_sel;
 static int g_menu_top;   /* first visible item */
+
+static void apply_clock(void)
+{
+    clk_set_ratio(&CLK, g_ratio_sel == 0 ? CLK_TICKS_DIV2
+                      : g_ratio_sel == 2 ? CLK_TICKS_2X
+                                         : CLK_TICKS_1X);
+    clk_set_mode(&CLK, g_mode_sel == 0 ? CLK_EXTERNAL
+                     : g_mode_sel == 1 ? CLK_INFER
+                                       : CLK_AUTO);
+}
 
 static void menu_label(int item, char *out, size_t n)
 {
@@ -168,11 +265,24 @@ static void menu_label(int item, char *out, size_t n)
 
 static int menu_get(int item)
 {
-    if(item < M_GLOBALS)
-        return GLOBAL_KEY[item] ? get_int(GLOBAL_KEY[item]) : g_cvmode;
+    switch(item)
+    {
+        case MI_CVMODE:  return g_cvmode;
+        case MI_RATIO:   return g_ratio_sel;
+        case MI_CLKMODE: return g_mode_sel;
+        default: break;
+    }
+    if(item < M_GLOBALS) return get_int(GLOBAL_KEY[item]);
     char key[16];
     track_key(key, sizeof(key), item - M_GLOBALS, "level");
     return get_int(key);
+}
+
+static void menu_value(int item, char *out, size_t n)
+{
+    if(item == MI_RATIO)        snprintf(out, n, "%s", RATIO_NAME[g_ratio_sel]);
+    else if(item == MI_CLKMODE) snprintf(out, n, "%s", MODE_NAME[g_mode_sel]);
+    else                        snprintf(out, n, "%d", menu_get(item));
 }
 
 static void menu_edit(int inc)
@@ -180,20 +290,22 @@ static void menu_edit(int inc)
     int item = g_menu_sel;
     if(item < M_GLOBALS)
     {
-        int v = clampi(menu_get(item) + inc, GLOBAL_LO[item], GLOBAL_HI[item]);
-        if(GLOBAL_KEY[item])
+        int v = clampi(menu_get(item) + inc, 0, GLOBAL_HI[item]);
+        switch(item)
         {
-            set_int(GLOBAL_KEY[item], v);
-        }
-        else
-        {
-            g_cvmode = v;
-            /* Entering trigger mode: seed the schmitt state from where the
-             * channels already sit, or every knob above the threshold would
-             * read as a rising edge on the next pass and arm its track. */
-            if(v == 0)
-                for(int k = 0; k < MARK_TRACKS; k++)
-                    g_cv_prev[k] = hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_TRIG_ON;
+            case MI_CVMODE:
+                g_cvmode = v;
+                /* Entering trigger mode: seed the schmitt state from where
+                 * the channels already sit, or every knob above the threshold
+                 * would read as a rising edge on the next pass and arm its
+                 * track. */
+                if(v == 0)
+                    for(int k = 0; k < MARK_TRACKS; k++)
+                        g_cv_prev[k] = hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_TRIG_ON;
+                break;
+            case MI_RATIO:   g_ratio_sel = v; apply_clock(); break;
+            case MI_CLKMODE: g_mode_sel  = v; apply_clock(); break;
+            default:         set_int(GLOBAL_KEY[item], v); break;
         }
     }
     else
@@ -208,19 +320,24 @@ static void menu_edit(int inc)
     }
 }
 
+/* Tap = all start/stop, on RELEASE: a press that turns is a menu edit and
+ * must not also toggle the transport. That costs a plain tap the time between
+ * press and release; Gate In 2 is the tight transport input, and quantized
+ * starts land on the grid regardless. Hold = undo/redo, firing at the
+ * threshold the way the RC-505's held button does; that press is then spent. */
+#define HOLD_UNDO_MS 600u
+
 static bool enc_down;
 static bool enc_turned;
+static bool enc_held;
 
-/* Encoder tap fires all start/stop on RELEASE, not on press -- a press that
- * turns is a menu edit and must not also toggle the transport. That costs a
- * plain tap the time between press and release; Gate In 1 is the tight
- * transport input, and quantized starts land on the grid regardless. */
 static void encoder(void)
 {
     if(hw.encoder.RisingEdge())
     {
         enc_down   = true;
         enc_turned = false;
+        enc_held   = false;
     }
 
     int inc = hw.encoder.Increment();
@@ -239,10 +356,17 @@ static void encoder(void)
         }
     }
 
+    if(enc_down && !enc_turned && !enc_held && hw.encoder.Pressed()
+       && (uint32_t)hw.encoder.TimeHeldMs() > HOLD_UNDO_MS)
+    {
+        mark_set_param(M, "undo", "1");
+        enc_held = true;
+    }
+
     if(enc_down && !hw.encoder.Pressed())
     {
         enc_down = false;
-        if(!enc_turned) mark_set_param(M, "all_btn", "1");
+        if(!enc_turned && !enc_held) mark_set_param(M, "all_btn", "1");
     }
 }
 
@@ -290,6 +414,18 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
                           size_t                    size)
 {
     const size_t n = size < BLOCK_SIZE ? size : BLOCK_SIZE;
+
+    /* Clock first, so this block's ticks precede this block's audio, the
+     * order the Move host delivers them in. The gate edge is polled in the
+     * main loop (fast enough to catch a 1 ms trigger, which block rate is
+     * not) and handed over here so the adapter runs on one thread. */
+    rt_drain();
+    if(g_gate_edge)
+    {
+        g_gate_edge = false;
+        clk_gate_edge(&CLK);
+    }
+    clk_advance(&CLK, (int)n, emit_gate_clock, M);
 
     for(int t = 0; t < MARK_TRACKS; t++)
         for(size_t i = 0; i < n; i++)
@@ -347,12 +483,12 @@ static void update_cv_outs(void)
 /*
  * 128x64, Font_6x8: 21 columns, rows at y = 0, 16, 26, 36, 46, 56.
  *
- *   RP-S  cv1            <- the four track states, cvmode, park warning
- *   1R 100 |  >mast 200  <- tracks on the left: state, level, playhead
- *   2P  80 /   qnt    1     menu on the right, '>' is the cursor,
- *   3-   0 |   grid   0     scrolls to show lvl1-4
- *   4S 100 -   cvmd   1
- *              lvl1 100
+ *   RP-S cv1 G120        <- track states, cvmode, clock source (G = gate at
+ *   1R 100 |  >mast 200     that BPM, MIDI, free), park warning
+ *   2P  80 /   qnt    1  <- tracks on the left: state, level, playhead
+ *   3-   0     grid   0     menu on the right, '>' is the cursor,
+ *   4S 100 -   cvmd   1     scrolls to reach rat, clk and lvl1-4
+ *              rat   =1
  */
 static const char *STATE_CH = "-RPDS";   /* EMPTY REC PLAY DUB STOP */
 static const char *SPIN_CH  = "|/-\\";
@@ -360,7 +496,7 @@ static const char *SPIN_CH  = "|/-\\";
 
 static void draw(void)
 {
-    char line[32], label[8];
+    char line[32], label[8], val[8], clk[8];
     hw.display.Fill(false);
 
     char st[MARK_TRACKS + 1];
@@ -371,6 +507,11 @@ static void draw(void)
     }
     st[MARK_TRACKS] = '\0';
 
+    if(g_clk_src == SRC_GATE)
+        snprintf(clk, sizeof(clk), "G%d", (int)(clk_bpm(&CLK) + 0.5f));
+    else
+        snprintf(clk, sizeof(clk), "%s", g_clk_src == SRC_MIDI ? "MIDI" : "free");
+
     /* cvmode 0 only works with the knobs parked, because each CV jack sums
      * with its knob in hardware. Say so rather than let it misbehave. */
     int parked_high = 0;
@@ -379,9 +520,9 @@ static void draw(void)
             if(hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_PARK_MAX) parked_high++;
 
     if(parked_high)
-        snprintf(line, sizeof(line), "%s  cv%d  park %d", st, g_cvmode, parked_high);
+        snprintf(line, sizeof(line), "%s cv%d %s park%d", st, g_cvmode, clk, parked_high);
     else
-        snprintf(line, sizeof(line), "%s  cv%d", st, g_cvmode);
+        snprintf(line, sizeof(line), "%s cv%d %s", st, g_cvmode, clk);
     hw.display.SetCursor(0, 0);
     hw.display.WriteString(line, Font_6x8, true);
 
@@ -402,8 +543,9 @@ static void draw(void)
         int item = g_menu_top + row;
         if(item >= M_COUNT) break;
         menu_label(item, label, sizeof(label));
-        snprintf(line, sizeof(line), "%c%-4s %3d",
-                 item == g_menu_sel ? '>' : ' ', label, menu_get(item));
+        menu_value(item, val, sizeof(val));
+        snprintf(line, sizeof(line), "%c%-4s %4s",
+                 item == g_menu_sel ? '>' : ' ', label, val);
         hw.display.SetCursor(MENU_X, 16 + row * 10);
         hw.display.WriteString(line, Font_6x8, true);
     }
@@ -449,6 +591,9 @@ int main(void)
         g_last_level[t] = -32768;
     }
 
+    clk_init(&CLK, MARK_SR, 120.0f);
+    apply_clock();
+
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
     hw.midi.StartReceive();
@@ -458,13 +603,15 @@ int main(void)
     for(;;)
     {
         hw.ProcessAllControls();
+        uint32_t now = System::GetNow();
 
         encoder();
         dispatch_channels();
 
-        /* Gates: global transport, so a footswitch works in either cvmode. */
-        if(hw.gate_input[0].Trig()) mark_set_param(M, "all_btn", "1");
-        if(hw.gate_input[1].Trig()) mark_set_param(M, "undo", "1");
+        /* Gate 1 is the clock; the edge is handed to the audio thread. Gate 2
+         * is global transport, so a footswitch works in either cvmode. */
+        if(hw.gate_input[0].Trig()) g_gate_edge = true;
+        if(hw.gate_input[1].Trig()) mark_set_param(M, "all_btn", "1");
 
         hw.midi.Listen();
         while(hw.midi.HasEvents())
@@ -477,11 +624,25 @@ int main(void)
                                    (uint8_t)ev.data[1] };
                 mark_on_midi(M, msg, 3, MOVE_MIDI_SOURCE_EXTERNAL);
             }
+            else if(ev.type == SystemRealTime)
+            {
+                uint8_t b = (uint8_t)(0xF8 + (uint8_t)ev.srt_type);
+                if(ev.srt_type == TimingClock)
+                {
+                    g_midi_tick_last = now;
+                    g_midi_seen      = true;
+                }
+                /* Forwarded only while MIDI owns the engine; the owner switch
+                 * below sends its own 0xFA/0xFC around that. */
+                if(g_clk_src == SRC_MIDI
+                   && (b == 0xF8 || b == 0xFA || b == 0xFB || b == 0xFC))
+                    rt_push(b);
+            }
         }
 
+        update_clock_source(now);
         update_cv_outs();
 
-        uint32_t now = System::GetNow();
         if(now - last_draw >= 50u)
         {
             draw();

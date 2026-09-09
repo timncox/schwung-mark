@@ -31,14 +31,15 @@ bootloader install, no QSPI write.
 | Audio In 1–4 | Track 1–4 record source |
 | Audio Out 1–4 | Track 1–4 playback |
 | **Knob 1–4 + CV In 1–4** | Track 1–4: level in `cvmode 1`, record/play trigger in `cvmode 0`. Knob and jack are one channel — see below |
-| Gate In 1 | All start / stop |
-| Gate In 2 | Undo / redo |
+| **Gate In 1** | **Clock** — see below |
+| Gate In 2 | All start / stop |
 | **Gate Out** | **Track 1 loop boundary** |
 | **CV Out 1 / 2** | **Track 1 / 2 playhead, 0–5 V ramp per loop** |
-| Encoder turn | Menu cursor: `mast` / `qnt` / `grid` / `cvmd` / `lvl1`–`lvl4` |
+| Encoder turn | Menu cursor: `mast` / `qnt` / `grid` / `cvmd` / `rat` / `clk` / `lvl1`–`lvl4` |
 | **Encoder push + turn** | Edit the selected menu item |
-| Encoder tap | All start / stop — fires on release, so a push-and-turn is never a transport toggle; Gate In 1 is the tight one |
-| MIDI In | CC to the engine |
+| Encoder tap | All start / stop — fires on release, so a push-and-turn is never a transport toggle; Gate In 2 is the tight one |
+| Encoder hold > 0.6 s | Undo / redo |
+| MIDI In | Clock, and CC to the engine |
 
 The gate output and CV outputs are the reason to run Mark here rather than on
 the Move. A looper that emits its own loop-boundary trigger and playhead ramps
@@ -49,17 +50,54 @@ which no amount of dividing a master clock will give you.
 
 128×64, `Font_6x8`. Tracks on the left — number, state (`-` empty, `R` rec,
 `P` play, `D` dub, `S` stop), level, and a playhead spinner; the encoder menu
-on the right with a `>` cursor, scrolling to reach `lvl1`–`lvl4`. The header
-is the four states at a glance, the `cvmode`, and the park warning.
+on the right with a `>` cursor, scrolling to reach `rat`, `clk` and
+`lvl1`–`lvl4`. The header is the four states at a glance, the `cvmode`, the
+clock source (`G120` = gate at that tempo, `MIDI`, `free`), and the park
+warning.
 
 ```
-RP-S  cv1
+RP-S cv1 G120
 1R 100 |  >mast 200
 2P  80 /   qnt    1
 3-   0     grid   0
 4S 100 -   cvmd   1
-           lvl1 100
+           rat   =1
 ```
+
+## Clock in
+
+Mark quantizes record start and stop to a measure grid, and before any loop
+exists the grid comes from the tempo. On the Move that tempo came from the
+host. Here the host stub has none, so the engine would assume 120 BPM and,
+with quantize on and the grid at a whole bar (both defaults), the first loop
+would snap to a multiple of 2.0 s regardless of what was played. Later loops
+quantize to the first, so only the first is affected — but it sets the length
+of everything else.
+
+A clock fixes that at the source. With one running, every start and stop
+lands on the rack's bar line: the RC-505-with-MIDI-sync behaviour Mark was
+modelled on. Mark plays at fixed speed, so the clock sets the grid at record
+time; it does not stretch loops if the tempo changes afterwards.
+
+Two sources, one owner at a time:
+
+| Source | How |
+|---|---|
+| **Gate In 1** | smack-versio's clock adapter turns gate edges into the 24 ppqn MIDI clock the engine already speaks. `rat` is what a pulse is worth: `/2` half note, `=1` quarter, `x2` eighth. `clk` is `EXT` (pulses are a clock), `INF` (tap tempo: pulse spacing sets the tempo, footswitchable) or `AUTO` (a steady train counts as `EXT`, anything else as `INF`) |
+| **MIDI In** | TRS MIDI clock, forwarded as-is |
+
+The gate owns the engine while it is locked; otherwise MIDI clock if any is
+arriving; otherwise nothing, and the header says which. Changing owner sends
+the engine a start (new downbeat) or a stop (clock gone), so it never
+quantizes against a clock that has stopped. The adapter free-runs at 120 BPM
+when unpatched; those ticks are dropped rather than fed to the engine as a
+phantom clock.
+
+With nothing patched the first loop is free-length and anchors the grid for
+the rest — the engine rounds a record stop only against a real rhythm
+reference (a synced track, a session grid, a running clock, a host tempo or
+a tempo override), and on bare metal with none of those there is nothing
+honest to round to.
 
 ## `cvmode` — what the four CV inputs do
 

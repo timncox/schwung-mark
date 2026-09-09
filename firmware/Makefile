@@ -43,7 +43,11 @@ CPP_SOURCES = mark_patch.cpp
 # mark_core_patch.c #includes vendor/mark_core.c with calloc/free redirected
 # to the SDRAM pool. Never list vendor/mark_core.c here as well — that would
 # define every engine symbol twice.
-C_SOURCES = patch_alloc.c mark_core_patch.c
+#
+# clock_adapter.c is smack-versio's gate-to-MIDI-clock adapter, copied
+# verbatim (it has no libDaisy dependency). It gives Gate In 1 to the engine's
+# existing 24 ppqn clock path instead of porting the timing model to analog.
+C_SOURCES = patch_alloc.c mark_core_patch.c clock_adapter.c
 
 OPT = -Os
 

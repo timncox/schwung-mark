@@ -1070,8 +1070,49 @@ static void test_cc_control(void) {
     printf("ok: midi cc control\n");
 }
 
+/* The Daisy Patch case: a host with no tempo, no clock, nothing playing.
+ * The 120 BPM placeholder is not a tempo, so the first loop must come out
+ * free-length -- and it must still anchor the grid, so the second track
+ * quantizes to it exactly as it would to a clocked bar. */
+static void test_no_tempo_first_loop_free(void) {
+    host_api_v1_t bare = host;
+    bare.get_bpm = NULL;
+    mark_t *m = mark_create(&bare);
+    assert(m);
+    g_in_frame = 0;
+
+    uint32_t odd = AT_SR(70000);   /* no multiple of any 120 BPM unit */
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_REC);
+    run(m, odd, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    run(m, BLOCK, 0, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    uint32_t len = tlen(m, 0);
+    assert(len >= odd && len <= odd + BLOCK);   /* what was played, not a bar */
+
+    /* the free loop is now the grid: track 2 starts on its boundary and a
+     * ~1.4-loop take rounds to exactly one loop */
+    mark_set_param(m, "t2_btn", "1");
+    int started = 0;
+    for (uint32_t scan = 0; scan < len + 2 * BLOCK && !started; scan += BLOCK) {
+        run(m, BLOCK, 0, NULL);
+        if (tstate(m, 1) == MK_REC) started = 1;
+    }
+    assert(started);
+    run(m, (uint64_t)(len * 1.4), 0, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    run(m, BLOCK, 0, NULL);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tlen(m, 1) == len);
+
+    mark_destroy(m);
+    printf("ok: no host tempo -> first loop free-length, still anchors grid\n");
+}
+
 int main(void) {
     test_record_quantize();
+    test_no_tempo_first_loop_free();
     test_second_track_aligned();
     test_overdub_undo_redo();
     test_reverse_oneshot();

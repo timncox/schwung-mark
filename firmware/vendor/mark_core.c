@@ -1207,10 +1207,22 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
  * grid-rounded target is longer than what's recorded, keep recording
  * until the target (the RC records to the end of the measure); shorter
  * targets truncate immediately. */
+/* Rounding needs something real to round to: a synced track, a session
+ * grid, a running clock, a host that knows the tempo, or an override. On
+ * Move the host always knows, so nothing changes there. On bare metal with
+ * none of those the 120 BPM placeholder is not a tempo, and the first loop
+ * is free-length -- the RC's rule for the stop as well as the start. */
+static int have_tempo_reference(const mark_t *m) {
+    return base_playing(m) != NULL || m->grid_unit > 0.0
+        || (m->clock_seen && m->clock_running)
+        || m->bpm_override > 0.0f
+        || (m->host && m->host->get_bpm);
+}
+
 static void request_finish(mark_t *m, int ti, int end_state) {
     mk_track_t *t = &m->t[ti];
     uint32_t target = t->rec_len;
-    if (m->quantize) {
+    if (m->quantize && have_tempo_reference(m)) {
         double g = live_unit(m);
         if (g >= 32.0) {
             double k = floor(((double)t->rec_len / g) + 0.5);
