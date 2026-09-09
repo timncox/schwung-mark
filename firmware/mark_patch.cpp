@@ -36,6 +36,7 @@
  */
 #include "daisy_patch.h"
 #include "patch_alloc.h"
+#include "module_picker.h"
 
 extern "C" {
 #include "vendor/mark_core.h"
@@ -232,13 +233,13 @@ static void track_key(char *out, size_t n, int track, const char *suffix)
  * here holds until its knob next moves (last touched wins); in cvmode 0 the
  * menu is the only level control.
  */
-enum { MI_MASTER = 0, MI_QNT, MI_GRID, MI_CVMODE, MI_RATIO, MI_CLKMODE, M_GLOBALS };
+enum { MI_MASTER = 0, MI_QNT, MI_GRID, MI_CVMODE, MI_RATIO, MI_CLKMODE, MI_MODS, M_GLOBALS };
 #define M_COUNT   (M_GLOBALS + MARK_TRACKS)
 #define M_VISIBLE 5
 
-static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd", "rat", "clk" };
-static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL, NULL, NULL };
-static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1, 2, 2 };
+static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd", "rat", "clk", "mods" };
+static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL, NULL, NULL, NULL };
+static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1, 2, 2, 0 };
 
 static int g_ratio_sel = 1, g_mode_sel = 2;
 static const char *const RATIO_NAME[3] = { "/2", "=1", "x2" };
@@ -270,6 +271,7 @@ static int menu_get(int item)
         case MI_CVMODE:  return g_cvmode;
         case MI_RATIO:   return g_ratio_sel;
         case MI_CLKMODE: return g_mode_sel;
+        case MI_MODS:    return 0;
         default: break;
     }
     if(item < M_GLOBALS) return get_int(GLOBAL_KEY[item]);
@@ -282,6 +284,7 @@ static void menu_value(int item, char *out, size_t n)
 {
     if(item == MI_RATIO)        snprintf(out, n, "%s", RATIO_NAME[g_ratio_sel]);
     else if(item == MI_CLKMODE) snprintf(out, n, "%s", MODE_NAME[g_mode_sel]);
+    else if(item == MI_MODS)    snprintf(out, n, "%s", "...");
     else                        snprintf(out, n, "%d", menu_get(item));
 }
 
@@ -305,6 +308,11 @@ static void menu_edit(int inc)
                 break;
             case MI_RATIO:   g_ratio_sel = v; apply_clock(); break;
             case MI_CLKMODE: g_mode_sel  = v; apply_clock(); break;
+            case MI_MODS:
+                /* Modal: returns when the user backs out, never if a module
+                 * was loaded. The caller marks this press as spent. */
+                picker::run(hw);
+                break;
             default:         set_int(GLOBAL_KEY[item], v); break;
         }
     }

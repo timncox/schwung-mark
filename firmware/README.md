@@ -20,9 +20,12 @@ make -C firmware program-dfu     # flash over USB
 Needs libDaisy built at `~/tim-os/daisy-sdk/libDaisy` (override `LIBDAISY_DIR`).
 DaisySP is not used.
 
-Builds `BOOT_NONE` at **100,516 B of 131,072 B (76.7%)**, so it flashes with
-the STM32 ROM DFU in silicon: hold **BOOT**, tap **RESET**, release BOOT. No
-bootloader install, no QSPI write.
+Builds `BOOT_SRAM` — it runs under the Daisy bootloader, because that is what
+lets the firmware be switched from the panel (see **Switching modules**
+below). The bootloader is installed once from ST ROM DFU (hold **BOOT**, tap
+**RESET**, release BOOT, then `make -C firmware program-boot`); after that,
+`make -C firmware program-dfu` has to hit the bootloader's ~2 s DFU window on
+power-up, or, simpler, the `.bin` goes on the card.
 
 ## Panel — every connector does something
 
@@ -35,8 +38,8 @@ bootloader install, no QSPI write.
 | Gate In 2 | All start / stop |
 | **Gate Out** | **Track 1 loop boundary** |
 | **CV Out 1 / 2** | **Track 1 / 2 playhead, 0–5 V ramp per loop** |
-| Encoder turn | Menu cursor: `mast` / `qnt` / `grid` / `cvmd` / `rat` / `clk` / `lvl1`–`lvl4` |
-| **Encoder push + turn** | Edit the selected menu item |
+| Encoder turn | Menu cursor: `mast` / `qnt` / `grid` / `cvmd` / `rat` / `clk` / `mods` / `lvl1`–`lvl4` |
+| **Encoder push + turn** | Edit the selected menu item; on `mods`, open the module picker |
 | Encoder tap | All start / stop — fires on release, so a push-and-turn is never a transport toggle; Gate In 2 is the tight one |
 | Encoder hold > 0.6 s | Undo / redo |
 | MIDI In | Clock, and CC to the engine |
@@ -122,6 +125,35 @@ until the knob next moves.
 record/play button, giving per-track control from a sequencer. The knobs must
 sit near zero or they hold the trigger permanently high — the header warns
 (`park N`) when one is too high — and levels come from the menu only.
+
+## Switching modules from the panel
+
+All three Patch ports share `module_picker.cpp`. The SD card is a module
+library: put `belt.bin`, `smack.bin` and `mark.bin` in a `modules` folder on a
+FAT32 card, leave the card in the slot, and switch from the screen:
+
+1. Push-and-turn on the `mods` menu item. The list appears: `back`, then every
+   `.bin` in `/modules`.
+2. Turn to choose, press to load. The file is written into the Daisy
+   bootloader's QSPI app slot (the same place a USB flash writes), verified
+   byte for byte, and the module resets into the bootloader, which boots it.
+   A few seconds; the card never leaves the slot.
+
+What it needs, once: the Daisy bootloader in internal flash — board in ST ROM
+DFU (hold **BOOT**, tap **RESET**), then `make -C firmware program-boot`. From
+then on every app is a `BOOT_SRAM` build (all three are).
+
+Keep `.bin` files **out of the card's root**: the bootloader itself flashes
+the first root `.bin` it finds at every power-up, a cruder mechanism that would
+fight the picker.
+
+If a load fails the screen says why (`no card`, `no folder`, `flash build` for
+an image built for internal flash, `verify failed`) and the running module
+carries on. A failed write does leave the QSPI slot invalid until the next
+successful load, so a power cycle in that state lands in the bootloader
+waiting for USB — nothing is lost, it just needs a `make program-dfu`.
+
+A switch is a reset: whatever is playing stops, and Mark's loops go with it.
 
 ## Build configuration
 
