@@ -85,13 +85,18 @@ act at value ≥ 64 — set controller buttons for rec/stop/clear/undo to
 | 25 | master level | | 70–74 | track 1–5 clear |
 | 30–34 | track 1–5 pan | | 80–84 | track 1–5 reverse |
 | 40–44 | track 1–5 FX amount | | 85–89 | track 1–5 one-shot |
-| 50–54 | track 1–5 rec/play/dub | | 90–94 | track 1–5 FX on/off |
+| 50–54 | track 1–5 rec/play/dub (long-press = clear) | | 90–94 | track 1–5 FX on/off |
 | 55 | All Start/Stop | | 102–106 | quantize / dub mode / play mode / follow / monitor |
 | 60–64 | track 1–5 stop | | | |
 
 Suggested Launch Control XL layout: faders 1–5 → track levels, fader 8 →
 master, top knob row → pan, middle row → FX amount, button row 1 →
 rec/play/dub, button row 2 → stop.
+
+CC 50–54 are momentary: the press cycles the track's record/play/overdub
+state immediately (zero take-edge latency). Keeping the button held for
+**1.5 seconds** clears the loop — the clear fires at the threshold and
+wipes whatever the press just started; releasing afterward is a no-op.
 
 ## Notes
 

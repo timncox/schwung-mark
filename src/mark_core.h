@@ -22,6 +22,8 @@
 
 #define MARK_SR      44100
 #define MARK_TRACKS  5
+#define MARK_LONGPRESS_FRAMES 66150  /* 1500 ms at 44100 Hz — long-press clear threshold */
+#define MARK_XFADE_FRAMES 256   /* ~5.8 ms — loop-seam crossfade + input pre-roll; must be a power of two */
 /* Per-track capacity target, seconds. 60 s stereo int16 = ~10.6 MB per
  * track; 5 tracks + 1 undo buffer = ~63 MB. mark_create() falls back to
  * smaller capacities if allocation fails (see mark_alloc_seconds). */

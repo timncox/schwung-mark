@@ -39,13 +39,20 @@ static int16_t sig(uint64_t k) { return (int16_t)((k % 997) * 31 % 4001 - 2000);
 
 static uint64_t g_in_frame = 0;
 
-/* Feed n frames; mode 0 = signal, 1 = silence, 2 = constant 1000. */
+/* Feed n frames; mode 0 = signal, 1 = silence, 2 = constant 1000,
+ * 3 = slow sine (~397-frame period, smooth for seam checks). */
 static void run(mark_t *m, uint64_t n, int mode, int16_t *last_out) {
     static int16_t in[BLOCK * 2], out[BLOCK * 2];
     while (n > 0) {
         int c = n > BLOCK ? BLOCK : (int)n;
         for (int i = 0; i < c; i++) {
-            int16_t v = mode == 0 ? sig(g_in_frame) : (mode == 2 ? 1000 : 0);
+            int16_t v;
+            if (mode == 0) v = sig(g_in_frame);
+            else if (mode == 2) v = 1000;
+            else if (mode == 3)
+                v = (int16_t)(sin(2.0 * M_PI * (double)g_in_frame / 397.0)
+                              * 12000.0);
+            else v = 0;
             in[i * 2] = v;
             in[i * 2 + 1] = v;
             g_in_frame++;
@@ -257,13 +264,15 @@ static void test_reverse_oneshot(void) {
     mark_set_param(m, "t1_stop", "1");
     assert(tstate(m, 0) == MK_STOP);
 
-    /* reverse: first frame out is the LAST recorded frame */
+    /* reverse: first frame out is the LAST recorded frame — now the
+     * seam-blended tail, which converges to the pre-roll (zero for a
+     * take that began with no prior input) */
     mark_set_param(m, "t1_rev", "1");
     mark_set_param(m, "t1_btn", "1");        /* nothing playing: immediate */
     assert(tstate(m, 0) == MK_PLAY);
     int16_t out[BLOCK * 2];
     run(m, BLOCK, 1, out);
-    assert(out[0] == sig(FPM - 1));
+    assert(abs(out[0]) < 8);
     /* overdub refused while reversed */
     mark_set_param(m, "t1_btn", "1");
     assert(tstate(m, 0) == MK_PLAY);
@@ -390,6 +399,110 @@ static void test_clocked_grid(void) {
 
     mark_destroy(m);
     printf("ok: clocked measure grid\n");
+}
+
+static void test_clocked_stop_quantize(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+
+    /* 100 BPM clock: 1102.5 frames/tick, 105840 frames/measure. Ticks are
+     * delivered block-quantized (bursty), like a real host. */
+    uint8_t start = 0xFA, tick = 0xF8;
+    mark_on_midi(m, &start, 1, 3);
+    double next_tick = 1102.5;
+    uint64_t fed = 0;
+
+    /* ~3 measures of clock so the beat-span tempo estimate converges */
+    while (fed < 3 * 105840) {
+        run(m, BLOCK, 0, NULL);
+        fed += BLOCK;
+        while ((double)fed >= next_tick) {
+            mark_on_midi(m, &tick, 1, 3);
+            next_tick += 1102.5;
+        }
+    }
+
+    /* pending record must fire on a measure boundary */
+    mark_set_param(m, "t1_btn", "1");
+    uint64_t rec_started = 0;
+    while (!rec_started && fed < 6 * 105840) {
+        run(m, BLOCK, 0, NULL);
+        fed += BLOCK;
+        while ((double)fed >= next_tick) {
+            mark_on_midi(m, &tick, 1, 3);
+            next_tick += 1102.5;
+        }
+        if (tstate(m, 0) == MK_REC) rec_started = fed;
+    }
+    assert(rec_started);
+
+    /* press stop ~1.6 measures into the take -> quantize extends to 2 */
+    uint64_t press_at = rec_started + (uint64_t)(1.6 * 105840);
+    while (fed < press_at) {
+        run(m, BLOCK, 0, NULL);
+        fed += BLOCK;
+        while ((double)fed >= next_tick) {
+            mark_on_midi(m, &tick, 1, 3);
+            next_tick += 1102.5;
+        }
+    }
+    mark_set_param(m, "t1_btn", "1");
+    while (tstate(m, 0) == MK_REC) {
+        run(m, BLOCK, 0, NULL);
+        fed += BLOCK;
+        while ((double)fed >= next_tick) {
+            mark_on_midi(m, &tick, 1, 3);
+            next_tick += 1102.5;
+        }
+    }
+    assert(tstate(m, 0) == MK_PLAY);
+    /* within ~1% of two real measures — a non-quantized stop would land
+     * ~169k, far outside this band */
+    assert(tlen(m, 0) > (uint32_t)(2 * 105840 * 0.99)
+           && tlen(m, 0) < (uint32_t)(2 * 105840 * 1.01));
+
+    mark_destroy(m);
+    printf("ok: clocked stop quantize\n");
+}
+
+static void quick_loop(mark_t *m, int ti);
+
+/* Running clock wins over anchor: pending starts fire on real clock
+ * measure flags (downbeats the source transport drives), not the session
+ * grid_unit the loops cycle at — otherwise a stale/mismatched anchor puts
+ * starts off the beat the user is playing against. */
+static void test_clock_flag_wins_over_anchor(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    quick_loop(m, 0);                    /* anchors grid_unit = 1 measure */
+
+    /* drive the base track to a known phase (~50000 frames in) */
+    char buf[32];
+    int p1 = 0;
+    gp_str(m, "tpos", buf, sizeof(buf));
+    sscanf(buf, "%d", &p1);
+    uint32_t adv = (50000 + FPM - (uint32_t)p1) % FPM;
+    run(m, adv, 1, NULL);
+
+    /* clock start at a DIFFERENT tempo (fpt=1000 -> 96000-frame measure):
+     * the 0xFA flag is a real downbeat — the pending must fire on it at
+     * the next processed block, not wait ~38200 frames for the anchor
+     * wrap. */
+    uint8_t start = 0xFA;
+    mark_on_midi(m, &start, 1, 3);
+    mark_set_param(m, "t2_btn", "1");
+    assert(tstate(m, 1) == MK_EMPTY);    /* pending, not immediate */
+
+    run(m, BLOCK, 1, NULL);
+    assert(tstate(m, 1) == MK_REC);      /* fired on the flag, frame 0 */
+
+    gp_str(m, "tpos", buf, sizeof(buf));
+    sscanf(buf, "%d", &p1);
+    assert(p1 > 50);                     /* base nowhere near its wrap
+                                          * (tpos = pos*128/len; ~57%) */
+
+    mark_destroy(m);
+    printf("ok: running clock flag wins over session anchor\n");
 }
 
 /* record one measure of signal on track ti and leave it playing */
@@ -934,13 +1047,24 @@ static void test_cc_control(void) {
     mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
     assert(gp_int(m, "t1_pan") == 50);
 
-    /* trigger fires on press, release is a no-op */
-    cc[1] = 50; cc[2] = 127;                           /* t1 btn -> record */
+    /* CC 50-54 momentary: the cycle fires at press (zero take-edge
+     * latency); holding >=1.5 s clears whatever the press started */
+    cc[1] = 50; cc[2] = 127;                           /* t1 btn press */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(tstate(m, 0) == MK_REC);                    /* fires on press */
+    cc[2] = 0;                                         /* release: no-op */
     mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
     assert(tstate(m, 0) == MK_REC);
-    cc[2] = 0;                                         /* release */
+
+    /* record some audio, then long-press to clear */
+    run(m, FPM, 0, NULL);                              /* record 1 measure */
+    cc[2] = 127;                                       /* press: finalize -> PLAY */
     mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
-    assert(tstate(m, 0) == MK_REC);
+    run(m, MARK_LONGPRESS_FRAMES + 256, 0, NULL);             /* hold > 1.5 s */
+    assert(tstate(m, 0) == MK_EMPTY);                   /* long-press cleared */
+    cc[2] = 0;                                         /* release after clear */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(tstate(m, 0) == MK_EMPTY);                   /* no double-fire */
 
     /* toggle follows the value */
     cc[1] = 82; cc[2] = 127;                           /* t3 reverse on */
@@ -962,6 +1086,40 @@ static void test_cc_control(void) {
     printf("ok: midi cc control\n");
 }
 
+static void test_seam_xfade(void) {
+    mark_t *m = mark_create(&host);
+    assert(m);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+
+    /* prime the pre-roll ring so the take's first frame has a real
+     * predecessor (mode 3: slow sine) */
+    run(m, 1000, 3, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    run(m, FPM, 3, NULL);                  /* one measure of sine */
+    mark_set_param(m, "t1_btn", "1");      /* exact-length finalize */
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tlen(m, 0) == FPM);
+
+    /* play to just before the wrap, then capture across it */
+    run(m, FPM - 512, 1, NULL);
+    int16_t cap[1024 * 2];
+    capture_silence(m, 1024, cap);         /* wrap lands mid-buffer */
+
+    /* every frame-to-frame step — inside the blend zone, across the wrap,
+     * and into the head — stays within the sine's natural slew (~190).
+     * An un-blended tail would jump ~9.5k here. */
+    int maxd = 0;
+    for (int i = 0; i < 1023; i++) {
+        int d = abs((int)cap[i * 2 + 2] - (int)cap[i * 2]);
+        if (d > maxd) maxd = d;
+    }
+    assert(maxd < 2000);
+
+    mark_destroy(m);
+    printf("ok: loop-seam crossfade\n");
+}
+
 int main(void) {
     test_record_quantize();
     test_second_track_aligned();
@@ -971,6 +1129,8 @@ int main(void) {
     test_state_blob();
     test_monitor();
     test_clocked_grid();
+    test_clocked_stop_quantize();
+    test_clock_flag_wins_over_anchor();
     test_single_mode();
     test_undo_capture_ownership();
     test_track_fx();
@@ -982,6 +1142,7 @@ int main(void) {
     test_trim_session_roundtrip();
     test_len16_and_16th_grid();
     test_cc_control();
+    test_seam_xfade();
     printf("all mark sim tests passed\n");
     return 0;
 }

@@ -122,6 +122,10 @@ typedef struct {
     uint32_t rec_len;      /* frames recorded so far while MK_REC */
     uint32_t rec_target;   /* 0 = none; keep recording until this length */
     int      rec_end;      /* state to enter when recording finalizes */
+    /* Pre-roll: the XF input frames captured just before this take's first
+     * frame. finalize_record morphs the tail toward them so buf[len-1]
+     * lands on the natural predecessor of buf[0] — seamless wrap. */
+    int16_t  pre[MARK_XFADE_FRAMES * 2];
     double   pos;          /* 0 .. len */
     int      st;           /* mk_tstate_t */
     int      pending;      /* 0 none, 1 = start record, 2 = start play */
@@ -173,7 +177,7 @@ struct mark {
     /* Clock (smack pattern). Global frame counter across all blocks. */
     uint64_t global_frames;
     double   frames_per_tick;    /* smoothed; 918.75 = 120 BPM */
-    uint64_t last_tick_global;
+    uint64_t last_beat_global;   /* global_frames at the last 24-tick mark */
     uint32_t tick_total;
     int      clock_running;
     int      clock_seen;
@@ -183,6 +187,18 @@ struct mark {
     /* MIDI CC control */
     uint8_t  cc_last[3];         /* last external CC accepted (dup guard) */
     uint64_t cc_last_frames;     /* global_frames when it was accepted */
+
+    /* Long-press detection for CC 50-54 (track buttons). Press is deferred
+     * until release; if held >= MARK_LONGPRESS_FRAMES the track clears instead of
+     * cycling its record/play/dub state. */
+    int      lp_track;           /* track being held, -1 = none */
+    uint64_t lp_press_frames;    /* global_frames when press began */
+    int      lp_fired;           /* 1 = long-press clear already fired */
+
+    /* Rolling input history for per-take pre-roll snapshots. Written every
+     * render frame; hist_pos is the next write slot (ring index). */
+    int16_t  hist[MARK_XFADE_FRAMES * 2];
+    uint32_t hist_pos;
 
     /* Grid: frames per measure captured when the first track finalized.
      * Used for quantization while free-running; a running clock always
@@ -397,7 +413,11 @@ static double frames_per_measure(const mark_t *m) {
     return frames_per_tick_now(m) * 96.0;   /* 4/4, 24 ppqn */
 }
 
-/* Quantization grid in frames: running clock > session grid unit > tempo. */
+/* The ONE grid all quantization shares. A running clock is the truth:
+ * starts fire on its measure flags and stop rounds to its live measure.
+ * With no running clock the session anchor (first loop's measure) rules —
+ * it's the grid the playing loops actually cycle at. Tempo estimate is
+ * the last fallback. */
 static double effective_grid(const mark_t *m) {
     if (m->clock_seen && m->clock_running) return frames_per_measure(m);
     if (m->grid_unit > 0.0) return m->grid_unit;
@@ -415,10 +435,9 @@ static double live_unit(const mark_t *m) {
     return effective_grid(m) / (double)grid_div(m);
 }
 
-/* Trim unit, locked to the session grid so edits are audio-exact. */
+/* Trim unit — the same session grid; locked so edits stay audio-exact. */
 static double locked_unit(const mark_t *m) {
-    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
-    return g / (double)grid_div(m);
+    return effective_grid(m) / (double)grid_div(m);
 }
 
 /* Lowest-numbered track currently playing or overdubbing — its position
@@ -785,9 +804,10 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
     }
     if (!m->track_frames) { free(m); return NULL; }
 
-    m->frames_per_tick = 918.75;   /* 120 BPM */
+    m->frames_per_tick = frames_per_tick_now(m);   /* host tempo; ticks refine it */
     m->undo_track = -1;
     m->swap_track = -1;
+    m->lp_track = -1;
     m->quantize = 1;
     m->master = 100;
     m->master_g = 1.0f;
@@ -861,11 +881,15 @@ void mark_destroy(mark_t *m) {
  * share every rule with the UI (trig_active, io_busy, edit_rev, RC dub
  * constraints). See README for the user-facing table.
  *   20-24 t level   25 master     30-34 t pan    40-44 t fxp
- *   50-54 t btn     55 all_btn    60-64 t stop   65 undo   70-74 t clear
+ *   50-54 t btn (momentary: tap = cycle at press, hold 1.5s = clear)
+ *   55 all_btn    60-64 t stop   65 undo   70-74 t clear
  *   80-84 t rev     85-89 t shot  90-94 t fx_on
  *   102 quantize  103 dub_mode  104 play_mode  105 follow  106 monitor
  * Continuous 0-127 scales into the param range; buttons act at value>=64
- * (triggers fire on press, release is a no-op; toggles follow the value). */
+ * (triggers fire on press, release is a no-op; toggles follow the value).
+ * CC 50-54 keep that timing too — the press fires the cycle immediately,
+ * and only if the button is still held at the threshold does the track
+ * clear instead. */
 static void cc_track(mark_t *m, int ti, const char *k, const char *val) {
     char key[16];
     snprintf(key, sizeof key, "t%d_%s", ti + 1, k);
@@ -888,7 +912,19 @@ static void mark_handle_cc(mark_t *m, int cc, int v) {
         snprintf(val, sizeof val, "%d", (v * 100 + 63) / 127);
         cc_track(m, cc - 40, "fxp", val);
     } else if (cc >= 50 && cc <= 54) {
-        if (on) cc_track(m, cc - 50, "btn", "1");
+        int ti = cc - 50;
+        if (on) {
+            /* Fire at press — deferring to release adds the finger's hold
+             * time as latency to every take edge. Holding >=1.5 s clears
+             * the track in mark_process; the clear wipes whatever the
+             * press action started, so the hold stays a clean gesture. */
+            cc_track(m, ti, "btn", "1");
+            m->lp_track = ti;
+            m->lp_press_frames = m->global_frames;
+            m->lp_fired = 0;
+        } else if (m->lp_track == ti) {
+            m->lp_track = -1;
+        }
     } else if (cc == 55) {
         if (on) mark_set_param(m, "all_btn", "1");
     } else if (cc >= 60 && cc <= 64) {
@@ -924,6 +960,7 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         m->tick_total = 0;
         m->clock_running = 1;
         m->measure_flag = 1;
+        m->last_beat_global = m->global_frames;
         if (m->transport_paused) {   /* resume every loop from its top */
             m->transport_paused = 0;
             for (int i = 0; i < MARK_TRACKS; i++)
@@ -936,14 +973,21 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         if (m->follow && base_playing(m)) m->transport_paused = 1;
         break;
     case 0xF8:
-        if (m->clock_seen && m->global_frames > m->last_tick_global) {
-            double d = (double)(m->global_frames - m->last_tick_global);
-            if (d > 100.0 && d < 20000.0)
-                m->frames_per_tick = 0.9 * m->frames_per_tick + 0.1 * d;
-        }
-        m->last_tick_global = m->global_frames;
         m->clock_seen = 1;
         m->tick_total++;
+        /* Tempo from the beat span (24 ticks), not per-tick deltas:
+         * bursty or block-quantized tick delivery ruins tick-to-tick
+         * deltas, but the span between beat boundaries still measures
+         * true time — and it shares the measure_flag's clock source, so
+         * record stop quantizes to the same grid record start used. */
+        if (m->tick_total % 24 == 0) {
+            if (m->last_beat_global && m->global_frames > m->last_beat_global) {
+                double e = (double)(m->global_frames - m->last_beat_global) / 24.0;
+                if (e > 200.0 && e < 6000.0)
+                    m->frames_per_tick = 0.7 * m->frames_per_tick + 0.3 * e;
+            }
+            m->last_beat_global = m->global_frames;
+        }
         if (m->tick_total % 96 == 0) m->measure_flag = 1;
         break;
     default: break;
@@ -1024,6 +1068,13 @@ static void solo_stop_others(mark_t *m, int ti) {
 
 static void apply_start_record(mark_t *m, int ti) {
     mk_track_t *t = &m->t[ti];
+    /* Snapshot the input frames that immediately precede the take's first
+     * frame — buf[0]'s natural predecessor for the finalize tail-blend. */
+    for (uint32_t k = 0; k < MARK_XFADE_FRAMES; k++) {
+        uint32_t j = (m->hist_pos + k) & (MARK_XFADE_FRAMES - 1);
+        t->pre[k * 2]     = m->hist[j * 2];
+        t->pre[k * 2 + 1] = m->hist[j * 2 + 1];
+    }
     t->st = MK_REC;
     t->rec_len = 0;
     t->rec_target = 0;
@@ -1050,6 +1101,21 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
         return;
     }
     t->full_len = final_len;
+    /* Seam de-click: morph the last XF frames toward the pre-roll input,
+     * so buf[len-1] lands on the frame that naturally precedes buf[0].
+     * Linear weights: the blend joins two unrelated signals; continuity —
+     * not power — is what kills the wrap click. The head stays untouched,
+     * so a downbeat transient at the loop start keeps its full edge. */
+    uint32_t xf = MARK_XFADE_FRAMES;
+    if (xf > final_len / 4) xf = final_len / 4;
+    for (uint32_t k = 0; k < xf; k++) {
+        float w = ((float)k + 1.0f) / ((float)xf + 1.0f);
+        for (int c = 0; c < 2; c++) {
+            uint32_t i = (final_len - xf + k) * 2 + c;
+            t->buf[i] = clip16((float)t->buf[i] * (1.0f - w)
+                               + (float)t->pre[k * 2 + c] * w);
+        }
+    }
     /* first finalized loop anchors the session grid for free-run sync.
      * Derive the MEASURE from the rounding unit actually used, so a
      * 15/16 polymetric first loop still anchors a true measure grid. */
@@ -1856,12 +1922,16 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
         /* --- pending scheduler: fire on the grid --- */
         int boundary = 0;
-        mk_track_t *base = base_playing(m);
-        if (base && !paused) {
-            double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
-            if (g >= 1.0 && fmod(base->pos, g) < 1.0) boundary = 1;
-        } else if (use_measure_flag && n == 0) {
-            boundary = 1;
+        if (m->clock_running) {
+            /* Real clock downbeats — immune to tempo-estimate drift and
+             * anchor mismatch. Matches request_finish's clock-wins grid. */
+            if (use_measure_flag && n == 0) boundary = 1;
+        } else {
+            mk_track_t *base = base_playing(m);
+            if (base && !paused) {
+                double g = effective_grid(m);
+                if (g >= 1.0 && fmod(base->pos, g) < 1.0) boundary = 1;
+            }
         }
         if (boundary) {
             for (int i = 0; i < MARK_TRACKS; i++) {
@@ -1959,6 +2029,12 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
             }
         }
 
+        /* Input history ring — after the pending block so a record start
+         * at this frame snapshots frames strictly before the take. */
+        m->hist[m->hist_pos * 2]     = in[n * 2];
+        m->hist[m->hist_pos * 2 + 1] = in[n * 2 + 1];
+        m->hist_pos = (m->hist_pos + 1) & (MARK_XFADE_FRAMES - 1);
+
         m->mix_l[n] = outl;
         m->mix_r[n] = outr;
     }
@@ -1989,6 +2065,15 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                                 + (float)in[n * 2 + 1] * dry);
     }
     m->global_frames += (uint64_t)frames;
+
+    /* Long-press detection: if a CC 50-54 button is still held and the
+     * threshold has elapsed, clear the track now. The subsequent CC release
+     * sees lp_fired and skips the deferred short press. */
+    if (m->lp_track >= 0 && !m->lp_fired &&
+        m->global_frames - m->lp_press_frames >= (uint64_t)MARK_LONGPRESS_FRAMES) {
+        track_clear(m, m->lp_track);
+        m->lp_fired = 1;
+    }
 }
 
 /* ------------------------------------------------------------------ */
