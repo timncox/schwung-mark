@@ -2,8 +2,12 @@
  * Mark core engine. See mark_core.h for the model.
  *
  * v1 simplifications (documented follow-ups, not accidents):
- *   - Playback is speed 1.0 only: no tempo-sync time-stretch or varispeed.
- *     Tracks recorded at one tempo drift against a changed clock tempo.
+ *   - Varispeed is tape-style (pitch follows speed), linear-interpolated.
+ *     Per-track `speed` in cents; `tempo_follow` scales every track by
+ *     (tempo it was recorded at / tempo now). Off both, playback is the
+ *     original integer 1.0 path, bit for bit. A track off 1x refuses
+ *     overdub (writes land at integer frames and undo assumes contiguous
+ *     writes), exactly like a reversed track.
  *   - Record/pending actions land on a block boundary (<= 2.9 ms early/late)
  *     when driven by the clocked measure flag; base-track boundaries are
  *     frame-accurate.
@@ -123,6 +127,14 @@ typedef struct {
     uint32_t rec_target;   /* 0 = none; keep recording until this length */
     int      rec_end;      /* state to enter when recording finalizes */
     double   pos;          /* 0 .. len */
+    int      speed;        /* cents, -2400..2400; 0 = 1x (a setting, kept
+                              across clear like rev) */
+    double   rate;         /* loop frames per output frame, slewed */
+    double   rate_goal;    /* what rate is slewing toward this block */
+    double   rec_fpm;      /* frames per measure when this loop was
+                              recorded: the tempo tempo_follow scales from */
+    int      fl_on;        /* tempo_follow engaged for this track (with
+                              hysteresis, so clock jitter can't flutter) */
     int      st;           /* mk_tstate_t */
     int      pending;      /* 0 none, 1 = start record, 2 = start play */
     int      level;        /* 0..200, 100 = unity (RC play level) */
@@ -188,6 +200,19 @@ struct mark {
      * Used for quantization while free-running; a running clock always
      * wins. Reset when every track is cleared. */
     double   grid_unit;
+    double   grid_fpm;           /* follow_fpm() when grid_unit anchored */
+
+    /* Tempo follow. meas_fpm is a sliding whole-measure clock estimate:
+     * frames across the last 96 ticks, re-taken every tick. Ticks land on
+     * block edges, so one tick is off by up to a block (percent-level)
+     * but 96 of them only ~0.15 % — and a tempo change is fully seen
+     * within one bar. */
+    int      tempo_follow;
+    double   meas_fpm;           /* 0 = no full clocked measure seen yet */
+    uint64_t tick_ts[96];        /* global_frames at the last 96 ticks */
+    uint32_t tick_ts_n;          /* ticks stored since the clock started */
+    double   phase_corr;         /* rate trim pulling the base onto the
+                                    clock's downbeat; 1.0 = none */
 
     /* Params */
     int   quantize;              /* 0 off, 1 on (default) */
@@ -397,11 +422,48 @@ static double frames_per_measure(const mark_t *m) {
     return frames_per_tick_now(m) * 96.0;   /* 4/4, 24 ppqn */
 }
 
-/* Quantization grid in frames: running clock > session grid unit > tempo. */
-static double effective_grid(const mark_t *m) {
-    if (m->clock_seen && m->clock_running) return frames_per_measure(m);
-    if (m->grid_unit > 0.0) return m->grid_unit;
+/* The tempo tempo_follow measures against, in frames per measure. Exact
+ * under bpm_override / host tempo; under a running clock, the
+ * whole-measure estimate once one exists. */
+static double follow_fpm(const mark_t *m) {
+    if (clock_governs(m) && m->clock_running && m->meas_fpm > 0.0)
+        return m->meas_fpm;
     return frames_per_measure(m);
+}
+
+/* Quantization grid in frames: running clock > session grid unit > tempo.
+ * Under tempo_follow the session grid is a bar at the CURRENT tempo, in
+ * real (output) frames — recording is always real-time. */
+static double effective_grid(const mark_t *m) {
+    /* Under tempo_follow a clocked loop is cut to the whole-measure
+     * estimate, the same number its rec_fpm records — the per-tick EMA
+     * is block-quantized and can sit ~0.5 % off, more than the downbeat
+     * trim can absorb. (Follow off keeps the original behaviour.) */
+    if (m->clock_seen && m->clock_running)
+        return m->tempo_follow ? follow_fpm(m) : frames_per_measure(m);
+    if (m->grid_unit > 0.0) {
+        if (m->tempo_follow && m->grid_fpm > 0.0)
+            return m->grid_unit * follow_fpm(m) / m->grid_fpm;
+        return m->grid_unit;
+    }
+    return frames_per_measure(m);
+}
+
+/* One measure in THIS track's own loop frames. Without tempo_follow that
+ * is the session grid; with it, a track recorded at another tempo has a
+ * proportionally different native measure. */
+static double track_grid(const mark_t *m, const mk_track_t *t) {
+    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
+    if (m->tempo_follow && m->grid_unit > 0.0 && m->grid_fpm > 0.0 &&
+        t->rec_fpm > 0.0)
+        g *= t->rec_fpm / m->grid_fpm;
+    return g;
+}
+
+/* Overdub needs the integer 1x path: writes land at integer frames and
+ * undo capture assumes contiguous writes. Same rule as reverse. */
+static int track_can_dub(const mk_track_t *t) {
+    return !t->rev && t->rate == 1.0 && t->rate_goal == 1.0;
 }
 
 /* rec_grid divisor: units per measure (4/4) */
@@ -421,11 +483,24 @@ static double locked_unit(const mark_t *m) {
     return g / (double)grid_div(m);
 }
 
-/* Lowest-numbered track currently playing or overdubbing — its position
- * IS the live grid every pending action aligns to. */
+/* Lowest-numbered track currently playing or overdubbing ("is anything
+ * playing?" — all_button, transport follow). */
 static mk_track_t *base_playing(mark_t *m) {
     for (int i = 0; i < MARK_TRACKS; i++)
         if (m->t[i].len > 0 && (m->t[i].st == MK_PLAY || m->t[i].st == MK_DUB))
+            return &m->t[i];
+    return NULL;
+}
+
+/* The track whose position IS the live grid every pending action aligns
+ * to: the lowest-numbered playing track with no speed set. A sped track
+ * never anchors — its "bar" is the wrong length in real time (half a bar
+ * at 2x). tempo_follow alone doesn't disqualify: that rate is what keeps
+ * a bar a bar. */
+static mk_track_t *grid_base(mark_t *m) {
+    for (int i = 0; i < MARK_TRACKS; i++)
+        if (m->t[i].len > 0 && m->t[i].speed == 0 &&
+            (m->t[i].st == MK_PLAY || m->t[i].st == MK_DUB))
             return &m->t[i];
     return NULL;
 }
@@ -786,6 +861,7 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
     if (!m->track_frames) { free(m); return NULL; }
 
     m->frames_per_tick = 918.75;   /* 120 BPM */
+    m->phase_corr = 1.0;
     m->undo_track = -1;
     m->swap_track = -1;
     m->quantize = 1;
@@ -796,7 +872,9 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
         m->t[i].level = 100;
         m->t[i].pan = 50;
         m->t[i].g_cur = 1.0f;
-        m->t[i].fx = TFX_LPF;      /* a sensible default once switched on */
+        m->t[i].rate = 1.0;
+        m->t[i].rate_goal = 1.0;
+        m->t[i].fx = TFX_LPF;     /* a sensible default once switched on */
         m->t[i].fxp = 50;
         m->t[i].fx_dirty = 1;
         m->t[i].dly = calloc((size_t)MARK_DLY_LEN * 2, sizeof(float));
@@ -864,6 +942,7 @@ void mark_destroy(mark_t *m) {
  *   50-54 t btn     55 all_btn    60-64 t stop   65 undo   70-74 t clear
  *   80-84 t rev     85-89 t shot  90-94 t fx_on
  *   102 quantize  103 dub_mode  104 play_mode  105 follow  106 monitor
+ *   107 tempo_follow   110-114 t speed, five octave zones 1/4 1/2 1 2 4
  * Continuous 0-127 scales into the param range; buttons act at value>=64
  * (triggers fire on press, release is a no-op; toggles follow the value). */
 static void cc_track(mark_t *m, int ti, const char *k, const char *val) {
@@ -913,7 +992,46 @@ static void mark_handle_cc(mark_t *m, int cc, int v) {
         mark_set_param(m, "follow", on ? "1" : "0");
     } else if (cc == 106) {
         mark_set_param(m, "monitor", on ? "1" : "0");
+    } else if (cc == 107) {
+        mark_set_param(m, "tempo_follow", on ? "1" : "0");
+    } else if (cc >= 110 && cc <= 114) {
+        snprintf(val, sizeof val, "%d", (v * 5 / 128 - 2) * 1200);
+        cc_track(m, cc - 110, "speed", val);
     }
+}
+
+/* Every running-clock tick: the frames spanned by the last 96 ticks (one
+ * measure), lightly smoothed. Only tempo_follow reads it. */
+static void clock_tick_estimate(mark_t *m) {
+    uint32_t slot = m->tick_ts_n % 96;
+    if (m->tick_ts_n >= 96) {
+        double d = (double)(m->global_frames - m->tick_ts[slot]);
+        double ref = m->frames_per_tick * 96.0;
+        if (d > 0.5 * ref && d < 2.0 * ref)
+            m->meas_fpm = m->meas_fpm > 0.0 ? m->meas_fpm + 0.1 * (d - m->meas_fpm)
+                                            : d;
+    }
+    m->tick_ts[slot] = m->global_frames;
+    m->tick_ts_n++;
+}
+
+/* A clocked downbeat (every 96 ticks while running): how far the grid
+ * base sits from it, as a rate trim that halves the error each bar (at
+ * most 1 %, ~17 cents), so estimate error and the lag after a tempo
+ * change can't settle into drift. Only tempo_follow reads it. */
+static void clock_measure(mark_t *m) {
+    m->phase_corr = 1.0;
+    if (!m->tempo_follow || !m->clock_running || !clock_governs(m)) return;
+    mk_track_t *base = grid_base(m);
+    if (!base || !base->fl_on) return;
+    double g = track_grid(m, base);
+    if (g < 1.0) return;
+    double ph = fmod(base->pos, g) / g;   /* 0 = on the downbeat */
+    if (ph > 0.5) ph -= 1.0;              /* >0 ahead: slow; <0 behind: speed */
+    double c = 0.5 * ph;
+    if (c > 0.01) c = 0.01;
+    if (c < -0.01) c = -0.01;
+    m->phase_corr = 1.0 - c;
 }
 
 void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
@@ -924,6 +1042,7 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         m->tick_total = 0;
         m->clock_running = 1;
         m->measure_flag = 1;
+        m->tick_ts_n = 0;
         if (m->transport_paused) {   /* resume every loop from its top */
             m->transport_paused = 0;
             for (int i = 0; i < MARK_TRACKS; i++)
@@ -944,7 +1063,11 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         m->last_tick_global = m->global_frames;
         m->clock_seen = 1;
         m->tick_total++;
-        if (m->tick_total % 96 == 0) m->measure_flag = 1;
+        if (m->clock_running) clock_tick_estimate(m);
+        if (m->tick_total % 96 == 0) {
+            m->measure_flag = 1;
+            clock_measure(m);
+        }
         break;
     default: break;
     }
@@ -1050,6 +1173,12 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
         return;
     }
     t->full_len = final_len;
+    /* the tempo this loop was made at: tempo_follow's reference. A new
+     * loop plays at its own tempo, so follow starts disengaged. */
+    t->rec_fpm = follow_fpm(m);
+    t->fl_on = 0;
+    t->rate_goal = t->speed ? exp2((double)t->speed / 1200.0) : 1.0;
+    t->rate = t->rate_goal;
     /* first finalized loop anchors the session grid for free-run sync.
      * Derive the MEASURE from the rounding unit actually used, so a
      * 15/16 polymetric first loop still anchors a true measure grid. */
@@ -1058,6 +1187,7 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
         double k = floor(((double)final_len / u) + 0.5);
         if (k < 1.0) k = 1.0;
         m->grid_unit = ((double)final_len / k) * (double)grid_div(m);
+        m->grid_fpm = t->rec_fpm;
     }
     /* undo of a first recording = clear it (redo restores) */
     m->undo_track = ti;
@@ -1070,7 +1200,7 @@ static void finalize_record(mark_t *m, int ti, uint32_t final_len, int end_state
     t->pos = 0.0;
     t->st = end_state;
     if (end_state == MK_DUB) {
-        if (t->rev) t->st = MK_PLAY;    /* no overdub on reversed tracks */
+        if (!track_can_dub(t)) t->st = MK_PLAY;   /* reversed or off 1x */
         else begin_dub_gesture(m, ti);
     }
     if (t->st == MK_PLAY || t->st == MK_DUB) solo_stop_others(m, ti);
@@ -1113,7 +1243,7 @@ static void request_finish(mark_t *m, int ti, int end_state) {
  * the RC's rule: quantize corrects timing only against a running rhythm,
  * a synced track, or MIDI sync. */
 static void schedule(mark_t *m, int ti, int action /* 1 rec, 2 play */) {
-    int quantized = m->quantize && (base_playing(m) != NULL || m->clock_running);
+    int quantized = m->quantize && (grid_base(m) != NULL || m->clock_running);
     if (!quantized) {
         if (action == 1) apply_start_record(m, ti);
         else apply_start_play(m, ti);
@@ -1135,7 +1265,7 @@ static void track_button(mark_t *m, int ti) {
         request_finish(m, ti, m->rec_action ? MK_DUB : MK_PLAY);
         break;
     case MK_PLAY:
-        if (t->rev) break;                    /* no overdub on reversed tracks */
+        if (!track_can_dub(t)) break;         /* reversed or off 1x: no dub */
         t->st = MK_DUB;
         begin_dub_gesture(m, ti);
         m->edit_rev++;
@@ -1178,7 +1308,7 @@ static void track_trim(mark_t *m, int ti, int delta) {
     mk_track_t *t = &m->t[ti];
     if (m->io_busy || m->swap_track == ti) return;
     if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
-    double u = locked_unit(m);
+    double u = track_grid(m, t) / (double)grid_div(m);
     if (u < 32.0) return;
     int cur = (int)floor((double)t->len / u + 0.5);
     int full = (int)floor((double)t->full_len / u + 0.5);
@@ -1206,8 +1336,7 @@ static void track_setlen16(mark_t *m, int ti, int n16) {
     if (m->io_busy || m->swap_track == ti) return;
     if (t->len == 0 || t->full_len == 0 || t->st == MK_REC) return;
     if (n16 < 1 || n16 > 16) return;
-    double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
-    double u = g / 16.0;
+    double u = track_grid(m, t) / 16.0;
     if (u < 32.0) return;
     uint32_t nl = (uint32_t)((double)n16 * u + 0.5);
     if (nl > t->full_len) nl = t->full_len;
@@ -1238,6 +1367,7 @@ static void track_clear(mark_t *m, int ti) {
     if (m->undo_track == ti) reset_undo(m);
     if (!any_content(m)) {
         m->grid_unit = 0.0;
+        m->grid_fpm = 0.0;
         m->transport_paused = 0;
     }
     m->edit_rev++;
@@ -1281,7 +1411,7 @@ static void undo_press(mark_t *m) {
             t->pos = 0.0;
             m->undo_redo = 1;
             m->edit_rev++;
-            if (!any_content(m)) m->grid_unit = 0.0;
+            if (!any_content(m)) { m->grid_unit = 0.0; m->grid_fpm = 0.0; }
         } else {                      /* redo: bring it back, stopped */
             t->len = m->undo_saved_len;
             t->st = MK_STOP;
@@ -1293,6 +1423,7 @@ static void undo_press(mark_t *m) {
                 double k = floor(((double)t->len / g) + 0.5);
                 if (k < 1.0) k = 1.0;
                 m->grid_unit = (double)t->len / k;
+                m->grid_fpm = follow_fpm(m);
             }
         }
         return;
@@ -1518,10 +1649,14 @@ static void *io_worker(void *arg) {
                     (long)(m->grid_unit + 0.5), m->quantize, m->rec_grid,
                     m->rec_action, m->dub_mode, m->play_mode, m->master,
                     m->follow);
+            fprintf(f, ",\"tf\":%d,\"gf\":%ld", m->tempo_follow,
+                    (long)(m->grid_fpm + 0.5));
             for (int i = 0; i < MARK_TRACKS; i++) {
                 const mk_track_t *t = &m->t[i];
                 uint32_t full = t->len > 0
                     ? (t->full_len > t->len ? t->full_len : t->len) : 0;
+                fprintf(f, ",\"sp%d\":%d,\"rf%d\":%ld", i + 1, t->speed,
+                        i + 1, (long)(t->rec_fpm + 0.5));
                 fprintf(f, ",\"l%d\":%u,\"F%d\":%u,\"v%d\":%d,\"p%d\":%d,"
                            "\"r%d\":%d,\"s%d\":%d,\"f%d\":%d,\"o%d\":%d,"
                            "\"g%d\":%d,\"x%d\":\"%s\"",
@@ -1578,6 +1713,7 @@ static void *io_worker(void *arg) {
             m->master     = clampi(json_int(js, "mst", 100), 0, 200);
             m->master_g   = (float)m->master / 100.0f;
             m->follow     = json_int(js, "flw", 0) ? 1 : 0;
+            m->tempo_follow = json_int(js, "tf", 0) ? 1 : 0;
             for (int i = 0; i < MARK_TRACKS; i++) {
                 mk_track_t *t = &m->t[i];
                 char k[8];
@@ -1590,6 +1726,14 @@ static void *io_worker(void *arg) {
                 t->rev = json_int(js, k, 0) ? 1 : 0;
                 snprintf(k, sizeof(k), "s%d", i + 1);
                 t->shot = json_int(js, k, 0) ? 1 : 0;
+                snprintf(k, sizeof(k), "sp%d", i + 1);
+                t->speed = clampi(json_int(js, k, 0), -2400, 2400);
+                /* sessions saved before tempo_follow carry no recorded
+                 * tempo: treat them as made at today's tempo (1x) */
+                snprintf(k, sizeof(k), "rf%d", i + 1);
+                long rf = json_int(js, k, 0);
+                t->rec_fpm = rf > 0 ? (double)rf : follow_fpm(m);
+                t->fl_on = 0;
                 snprintf(k, sizeof(k), "f%d", i + 1);
                 t->fx = clampi(json_int(js, k, TFX_LPF), 0, TFX_COUNT - 1);
                 snprintf(k, sizeof(k), "o%d", i + 1);
@@ -1634,6 +1778,8 @@ static void *io_worker(void *arg) {
                 }
             }
             m->grid_unit = gu > 0 ? (double)gu : 0.0;
+            long gf = json_int(js, "gf", 0);
+            m->grid_fpm = gu <= 0 ? 0.0 : (gf > 0 ? (double)gf : follow_fpm(m));
         }
     }
 
@@ -1678,6 +1824,7 @@ static void session_start(mark_t *m, int slot, int op) {
         }
         reset_undo(m);
         m->grid_unit = 0.0;
+        m->grid_fpm = 0.0;
     } else {
         /* saving while overdubbing/recording would race the writer — leave
          * dub, and finalize a recording at what's already down (no
@@ -1828,12 +1975,56 @@ static void track_fx_run(mark_t *m, mk_track_t *t, float *l, float *r) {
     }
 }
 
+/* tempo_follow hysteresis: engage beyond 0.3 % (~5 cents, ~0.36 BPM at
+ * 120), release inside 0.15 %. Inside it a loop plays the untouched 1x
+ * path — clock-estimate jitter can't flutter the pitch, and overdub stays
+ * available at the tempo you recorded at. */
+#define FOLLOW_ENGAGE   0.003
+#define FOLLOW_RELEASE  0.0015
+/* per-block slew toward the goal rate: ~17 ms at 128-frame blocks, so a
+ * speed change glides like tape rather than clicking */
+#define RATE_SLEW       0.15
+
+/* Once per block: each track's goal rate from its speed and, under
+ * tempo_follow, (recorded tempo / tempo now) trimmed by the downbeat
+ * phase correction; then slew toward it. At speed 0 with follow off the
+ * goal is exactly 1.0 and rate never leaves 1.0. */
+static void update_rates(mark_t *m) {
+    int clocked = clock_governs(m) && m->clock_running;
+    if (!m->tempo_follow || !clocked) m->phase_corr = 1.0;
+    double now = follow_fpm(m);
+    for (int i = 0; i < MARK_TRACKS; i++) {
+        mk_track_t *t = &m->t[i];
+        double goal = t->speed ? exp2((double)t->speed / 1200.0) : 1.0;
+        if (m->tempo_follow && t->len > 0 && t->rec_fpm > 0.0 && now > 0.0) {
+            double ratio = t->rec_fpm / now;
+            double dev = fabs(ratio - 1.0);
+            if (!t->fl_on && dev > FOLLOW_ENGAGE) t->fl_on = 1;
+            else if (t->fl_on && dev < FOLLOW_RELEASE) t->fl_on = 0;
+            if (t->fl_on) goal *= ratio * m->phase_corr;
+        } else {
+            t->fl_on = 0;
+        }
+        if (goal != 1.0 && t->st == MK_DUB) {   /* left 1x: dub ends */
+            t->st = MK_PLAY;
+            end_dub_capture(m, i);
+            m->edit_rev++;
+        }
+        t->rate_goal = goal;
+        if (t->rate != goal) {
+            t->rate += (goal - t->rate) * RATE_SLEW;
+            if (fabs(goal - t->rate) < 1e-7) t->rate = goal;
+        }
+    }
+}
+
 void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
     if (!m) return;
     if (frames > MARK_BLOCK_FRAMES) frames = MARK_BLOCK_FRAMES;
 
     fx_apply_pending(m);
     swap_step(m);
+    update_rates(m);
     mk_ext_fx_t *block_fx[MARK_TRACKS] = {0};
     int use_ext[MARK_TRACKS] = {0};
     for (int i = 0; i < MARK_TRACKS; i++) {
@@ -1856,10 +2047,13 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
         /* --- pending scheduler: fire on the grid --- */
         int boundary = 0;
-        mk_track_t *base = base_playing(m);
+        mk_track_t *base = grid_base(m);
         if (base && !paused) {
-            double g = m->grid_unit > 0.0 ? m->grid_unit : frames_per_measure(m);
-            if (g >= 1.0 && fmod(base->pos, g) < 1.0) boundary = 1;
+            double g = track_grid(m, base);
+            /* pos just stepped by base->rate: a boundary was crossed iff
+             * the phase is now below one step (at 1x, the original < 1.0;
+             * above 1x a fixed < 1.0 could step straight over it) */
+            if (g >= 1.0 && fmod(base->pos, g) < base->rate) boundary = 1;
         } else if (use_measure_flag && n == 0) {
             boundary = 1;
         }
@@ -1915,11 +2109,27 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
 
             uint32_t ip = (uint32_t)t->pos;
             if (ip >= t->len) ip = t->len - 1;
-            uint32_t rp = t->rev ? (t->len - 1 - ip) : ip;
-            float l = (float)t->buf[rp * 2];
-            float r = (float)t->buf[rp * 2 + 1];
+            float l, r;
+            if (t->rate == 1.0) {
+                uint32_t rp = t->rev ? (t->len - 1 - ip) : ip;
+                l = (float)t->buf[rp * 2];
+                r = (float)t->buf[rp * 2 + 1];
+            } else {
+                /* varispeed: linear read between neighbours, wrapping at
+                 * the loop edge (aliasing at 2x/4x is part of the tape
+                 * character, not filtered) */
+                double fp = t->rev ? ((double)t->len - 1.0 - t->pos) : t->pos;
+                if (fp < 0.0) fp += (double)t->len;
+                uint32_t i0 = (uint32_t)fp;
+                if (i0 >= t->len) i0 = t->len - 1;
+                uint32_t i1 = i0 + 1 < t->len ? i0 + 1 : 0;
+                float fr = (float)(fp - (double)i0);
+                float l0 = (float)t->buf[i0 * 2], r0 = (float)t->buf[i0 * 2 + 1];
+                l = l0 + ((float)t->buf[i1 * 2] - l0) * fr;
+                r = r0 + ((float)t->buf[i1 * 2 + 1] - r0) * fr;
+            }
 
-            if (t->st == MK_DUB) {
+            if (t->st == MK_DUB && t->rate == 1.0) {
                 /* capture-before-write; writes run sequentially from the
                  * gesture start, so the captured region stays contiguous */
                 if (m->undo_capturing && m->undo_track == i &&
@@ -1949,9 +2159,12 @@ void mark_process(mark_t *m, const int16_t *in, int16_t *out, int frames) {
                 outr += r * t->g_cur * t->pg[1];
             }
 
-            t->pos += 1.0;
+            t->pos += t->rate;
             if (t->pos >= (double)t->len) {
-                t->pos = 0.0;
+                /* keep the fractional phase (a reset to 0 would slip it
+                 * every lap off 1x); at 1x this is exactly 0.0 */
+                t->pos -= (double)t->len;
+                if (t->pos >= (double)t->len) t->pos = fmod(t->pos, (double)t->len);
                 if (t->shot) {       /* one-shot: play once, then stop */
                     if (t->st == MK_DUB) end_dub_capture(m, i);
                     t->st = MK_STOP;
@@ -2032,6 +2245,18 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
             return;
         }
         if (!strcmp(k, "shot"))  { t->shot = atoi(val) ? 1 : 0; m->edit_rev++; return; }
+        if (!strcmp(k, "speed")) {
+            /* cents; the panel decides octave-locked vs free by what it
+             * sends. Off 0 a dub ends here (update_rates would end it at
+             * the next block anyway). */
+            t->speed = clampi(atoi(val), -2400, 2400);
+            if (t->speed && t->st == MK_DUB) {
+                t->st = MK_PLAY;
+                end_dub_capture(m, ti);
+            }
+            m->edit_rev++;
+            return;
+        }
         if (!strcmp(k, "fx")) {
             int fx = clampi(atoi(val), 0, TFX_COUNT - 1);
             if (fx != t->fx) track_fx_reset(t);
@@ -2083,6 +2308,13 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
     if (!strcmp(key, "follow")) {
         m->follow = atoi(val) ? 1 : 0;
         if (!m->follow) m->transport_paused = 0;
+        m->edit_rev++;
+        return;
+    }
+    if (!strcmp(key, "tempo_follow")) {
+        m->tempo_follow = atoi(val) ? 1 : 0;
+        if (m->grid_unit > 0.0 && m->grid_fpm <= 0.0)
+            m->grid_fpm = follow_fpm(m);
         m->edit_rev++;
         return;
     }
@@ -2140,13 +2372,17 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
         m->master     = clampi(json_int(val, "mst", m->master), 0, 200);
         m->master_g   = (float)m->master / 100.0f;
         m->follow     = json_int(val, "flw", m->follow) ? 1 : 0;
+        m->tempo_follow = json_int(val, "tf", m->tempo_follow) ? 1 : 0;
+        if (m->grid_unit > 0.0 && m->grid_fpm <= 0.0)
+            m->grid_fpm = follow_fpm(m);
         const char *arr;
         struct { const char *key; int which; } fields[] = {
             { "\"lv\":\"", 0 }, { "\"pn\":\"", 1 },
             { "\"rv\":\"", 2 }, { "\"sh\":\"", 3 },
             { "\"fx\":\"", 4 }, { "\"fo\":\"", 5 }, { "\"fp\":\"", 6 },
+            { "\"sp\":\"", 7 },
         };
-        for (int f = 0; f < 7; f++) {
+        for (int f = 0; f < 8; f++) {
             arr = strstr(val, fields[f].key);
             if (!arr) continue;
             arr += strlen(fields[f].key);
@@ -2175,6 +2411,13 @@ void mark_set_param(mark_t *m, const char *key, const char *val) {
                     break;
                 }
                 case 6: t->fxp = clampi((int)v, 0, 100); t->fx_dirty = 1; break;
+                case 7:
+                    t->speed = clampi((int)v, -2400, 2400);
+                    if (t->speed && t->st == MK_DUB) {
+                        t->st = MK_PLAY;
+                        end_dub_capture(m, i);
+                    }
+                    break;
                 }
                 arr = (*end == ',') ? end + 1 : end;
             }
@@ -2210,6 +2453,7 @@ static int g_pend(const mk_track_t *t)  { return t->pending; }
 static int g_fx(const mk_track_t *t)    { return t->fx; }
 static int g_fxon(const mk_track_t *t)  { return t->fx_on; }
 static int g_fxp(const mk_track_t *t)   { return t->fxp; }
+static int g_speed(const mk_track_t *t) { return t->speed; }
 
 int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
     if (!m || !key || !buf || buf_len < 2) return -1;
@@ -2222,6 +2466,10 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         if (!strcmp(k, "pan"))   return snprintf(buf, (size_t)buf_len, "%d", t->pan);
         if (!strcmp(k, "rev"))   return snprintf(buf, (size_t)buf_len, "%d", t->rev);
         if (!strcmp(k, "shot"))  return snprintf(buf, (size_t)buf_len, "%d", t->shot);
+        if (!strcmp(k, "speed")) return snprintf(buf, (size_t)buf_len, "%d", t->speed);
+        /* effective playback rate x10000 (speed x tempo follow), display */
+        if (!strcmp(k, "rate"))
+            return snprintf(buf, (size_t)buf_len, "%d", (int)(t->rate * 10000.0 + 0.5));
         if (!strcmp(k, "len"))   return snprintf(buf, (size_t)buf_len, "%u", t->len);
         if (!strcmp(k, "state")) return snprintf(buf, (size_t)buf_len, "%d", t->st);
         if (!strcmp(k, "fx"))    return snprintf(buf, (size_t)buf_len, "%d", t->fx);
@@ -2345,6 +2593,8 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         return snprintf(buf, (size_t)buf_len, "%d", rs);
     }
     if (!strcmp(key, "quantize"))   return snprintf(buf, (size_t)buf_len, "%d", m->quantize);
+    if (!strcmp(key, "tempo_follow"))
+        return snprintf(buf, (size_t)buf_len, "%d", m->tempo_follow);
     if (!strcmp(key, "rec_grid"))   return snprintf(buf, (size_t)buf_len, "%d", m->rec_grid);
     if (!strcmp(key, "tunits")) {
         /* per-track length in current rec_grid units (0 = empty) */
@@ -2449,15 +2699,16 @@ int mark_get_param(mark_t *m, const char *key, char *buf, int buf_len) {
         int n = 0;
         n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
                                 "{\"q\":%d,\"gd\":%d,\"ra\":%d,\"dm\":%d,\"pm\":%d,"
-                                "\"mst\":%d,\"flw\":%d",
+                                "\"mst\":%d,\"flw\":%d,\"tf\":%d",
                                 m->quantize, m->rec_grid, m->rec_action,
                                 m->dub_mode, m->play_mode, m->master,
-                                m->follow), buf_len);
+                                m->follow, m->tempo_follow), buf_len);
         struct { const char *key; int (*get)(const mk_track_t *); } arrs[] = {
             { "lv", g_level }, { "pn", g_pan }, { "rv", g_rev }, { "sh", g_shot },
-            { "fx", g_fx }, { "fo", g_fxon }, { "fp", g_fxp }, { "ts", g_state },
+            { "fx", g_fx }, { "fo", g_fxon }, { "fp", g_fxp }, { "sp", g_speed },
+            { "ts", g_state },
         };
-        for (int f = 0; f < 8; f++) {
+        for (int f = 0; f < 9; f++) {
             n = nclamp(n + snprintf(buf + n, (size_t)(buf_len - n),
                                     ",\"%s\":\"", arrs[f].key), buf_len);
             n = nclamp(n + track_csv(m, buf + n, buf_len - n, arrs[f].get), buf_len);

@@ -71,6 +71,17 @@ Set Move's **MIDI Clock to Out** (Settings → MIDI Sync) to lock loops to
 Move's transport. Without clock, Mark free-runs at the project tempo and
 the first recorded loop anchors the grid.
 
+**Speed and tempo follow** (engine params; CC below — no Move-UI control
+yet). Each track has a `speed` in cents (±2400, so ¼× to 4×), tape-style:
+pitch moves with speed. `tempo_follow` makes every loop play at
+(tempo it was recorded at ÷ tempo now), so loops keep time when the clock
+or project tempo changes; on a running clock the loops also lock to its
+downbeat. Changes under ~0.3 % (~0.36 BPM at 120) are ignored, so a steady
+clock never wobbles the pitch. Rules: a track off 1× can't overdub (like a
+reversed track), and a sped-up track never sets the grid other tracks wait
+for. Turn tempo follow on *before* recording to a clock, so each loop is
+cut to an exact measure.
+
 ## MIDI CC control
 
 A controller on the Move's USB-A port (Launch Control XL, Faderfox, etc.)
@@ -87,7 +98,8 @@ act at value ≥ 64 — set controller buttons for rec/stop/clear/undo to
 | 40–44 | track 1–5 FX amount | | 85–89 | track 1–5 one-shot |
 | 50–54 | track 1–5 rec/play/dub | | 90–94 | track 1–5 FX on/off |
 | 55 | All Start/Stop | | 102–106 | quantize / dub mode / play mode / follow / monitor |
-| 60–64 | track 1–5 stop | | | |
+| 60–64 | track 1–5 stop | | 107 | tempo follow |
+| 110–114 | track 1–5 speed: ¼ ½ 1 2 4× in five zones | | | |
 
 Suggested Launch Control XL layout: faders 1–5 → track levels, fader 8 →
 master, top knob row → pan, middle row → FX amount, button row 1 →
