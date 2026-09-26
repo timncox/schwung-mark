@@ -962,6 +962,378 @@ static void test_cc_control(void) {
     printf("ok: midi cc control\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* Golden output: a scripted session at default speed with tempo_follow
+ * off, hashed. The expected value was captured from the engine BEFORE
+ * varispeed existed (b82c463), so it proves the 1x path is unchanged
+ * bit for bit. */
+static uint64_t g_hash;
+static void hash_run(mark_t *m, uint64_t n) {
+    static int16_t in[BLOCK * 2], out[BLOCK * 2];
+    while (n > 0) {
+        int c = n > BLOCK ? BLOCK : (int)n;
+        for (int i = 0; i < c; i++) {
+            int16_t v = sig(g_in_frame);
+            in[i * 2] = v;
+            in[i * 2 + 1] = (int16_t)(v / 2);
+            g_in_frame++;
+        }
+        mark_process(m, in, out, c);
+        const uint8_t *p = (const uint8_t *)out;
+        for (size_t i = 0; i < (size_t)c * 4; i++) {
+            g_hash ^= p[i];
+            g_hash *= 1099511628211ull;
+        }
+        n -= (uint64_t)c;
+    }
+}
+
+static uint64_t golden_session(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    g_hash = 1469598103934665603ull;
+    mark_set_param(m, "monitor", "0");
+    mark_set_param(m, "t1_btn", "1");            /* record t1 */
+    hash_run(m, FPM + 30000);
+    mark_set_param(m, "t1_btn", "1");            /* -> 1 measure, keeps going */
+    hash_run(m, FPM);
+    mark_set_param(m, "t2_btn", "1");            /* pending, aligned */
+    hash_run(m, FPM + 40000);
+    mark_set_param(m, "t2_btn", "1");
+    hash_run(m, FPM * 2);
+    mark_set_param(m, "t2_fx", "1");             /* low-pass on t2 */
+    mark_set_param(m, "t2_fx_on", "1");
+    mark_set_param(m, "t2_pan", "20");
+    mark_set_param(m, "t1_btn", "1");            /* overdub t1 */
+    hash_run(m, 50000);
+    mark_set_param(m, "t1_btn", "1");            /* back to play */
+    hash_run(m, FPM);
+    mark_set_param(m, "t3_btn", "1");            /* t3, pending */
+    hash_run(m, FPM + 10000);
+    mark_set_param(m, "t3_btn", "1");
+    hash_run(m, FPM);
+    mark_set_param(m, "t3_rev", "1");
+    mark_set_param(m, "t2_trim", "-1");
+    hash_run(m, FPM * 2);
+    uint8_t start = 0xFA, tick = 0xF8;            /* a clocked stretch */
+    mark_on_midi(m, &start, 1, MOVE_MIDI_SOURCE_EXTERNAL);
+    for (int k = 0; k < 96 * 3; k++) {
+        mark_on_midi(m, &tick, 1, MOVE_MIDI_SOURCE_EXTERNAL);
+        hash_run(m, 912);                          /* a hair fast of 120 */
+    }
+    mark_set_param(m, "t1_shot", "1");
+    hash_run(m, FPM * 2);
+    mark_set_param(m, "undo", "1");
+    hash_run(m, FPM);
+    mark_destroy(m);
+    return g_hash;
+}
+
+/* ------------------------------------------------------------------ */
+/* Varispeed + tempo follow                                            */
+
+/* frames for a rate slew to land exactly on its goal (0.85^128 < 1e-7) */
+#define SETTLE 16384
+
+static int tposv(mark_t *m, int ti) {
+    char buf[64];
+    gp_str(m, "tpos", buf, sizeof(buf));
+    int v[5] = {0};
+    sscanf(buf, "%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4]);
+    return v[ti];
+}
+
+static int trate(mark_t *m, int ti) {
+    char key[16];
+    snprintf(key, sizeof(key), "t%d_rate", ti + 1);
+    return gp_int(m, key);
+}
+
+/* Frames between two successive loop wraps of track ti, measured in
+ * 8-frame steps (wrap = tpos drops). */
+static uint32_t wrap_period(mark_t *m, int ti, uint64_t limit) {
+    int prev = tposv(m, ti);
+    uint64_t t0 = 0, run_n = 0;
+    int seen = 0;
+    while (run_n < limit) {
+        run(m, 8, 1, NULL);
+        run_n += 8;
+        int v = tposv(m, ti);
+        if (v < prev - 64) {
+            if (seen) return (uint32_t)(run_n - t0);
+            seen = 1;
+            t0 = run_n;
+        }
+        prev = v;
+    }
+    return 0;
+}
+
+/* One exact measure on track ti, started immediately (nothing playing). */
+static void record_one_measure(mark_t *m, int ti) {
+    char key[16];
+    snprintf(key, sizeof(key), "t%d_btn", ti + 1);
+    mark_set_param(m, key, "1");
+    run(m, FPM - 20000, 0, NULL);
+    mark_set_param(m, key, "1");
+    run(m, 20000 + BLOCK, 0, NULL);
+    assert(tstate(m, ti) == MK_PLAY);
+    assert(tlen(m, ti) == FPM);
+}
+
+static void test_speed_octaves(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    record_one_measure(m, 0);
+    assert(trate(m, 0) == 10000);
+
+    mark_set_param(m, "t1_speed", "1200");            /* 2x */
+    assert(gp_int(m, "t1_speed") == 1200);
+    run(m, SETTLE, 1, NULL);                          /* slew settles */
+    assert(trate(m, 0) == 20000);
+    uint32_t p = wrap_period(m, 0, FPM * 3);
+    assert(p >= FPM / 2 - 16 && p <= FPM / 2 + 16);
+
+    mark_set_param(m, "t1_speed", "-1200");           /* 1/2x */
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 0) == 5000);
+    p = wrap_period(m, 0, FPM * 5);
+    assert(p >= FPM * 2 - 16 && p <= FPM * 2 + 16);
+
+    /* off 1x: overdub refused, like reverse */
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+
+    /* back to 1x: rate returns to exactly 1.0 and dub works again */
+    mark_set_param(m, "t1_speed", "0");
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 0) == 10000);
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_DUB);
+    /* a speed change mid-dub ends the dub */
+    mark_set_param(m, "t1_speed", "1200");
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(gp_int(m, "undo_avail") == 1);
+
+    mark_destroy(m);
+    printf("ok: octave speed, dub refused off 1x\n");
+}
+
+static void test_speed_never_anchors_grid(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    record_one_measure(m, 0);
+    mark_set_param(m, "t1_speed", "1200");
+    run(m, 30000, 1, NULL);
+
+    /* only a 2x track playing: there is no grid, so a record starts now
+     * (quantize behaves as with nothing playing) */
+    mark_set_param(m, "t2_btn", "1");
+    assert(tstate(m, 1) == MK_REC);
+    run(m, FPM - 20000, 0, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    run(m, 20000 + BLOCK, 0, NULL);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tlen(m, 1) == FPM);
+
+    /* now t2 (1x) is the base even though t1 is lower-numbered: a pending
+     * record on t3 fires on t2's bar, not t1's half-bar */
+    run(m, 30000, 1, NULL);
+    mark_set_param(m, "t3_btn", "1");
+    assert(tstate(m, 2) == MK_EMPTY);
+    int fired_at = -1;
+    for (int k = 0; k < (int)(FPM / 64) + 8 && fired_at < 0; k++) {
+        run(m, 64, 1, NULL);
+        if (tstate(m, 2) == MK_REC) fired_at = tposv(m, 1);
+    }
+    assert(fired_at >= 0);
+    assert(fired_at <= 1 || fired_at >= 126);        /* at t2's top */
+
+    /* the All button still sees a 2x-only rack as playing */
+    mark_set_param(m, "t2_stop", "1");
+    mark_set_param(m, "t3_stop", "1");
+    run(m, BLOCK, 1, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    mark_set_param(m, "all_btn", "1");
+    assert(tstate(m, 0) == MK_STOP);
+
+    mark_destroy(m);
+    printf("ok: a sped track never anchors the grid\n");
+}
+
+static void test_tempo_follow_override(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    mark_set_param(m, "bpm_override", "120");
+    record_one_measure(m, 0);
+    mark_set_param(m, "tempo_follow", "1");
+    assert(gp_int(m, "tempo_follow") == 1);
+
+    /* inside the deadband: untouched 1x, overdub still available */
+    mark_set_param(m, "bpm_override", "120.1");
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 0) == 10000);
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_DUB);
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+
+    /* 120 -> 132 BPM: the loop speeds up by 1.1, a bar is a bar */
+    mark_set_param(m, "bpm_override", "132");
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 0) == 11000);
+    uint32_t bar = (uint32_t)(FPM / 1.1 + 0.5);       /* 80182 */
+    uint32_t p = wrap_period(m, 0, FPM * 3);
+    assert(p >= bar - 16 && p <= bar + 16);
+    mark_set_param(m, "t1_btn", "1");                  /* off 1x: no dub */
+    assert(tstate(m, 0) == MK_PLAY);
+
+    /* a loop recorded at the new tempo quantizes to the NEW bar, plays at
+     * 1x, and stays aligned with the followed track */
+    run(m, 20000, 1, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    int fired = 0;
+    for (int k = 0; k < (int)(FPM / 64) + 8 && !fired; k++) {
+        run(m, 64, 0, NULL);
+        fired = tstate(m, 1) == MK_REC;
+    }
+    assert(fired);
+    run(m, bar - 30000, 0, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    run(m, 30000 + BLOCK, 0, NULL);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tlen(m, 1) >= bar - 1 && tlen(m, 1) <= bar + 1);
+    assert(trate(m, 1) == 10000);
+    run(m, bar * 4, 1, NULL);
+    int d = abs(tposv(m, 0) - tposv(m, 1));
+    assert(d <= 1 || d >= 127);
+
+    /* back to 120: t1 returns to exactly 1x, t2 slows to 120/132 */
+    mark_set_param(m, "bpm_override", "120");
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 0) == 10000);
+    assert(trate(m, 1) == 9091);
+
+    /* follow off: everything back to 1x */
+    mark_set_param(m, "tempo_follow", "0");
+    run(m, SETTLE, 1, NULL);
+    assert(trate(m, 1) == 10000);
+
+    mark_destroy(m);
+    printf("ok: tempo follow under bpm_override\n");
+}
+
+/* External clock with block-quantized delivery (the host hands ticks over
+ * between blocks), tempo changed mid-play. The loop must track the
+ * clock's downbeat, not just its average tempo. */
+static double g_clk_next;
+static uint64_t g_clk_now;
+
+static void clk_run(mark_t *m, uint64_t n, double tick_frames,
+                    int *db_tpos, int *db_count) {
+    static const uint8_t tick = 0xF8;
+    static uint32_t ticks = 0;
+    while (n > 0) {
+        while (g_clk_next <= (double)g_clk_now) {
+            mark_on_midi(m, &tick, 1, MOVE_MIDI_SOURCE_EXTERNAL);
+            g_clk_next += tick_frames;
+            if (++ticks % 96 == 0 && db_tpos && db_count)
+                db_tpos[(*db_count)++ % 64] = tposv(m, 0);
+        }
+        run(m, BLOCK, 0, NULL);
+        g_clk_now += BLOCK;
+        n = n > BLOCK ? n - BLOCK : 0;
+    }
+}
+
+static void test_tempo_follow_clock(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+    g_clk_now = 0;
+    g_clk_next = 0.0;
+    uint8_t start = 0xFA;
+    double t120 = 918.75, t126 = (double)MARK_SR * 60.0 / (126.0 * 24.0);
+
+    mark_set_param(m, "tempo_follow", "1");
+    mark_on_midi(m, &start, 1, MOVE_MIDI_SOURCE_EXTERNAL);
+    clk_run(m, FPM * 2, t120, NULL, NULL);            /* estimate settles */
+    mark_set_param(m, "t1_btn", "1");                  /* waits for downbeat */
+    clk_run(m, FPM + 20000, t120, NULL, NULL);
+    assert(tstate(m, 0) == MK_REC);
+    mark_set_param(m, "t1_btn", "1");
+    clk_run(m, FPM, t120, NULL, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    uint32_t len = tlen(m, 0);
+    if (len < FPM - 200 || len > FPM + 200) printf("clocked len %u\n", len);
+    assert(len >= FPM - 200 && len <= FPM + 200);
+
+    /* steady tempo: follow stays disengaged, so the loop is untouched */
+    clk_run(m, FPM * 4, t120, NULL, NULL);
+    assert(trate(m, 0) == 10000);
+
+    /* clock to 126 BPM: rate ~1.05, then locked to the downbeat */
+    int db[64], dbn = 0;
+    clk_run(m, FPM * 24, t126, db, &dbn);
+    int r = trate(m, 0);
+    printf("  126 BPM: rate x%.4f, base phase at each clock downbeat (/128):",
+           r / 10000.0);
+    for (int k = 0; k < dbn && k < 64; k++) printf(" %d", db[k]);
+    printf("\n");
+    assert(r >= 10450 && r <= 10550);
+    /* last 8 downbeats: base within ~2 % of a bar of the clock's top */
+    for (int k = dbn - 8; k < dbn; k++) {
+        int v = db[k % 64];
+        assert(v <= 3 || v >= 125);
+    }
+
+    mark_destroy(m);
+    printf("ok: tempo follow locks to a changed external clock\n");
+}
+
+static void test_speed_persistence_and_cc(void) {
+    mark_t *m = mark_create(&host);
+    mark_set_param(m, "t2_speed", "-1200");
+    mark_set_param(m, "t4_speed", "700");
+    mark_set_param(m, "tempo_follow", "1");
+    char blob[8192];
+    assert(mark_get_param(m, "state", blob, sizeof(blob)) > 0);
+    assert(strstr(blob, "\"tf\":1"));
+    assert(strstr(blob, "\"sp\":\"0,-1200,0,700,0\""));
+    mark_t *m2 = mark_create(&host);
+    mark_set_param(m2, "state", blob);
+    assert(gp_int(m2, "t2_speed") == -1200);
+    assert(gp_int(m2, "t4_speed") == 700);
+    assert(gp_int(m2, "tempo_follow") == 1);
+    /* an old preset (no sp/tf) leaves the settings alone */
+    mark_set_param(m2, "state", "{\"q\":1}");
+    assert(gp_int(m2, "t2_speed") == -1200);
+    mark_destroy(m2);
+
+    uint8_t cc[3] = { 0xB0, 112, 127 };               /* t3 speed top zone */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t3_speed") == 2400);
+    cc[2] = 64;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t3_speed") == 0);
+    cc[2] = 0;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t3_speed") == -2400);
+    cc[1] = 107; cc[2] = 0;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "tempo_follow") == 0);
+    mark_destroy(m);
+    printf("ok: speed + tempo_follow persist, CC 107 / 110-114\n");
+}
+
+static void test_golden_unity(void) {
+    uint64_t h = golden_session();
+    if (h != 0x3de182c67a1e41d2ull) {
+        printf("golden %016llx != 3de182c67a1e41d2\n", (unsigned long long)h);
+        assert(0);
+    }
+    printf("ok: 1x output bit-identical to pre-varispeed engine\n");
+}
+
 int main(void) {
     test_record_quantize();
     test_second_track_aligned();
@@ -982,6 +1354,12 @@ int main(void) {
     test_trim_session_roundtrip();
     test_len16_and_16th_grid();
     test_cc_control();
+    test_golden_unity();
+    test_speed_octaves();
+    test_speed_never_anchors_grid();
+    test_tempo_follow_override();
+    test_tempo_follow_clock();
+    test_speed_persistence_and_cc();
     printf("all mark sim tests passed\n");
     return 0;
 }
