@@ -274,6 +274,16 @@ bool load(DaisyPatch &hw, const char *name, void (*progress)(int pct), char *err
 void run(DaisyPatch &hw)
 {
     g_hw = &hw;
+
+    /* Say so at once: the gesture that got here (push-and-turn on "mods") is
+     * still held, and until it is released the module's own screen used to
+     * sit frozen, which read as "nothing happened". */
+    hw.display.Fill(false);
+    hw.display.SetCursor(0, 0);
+    hw.display.WriteString("MODULES", Font_6x8, true);
+    hw.display.SetCursor(0, 26);
+    hw.display.WriteString("let go to open", Font_6x8, true);
+    hw.display.Update();
     wait_release(hw);
 
     List list;
@@ -282,7 +292,9 @@ void run(DaisyPatch &hw)
     snprintf(status, sizeof(status), "%s",
              have ? (list.count ? "" : "empty") : (g_fsi ? "no folder" : "no card"));
 
-    int      sel       = 0;
+    /* Start on the first module, not "back": a press straight away should
+     * load something, not quietly return. "back" is one click up. */
+    int      sel       = list.count ? 1 : 0;
     uint32_t last_draw = 0;
 
     for(;;)
