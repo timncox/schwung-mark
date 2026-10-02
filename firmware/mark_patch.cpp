@@ -364,6 +364,15 @@ static void encoder(void)
         }
     }
 
+    /* On "mods" a press only ever opens the picker (push-and-turn, the same
+     * gesture on every Patch module), so a slow turn cannot undo or toggle
+     * the transport on the way. */
+    if(g_menu_sel == MI_MODS)
+    {
+        if(!hw.encoder.Pressed()) enc_down = false; /* no all_btn on release */
+        return;
+    }
+
     if(enc_down && !enc_turned && !enc_held && hw.encoder.Pressed()
        && (uint32_t)hw.encoder.TimeHeldMs() > HOLD_UNDO_MS)
     {
