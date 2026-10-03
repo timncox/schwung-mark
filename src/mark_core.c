@@ -67,6 +67,18 @@ typedef enum {
 #define MARK_DLY_LEN 32768     /* 8th-note delay down through the UI's 50 BPM */
 #define MARK_SESSION_SLOTS 16
 #define MARK_BLOCK_FRAMES 128
+/* Tempo regression window, in ticks: 8 bars at 24 ppqn. A tick is stamped
+ * with global_frames, which moves once per render block, so one tick gap
+ * reads 896 or 1024 frames at 120 BPM / 48 kHz (and a gate clock's edges
+ * are block-quantized too). A quantized loop's length is a snapshot of
+ * this estimate and plays at fixed speed forever after, so its error IS
+ * drift against the clock, every bar. Least squares over 96 ticks (Smack's
+ * window) still leaves up to ~4 ms/bar at awkward tempos; a full 768
+ * keeps it under ~0.15 ms/bar at 44.1k and 48k alike (6 KB, one pass per
+ * tick). Until the window fills, accuracy is bounded by how long the clock
+ * has run: block-quantized stamps over T seconds pin the bar to roughly
+ * a block / T (~0.5 ms/bar after 7 s, measured on patch-sim). */
+#define MARK_TICK_WIN 768
 #define MARK_FX_CATALOG_MAX 48
 #define MARK_FX_ID_MAX 64
 #define MARK_FX_NAME_MAX 80
@@ -189,8 +201,14 @@ struct mark {
 
     /* Clock (smack pattern). Global frame counter across all blocks. */
     uint64_t global_frames;
-    double   frames_per_tick;    /* smoothed; 918.75 = 120 BPM */
+    double   frames_per_tick;    /* estimated; 120 BPM = MARK_SR*60/2880 */
     uint64_t last_tick_global;
+    /* Tick-time history for the tempo regression (see clock_tick_push).
+     * Fixed-size, inside mark_t: the render path never allocates. */
+    uint64_t tick_hist[MARK_TICK_WIN];
+    uint16_t tick_hist_n;        /* entries held, <= MARK_TICK_WIN */
+    uint16_t tick_hist_pos;      /* next write; oldest entry when full */
+    double   tick_pred;          /* frame the next tick is expected at */
     uint32_t tick_total;
     int      clock_running;
     int      clock_seen;
@@ -493,9 +511,13 @@ static double frames_per_measure(const mark_t *m) {
     return frames_per_tick_now(m) * 96.0;   /* 4/4, 24 ppqn */
 }
 
-/* Quantization grid in frames: running clock > session grid unit > tempo. */
+/* Quantization grid in frames: session grid unit > tempo (running clock
+ * included). Once the first loop exists its measure IS the grid: loops
+ * play at fixed speed, so a later layer rounded to the clock's live
+ * estimate instead would be a few frames off track 1 and slide against
+ * it every pass. With a clock running, grid_unit was itself measured
+ * from that clock, so the two agree to within the estimate's error. */
 static double effective_grid(const mark_t *m) {
-    if (m->clock_seen && m->clock_running) return frames_per_measure(m);
     if (m->grid_unit > 0.0) return m->grid_unit;
     return frames_per_measure(m);
 }
@@ -907,7 +929,8 @@ mark_t *mark_create_in_dir(const host_api_v1_t *host, const char *module_dir) {
     }
     if (!m->track_frames) { free(m); return NULL; }
 
-    m->frames_per_tick = 918.75;   /* 120 BPM */
+    /* 120 BPM at THIS build's rate (918.75 at 44.1k, 1000 at 48k) */
+    m->frames_per_tick = (double)MARK_SR * 60.0 / (120.0 * 24.0);
     m->undo_track = -1;
     m->swap_track = -1;
     m->quantize = 1;
@@ -1042,11 +1065,78 @@ static void mark_handle_cc(mark_t *m, int cc, int v) {
     }
 }
 
+/* One 0xF8 arrived at global_frames: update frames_per_tick.
+ *
+ * Smack's estimator, with a longer window (MARK_TICK_WIN) and a reset.
+ * The first dozen ticks after a (re)start use the old EMA; from then on
+ * frames_per_tick is the least-squares slope of tick time against tick
+ * index over the history, which averages the block quantization out
+ * instead of baking the latest 896/1024-frame gap into every loop.
+ *
+ * The index axis assumes consecutive ticks. A dropped F8 (Move's input
+ * queue can lose one under pad pressure -- Smack lesson), a tempo jump or
+ * a clock that stopped and came back would bias a long window for bars,
+ * so when a tick lands more than half a tick (and more than two blocks of
+ * stamp jitter) off the fitted line the history restarts at that tick. */
+static void clock_tick_push(mark_t *m) {
+    uint64_t f = m->global_frames;
+    if (m->tick_hist_n >= 12) {
+        double tol = fmax(0.5 * m->frames_per_tick, 2.0 * MARK_BLOCK_FRAMES);
+        if (fabs((double)f - m->tick_pred) > tol) m->tick_hist_n = 0;
+    }
+    if (m->tick_hist_n == 0) m->tick_hist_pos = 0;
+    else if (m->tick_hist_n < 12 && f > m->last_tick_global) {
+        double d = (double)(f - m->last_tick_global);
+        if (d > 100.0 && d < 20000.0)
+            m->frames_per_tick = 0.9 * m->frames_per_tick + 0.1 * d;
+    }
+
+    m->tick_hist[m->tick_hist_pos] = f;
+    m->tick_hist_pos = (uint16_t)((m->tick_hist_pos + 1) % MARK_TICK_WIN);
+    if (m->tick_hist_n < MARK_TICK_WIN) m->tick_hist_n++;
+
+    int n = (int)m->tick_hist_n;
+    if (n < 12) return;
+    int first = ((int)m->tick_hist_pos + MARK_TICK_WIN - n) % MARK_TICK_WIN;
+    uint64_t y0 = m->tick_hist[first];
+    double sy = 0.0, sxy = 0.0;
+    for (int i = 0, k = first; i < n; i++) {
+        double y = (double)(m->tick_hist[k] - y0);
+        sy += y;
+        sxy += (double)i * y;
+        if (++k == MARK_TICK_WIN) k = 0;
+    }
+    /* x = 0..n-1, so its sums are closed-form */
+    double dn = (double)n;
+    double sx = dn * (dn - 1.0) * 0.5;
+    double sxx = (dn - 1.0) * dn * (2.0 * dn - 1.0) / 6.0;
+    double den = dn * sxx - sx * sx;
+    if (den <= 0.0) return;
+    double slope = (dn * sxy - sx * sy) / den;
+    if (slope > 100.0 && slope < 20000.0) {
+        m->frames_per_tick = slope;
+        /* the next tick is index n on this fit's line */
+        m->tick_pred = (double)y0 + (sy - slope * sx) / dn + slope * dn;
+    } else {
+        m->tick_hist_n = 0;   /* nonsense fit: start over */
+    }
+}
+
 void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
     if (!m || len < 1) return;
     switch (msg[0]) {
     case 0xFA: /* start */
     case 0xFB: /* continue: treated as downbeat too (pushnpull convention) */
+        /* To this engine a start IS tick 0 (the next F8 counts 1). Sent
+         * while the clock already runs -- a re-zeroed bar, e.g. the Patch
+         * shim moving bar 1 onto the gate's first pulse -- it stands in for
+         * the tick at that instant, so stamp it: the regression's index axis
+         * then has no hole. (If an F8 also arrives at the same instant the
+         * residual check simply restarts the history, as for any glitch.) */
+        if (m->clock_running && m->tick_hist_n > 0) {
+            clock_tick_push(m);
+            m->last_tick_global = m->global_frames;
+        }
         m->tick_total = 0;
         m->clock_running = 1;
         m->measure_flag = 1;
@@ -1062,11 +1152,7 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         if (m->follow && base_playing(m)) m->transport_paused = 1;
         break;
     case 0xF8:
-        if (m->clock_seen && m->global_frames > m->last_tick_global) {
-            double d = (double)(m->global_frames - m->last_tick_global);
-            if (d > 100.0 && d < 20000.0)
-                m->frames_per_tick = 0.9 * m->frames_per_tick + 0.1 * d;
-        }
+        clock_tick_push(m);
         m->last_tick_global = m->global_frames;
         m->clock_seen = 1;
         m->tick_total++;

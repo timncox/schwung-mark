@@ -113,12 +113,34 @@ static void rt_push(uint8_t b)                 /* main thread */
     g_rt_head  = (h + 1) % RT_QUEUE;
 }
 
+/*
+ * Bar phase from the gate. The adapter's FIRST pulse is the downbeat ("first
+ * pulse defines the downbeat", clock_adapter.c), but the gate only takes the
+ * engine when the adapter locks, on pulse 2, and the owner switch's 0xFA
+ * zeroes the engine's bar count there -- so bar 1 would be pulse 2. Instead,
+ * g_gate_pulse counts pulses from the adapter's downbeat, and the first edge
+ * tick that falls on a bar line counted from pulse 1 (every 96 / ratio
+ * pulses: 1, 5, 9 at "=1") goes to the engine as 0xFA rather than 0xF8. To
+ * the engine 0xFA IS tick 0 -- just as the owner switch's 0xFA stands in for
+ * the lock edge's own (dropped) tick -- so this re-zeroes it on the true
+ * downbeat without adding a tick. Nothing can be waiting on the clock's bar
+ * in between: the owner switch only just started it, and the engine's own
+ * next bar line (96 ticks after pulse 2) comes after the re-zero.
+ *
+ * Audio thread only, like every other realtime byte. g_bar_synced drops
+ * whenever an owner-switch 0xFA is drained (it lands at whatever phase the
+ * lock happened) or the adapter starts a new downbeat.
+ */
+static int  g_gate_pulse;     /* pulses since the adapter's downbeat */
+static bool g_bar_synced;     /* engine's bar count matches g_gate_pulse */
+
 static void rt_drain(void)                     /* audio thread */
 {
     while(g_rt_tail != g_rt_head)
     {
         uint8_t b = g_rt_q[g_rt_tail];
         g_rt_tail = (g_rt_tail + 1) % RT_QUEUE;
+        if(b == 0xFA) g_bar_synced = false;    /* see "bar phase" above */
         mark_on_midi(M, &b, 1, 3);             /* source 3 = host, as on Move */
     }
 }
@@ -127,8 +149,19 @@ static void emit_gate_clock(void *ctx, uint8_t byte)   /* audio thread */
 {
     if(g_clk_src != SRC_GATE) return;
     /* The adapter's own 0xFA fires on its first edge, before it is locked and
-     * before this source owns the engine; the owner switch sends its own. */
+     * before this source owns the engine; the owner switch sends its own, and
+     * the bar re-zero below puts the downbeat back on that first edge. */
     if(byte == 0xFA) return;
+    if(byte == 0xF8 && !g_bar_synced)
+    {
+        /* this tick's place counted from pulse 1 (the edge tick is 0) */
+        int pos = g_gate_pulse * CLK.ticks_per_pulse + CLK.ticks_this_pulse - 1;
+        if(pos % 96 == 0)
+        {
+            byte         = 0xFA;
+            g_bar_synced = true;
+        }
+    }
     mark_on_midi((mark_t *)ctx, &byte, 1, 3);
 }
 
@@ -178,6 +211,15 @@ static bool g_cv_prev[MARK_TRACKS];
 #define CV_PARK_MAX  0.15f   /* a knob above this makes cvmode 0 unusable */
 
 static int g_last_level[MARK_TRACKS];   /* last KNOB reading dispatched; -32768 = never */
+
+/* Channel k's knob + CV as a 0-200 level, the unit cvmode 1 dispatches. */
+static int knob_level(int k)
+{
+    float norm = hw.GetKnobValue((DaisyPatch::Ctrl)k);
+    if(norm < 0.0f) norm = 0.0f;
+    if(norm > 1.0f) norm = 1.0f;
+    return (int)(norm * 200.0f + 0.5f);
+}
 
 /* ---- engine helpers ----------------------------------------------------- */
 
@@ -305,6 +347,15 @@ static void menu_edit(int inc)
                 if(v == 0)
                     for(int k = 0; k < MARK_TRACKS; k++)
                         g_cv_prev[k] = hw.GetKnobValue((DaisyPatch::Ctrl)k) > CV_TRIG_ON;
+                /* Entering level mode: the same, for levels. The knobs sat
+                 * parked through cvmode 0 while the menu set the levels, so
+                 * every reading differs from the last one dispatched and
+                 * would drop each level to its parked knob at once. Seed
+                 * from where they sit; a level follows its knob again only
+                 * once that knob actually moves (last touched wins). */
+                else
+                    for(int k = 0; k < MARK_TRACKS; k++)
+                        g_last_level[k] = knob_level(k);
                 break;
             case MI_RATIO:   g_ratio_sel = v; apply_clock(); break;
             case MI_CLKMODE: g_mode_sel  = v; apply_clock(); break;
@@ -410,7 +461,7 @@ static void dispatch_channels(void)
             continue;   /* levels are menu-only in this mode */
         }
 
-        int v = (int)(norm * 200.0f + 0.5f);
+        int v = knob_level(k);
         if(v == g_last_level[k]) continue;
         g_last_level[k] = v;
         char key[16];
@@ -441,6 +492,15 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     {
         g_gate_edge = false;
         clk_gate_edge(&CLK);
+        /* pending_start: the adapter took this edge as a new downbeat (the
+         * first one, or the first after an idle gap) */
+        if(CLK.pending_start)
+        {
+            g_gate_pulse = 0;
+            g_bar_synced = false;
+        }
+        else   /* mod 96 keeps pulse * ratio mod 96 exact, and never overflows */
+            g_gate_pulse = (g_gate_pulse + 1) % 96;
     }
     clk_advance(&CLK, (int)n, emit_gate_clock, M);
 

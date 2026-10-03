@@ -405,6 +405,70 @@ static void test_clocked_grid(void) {
     printf("ok: clocked measure grid\n");
 }
 
+/* Feed n frames block by block while a MIDI clock at bpm runs; ticks reach
+ * the engine stamped at block boundaries, as the host delivers them.
+ * *next is the true frame of the next tick; skip_tick (if > 0) drops that
+ * tick number to mimic an F8 lost in the host's input queue. */
+static void run_clocked(mark_t *m, uint64_t n, double fpt, double *next,
+                        uint64_t *fed, uint64_t *tickno, uint64_t skip_tick) {
+    uint8_t tick = 0xF8;
+    for (uint64_t done = 0; done < n; done += BLOCK) {
+        run(m, BLOCK, 0, NULL);
+        *fed += BLOCK;
+        while ((double)*fed >= *next) {
+            if (++*tickno != skip_tick) mark_on_midi(m, &tick, 1, 3);
+            *next += fpt;
+        }
+    }
+}
+
+/* A clocked, quantized loop is a snapshot of the tempo estimate and plays
+ * at fixed speed, so its error is drift against the clock every bar. The
+ * estimate must average out the block-quantized tick stamps (one tick gap
+ * reads 896 or 1024 frames at 48k), whenever the record was armed, and a
+ * later layer must lock to track 1's grid rather than the live estimate. */
+static void test_clocked_loop_length(void) {
+    static const double bpms[] = { 120.0, 97.0 };
+    static const uint32_t arm_at[] = { 0, 37 * BLOCK + 61 };
+    for (int b = 0; b < 2; b++)
+    for (int a = 0; a < 2; a++) {
+        mark_t *m = mark_create(&host);
+        g_in_frame = 0;
+        double fpt = (double)MARK_SR * 60.0 / (bpms[b] * 24.0);
+        double bar = fpt * 96.0;
+        double next = fpt;
+        uint64_t fed = 0, tickno = 0;
+        uint8_t start = 0xFA;
+        mark_on_midi(m, &start, 1, 3);
+        /* 6 bars of clock (one F8 lost on the way), then arm mid-bar */
+        run_clocked(m, (uint64_t)(6.0 * bar) + arm_at[a], fpt, &next,
+                    &fed, &tickno, 200);
+        mark_set_param(m, "t1_btn", "1");
+        for (int k = 0; k < 2000 && tstate(m, 0) != MK_REC; k++)
+            run_clocked(m, BLOCK, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 0) == MK_REC);                 /* on a clock bar */
+        run_clocked(m, (uint64_t)(1.3 * bar), fpt, &next, &fed, &tickno, 0);
+        mark_set_param(m, "t1_btn", "1");                /* rounds to 1 bar */
+        run_clocked(m, (uint64_t)bar, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 0) == MK_PLAY);
+        double err = fabs((double)tlen(m, 0) - bar);
+        assert(err <= (double)MARK_SR * 0.00025);      /* 0.25 ms per bar */
+
+        /* layer: ~2.2 bars -> exactly 2 of TRACK 1's bars */
+        mark_set_param(m, "t2_btn", "1");
+        for (int k = 0; k < 2000 && tstate(m, 1) != MK_REC; k++)
+            run_clocked(m, BLOCK, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 1) == MK_REC);
+        run_clocked(m, (uint64_t)(2.2 * bar), fpt, &next, &fed, &tickno, 0);
+        mark_set_param(m, "t2_btn", "1");
+        run_clocked(m, (uint64_t)bar, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 1) == MK_PLAY);
+        assert(tlen(m, 1) == 2 * tlen(m, 0));
+        mark_destroy(m);
+    }
+    printf("ok: clocked loop length (block-stamped ticks, any arm time)\n");
+}
+
 /* record one measure of signal on track ti and leave it playing */
 static void quick_loop(mark_t *m, int ti) {
     char key[8];
@@ -1120,6 +1184,7 @@ int main(void) {
     test_state_blob();
     test_monitor();
     test_clocked_grid();
+    test_clocked_loop_length();
     test_single_mode();
     test_undo_capture_ownership();
     test_track_fx();
