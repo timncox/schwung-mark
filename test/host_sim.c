@@ -18,8 +18,17 @@
 #include "../src/mark_core.h"
 
 #define BLOCK 128
-/* 120 BPM: 918.75 frames/tick, 88200 frames/measure */
-#define FPM 88200u
+/* 120 BPM: at 44.1 kHz that is 918.75 frames/tick, 88200 frames/measure.
+ * Derived from MARK_SR so the suite is meaningful on a 48 kHz build too. */
+#define FPM (MARK_SR * 2u)
+
+/* Frame counts in this file were written against the 44.1 kHz Move build.
+ * AT_SR rescales one to the build's actual rate; it is the identity at
+ * 44100, so the Move numbers are unchanged. */
+#define AT_SR(n) ((uint32_t)((uint64_t)(n) * (uint64_t)FPM / 88200ull))
+
+/* One eighth note at the 120 BPM project tempo: 11025 frames at 44.1 kHz. */
+#define FP8 (FPM / 8u)
 
 static float fake_bpm(void) { return 120.0f; }
 static void fake_log(const char *msg) { (void)msg; }
@@ -118,10 +127,10 @@ static void test_record_quantize(void) {
     /* record ~1.93 measures; stop should extend to exactly 2 measures */
     mark_set_param(m, "t1_btn", "1");
     assert(tstate(m, 0) == MK_REC);          /* immediate: nothing playing */
-    run(m, 170000, 0, NULL);
+    run(m, AT_SR(170000), 0, NULL);
     mark_set_param(m, "t1_btn", "1");
     assert(tstate(m, 0) == MK_REC);          /* still extending to target */
-    run(m, 2 * FPM - 170000 + BLOCK, 0, NULL);
+    run(m, 2 * FPM - AT_SR(170000) + BLOCK, 0, NULL);
     assert(tstate(m, 0) == MK_PLAY);
     assert(tlen(m, 0) == 2 * FPM);
 
@@ -160,14 +169,14 @@ static void test_second_track_aligned(void) {
 
     /* exact 1-measure loop on track 1 */
     mark_set_param(m, "t1_btn", "1");
-    run(m, FPM - 20000, 0, NULL);
+    run(m, FPM - AT_SR(20000), 0, NULL);
     mark_set_param(m, "t1_btn", "1");        /* round(0.77) -> 1 measure */
-    run(m, 20000 + BLOCK, 0, NULL);
+    run(m, AT_SR(20000) + BLOCK, 0, NULL);
     assert(tstate(m, 0) == MK_PLAY);
     assert(tlen(m, 0) == FPM);
 
     /* track 2: press mid-measure — must wait for the grid */
-    run(m, 30000, 0, NULL);
+    run(m, AT_SR(30000), 0, NULL);
     mark_set_param(m, "t2_btn", "1");
     assert(tstate(m, 1) == MK_EMPTY);
     char buf[64];
@@ -178,7 +187,7 @@ static void test_second_track_aligned(void) {
     run(m, FPM, 0, NULL);
     assert(tstate(m, 1) == MK_REC);
     /* stop after ~0.6 measures -> rounds to 1 measure, keeps recording */
-    run(m, 50000, 0, NULL);
+    run(m, AT_SR(50000), 0, NULL);
     mark_set_param(m, "t2_btn", "1");
     run(m, FPM, 0, NULL);
     assert(tstate(m, 1) == MK_PLAY);
@@ -317,7 +326,9 @@ static void test_state_blob(void) {
     mark_set_param(m, "t2_level", "150");
     mark_set_param(m, "t3_pan", "10");
     mark_set_param(m, "t4_rev", "1");
+#if MARK_TRACKS >= 5
     mark_set_param(m, "t5_shot", "1");
+#endif
     mark_set_param(m, "quantize", "0");
     mark_set_param(m, "dub_mode", "1");
     mark_set_param(m, "master", "80");
@@ -330,7 +341,9 @@ static void test_state_blob(void) {
     assert(gp_int(m2, "t2_level") == 150);
     assert(gp_int(m2, "t3_pan") == 10);
     assert(gp_int(m2, "t4_rev") == 1);
+#if MARK_TRACKS >= 5
     assert(gp_int(m2, "t5_shot") == 1);
+#endif
     assert(gp_int(m2, "quantize") == 0);
     assert(gp_int(m2, "dub_mode") == 1);
     assert(gp_int(m2, "master") == 80);
@@ -390,6 +403,70 @@ static void test_clocked_grid(void) {
 
     mark_destroy(m);
     printf("ok: clocked measure grid\n");
+}
+
+/* Feed n frames block by block while a MIDI clock at bpm runs; ticks reach
+ * the engine stamped at block boundaries, as the host delivers them.
+ * *next is the true frame of the next tick; skip_tick (if > 0) drops that
+ * tick number to mimic an F8 lost in the host's input queue. */
+static void run_clocked(mark_t *m, uint64_t n, double fpt, double *next,
+                        uint64_t *fed, uint64_t *tickno, uint64_t skip_tick) {
+    uint8_t tick = 0xF8;
+    for (uint64_t done = 0; done < n; done += BLOCK) {
+        run(m, BLOCK, 0, NULL);
+        *fed += BLOCK;
+        while ((double)*fed >= *next) {
+            if (++*tickno != skip_tick) mark_on_midi(m, &tick, 1, 3);
+            *next += fpt;
+        }
+    }
+}
+
+/* A clocked, quantized loop is a snapshot of the tempo estimate and plays
+ * at fixed speed, so its error is drift against the clock every bar. The
+ * estimate must average out the block-quantized tick stamps (one tick gap
+ * reads 896 or 1024 frames at 48k), whenever the record was armed, and a
+ * later layer must lock to track 1's grid rather than the live estimate. */
+static void test_clocked_loop_length(void) {
+    static const double bpms[] = { 120.0, 97.0 };
+    static const uint32_t arm_at[] = { 0, 37 * BLOCK + 61 };
+    for (int b = 0; b < 2; b++)
+    for (int a = 0; a < 2; a++) {
+        mark_t *m = mark_create(&host);
+        g_in_frame = 0;
+        double fpt = (double)MARK_SR * 60.0 / (bpms[b] * 24.0);
+        double bar = fpt * 96.0;
+        double next = fpt;
+        uint64_t fed = 0, tickno = 0;
+        uint8_t start = 0xFA;
+        mark_on_midi(m, &start, 1, 3);
+        /* 6 bars of clock (one F8 lost on the way), then arm mid-bar */
+        run_clocked(m, (uint64_t)(6.0 * bar) + arm_at[a], fpt, &next,
+                    &fed, &tickno, 200);
+        mark_set_param(m, "t1_btn", "1");
+        for (int k = 0; k < 2000 && tstate(m, 0) != MK_REC; k++)
+            run_clocked(m, BLOCK, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 0) == MK_REC);                 /* on a clock bar */
+        run_clocked(m, (uint64_t)(1.3 * bar), fpt, &next, &fed, &tickno, 0);
+        mark_set_param(m, "t1_btn", "1");                /* rounds to 1 bar */
+        run_clocked(m, (uint64_t)bar, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 0) == MK_PLAY);
+        double err = fabs((double)tlen(m, 0) - bar);
+        assert(err <= (double)MARK_SR * 0.00025);      /* 0.25 ms per bar */
+
+        /* layer: ~2.2 bars -> exactly 2 of TRACK 1's bars */
+        mark_set_param(m, "t2_btn", "1");
+        for (int k = 0; k < 2000 && tstate(m, 1) != MK_REC; k++)
+            run_clocked(m, BLOCK, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 1) == MK_REC);
+        run_clocked(m, (uint64_t)(2.2 * bar), fpt, &next, &fed, &tickno, 0);
+        mark_set_param(m, "t2_btn", "1");
+        run_clocked(m, (uint64_t)bar, fpt, &next, &fed, &tickno, 0);
+        assert(tstate(m, 1) == MK_PLAY);
+        assert(tlen(m, 1) == 2 * tlen(m, 0));
+        mark_destroy(m);
+    }
+    printf("ok: clocked loop length (block-stamped ticks, any arm time)\n");
 }
 
 /* record one measure of signal on track ti and leave it playing */
@@ -531,16 +608,17 @@ static void test_delay_timing_and_tail(void) {
     /* A single-sample loop impulse makes the 120 BPM eighth-note tap
      * measurable exactly: 88200 / 8 = 11025 frames. */
     mark_set_param(m, "t1_btn", "1");
-    run_impulse(m, 22050, 12000);
+    run_impulse(m, AT_SR(22050), AT_SR(12000));
     mark_set_param(m, "t1_btn", "1");
     mark_set_param(m, "t1_fx", "4");
     mark_set_param(m, "t1_fxp", "0");
     mark_set_param(m, "t1_fx_on", "1");
-    int16_t *cap = calloc(12000 * 2, sizeof(int16_t));
+    int16_t *cap = calloc((size_t)AT_SR(12000) * 2, sizeof(int16_t));
     assert(cap);
-    capture_silence(m, 12000, cap);
-    assert(abs((int)cap[8191 * 2]) < 10);
-    assert(abs((int)cap[11025 * 2]) > 2000);
+    capture_silence(m, AT_SR(12000), cap);
+    assert(abs((int)cap[AT_SR(8191) * 2]) < 10);
+    /* the 120 BPM eighth note: FPM/8, i.e. 11025 frames at 44.1 kHz */
+    assert(abs((int)cap[(FPM / 8u) * 2]) > 2000);
 
     /* Re-arm a clean delay, start the loop, then stop before its echo.
      * The feedback network must continue and emit the tail while stopped. */
@@ -550,9 +628,11 @@ static void test_delay_timing_and_tail(void) {
     mark_set_param(m, "t1_btn", "1");
     capture_silence(m, 256, cap);
     mark_set_param(m, "t1_stop", "1");
-    memset(cap, 0, 12000 * 2 * sizeof(int16_t));
-    capture_silence(m, 11000, cap);
-    assert(abs((int)cap[(11025 - 256) * 2]) > 2000);
+    memset(cap, 0, (size_t)AT_SR(12000) * 2 * sizeof(int16_t));
+    /* Must capture past the echo at FP8-256, which is 10769 frames at
+     * 44.1 kHz but 11744 at 48 kHz — hence scaled, not a bare 11000. */
+    capture_silence(m, AT_SR(11000), cap);
+    assert(abs((int)cap[(FP8 - 256) * 2]) > 2000);
 
     free(cap);
     mark_destroy(m);
@@ -788,7 +868,12 @@ static void test_rui_poll(void) {
     /* state blob carries the display fields the web editor renders */
     char blob[1024];
     gp_str(m, "state", blob, sizeof(blob));
-    assert(strstr(blob, "\"ts\":\"2,0,0,0,0\"") != NULL);
+    {   /* one "2" then a zero per remaining track — MARK_TRACKS-dependent */
+        char want[64] = "\"ts\":\"2";
+        for (int i = 1; i < MARK_TRACKS; i++) strcat(want, ",0");
+        strcat(want, "\"");
+        assert(strstr(blob, want) != NULL);
+    }
     assert(strstr(blob, "\"run\":3") != NULL);
     assert(strstr(blob, "\"sess\":\"") != NULL);
 
@@ -805,11 +890,11 @@ static void test_grid_and_trim(void) {
      * against a 16/16 drum groove — Bigbee's polyrhythm case). */
     mark_set_param(m, "rec_grid", "2");
     mark_set_param(m, "t1_btn", "1");
-    run(m, 167000, 0, NULL);
+    run(m, AT_SR(167000), 0, NULL);
     mark_set_param(m, "t1_btn", "1");
     run(m, 2 * FPM, 0, NULL);
     assert(tstate(m, 0) == MK_PLAY);
-    assert(tlen(m, 0) == 15 * 11025);
+    assert(tlen(m, 0) == 15 * FP8);
     char buf[64];
     gp_str(m, "tunits", buf, sizeof(buf));
     assert(strncmp(buf, "15,", 3) == 0);
@@ -820,8 +905,8 @@ static void test_grid_and_trim(void) {
     mark_set_param(m, "quantize", "0");     /* immediate start for math */
     mark_set_param(m, "quantize", "1");
     mark_set_param(m, "t2_btn", "1");
-    run(m, 15 * 11025, 0, NULL);            /* wait out one t1 pass */
-    run(m, 70000, 0, NULL);
+    run(m, 15 * FP8, 0, NULL);            /* wait out one t1 pass */
+    run(m, AT_SR(70000), 0, NULL);
     mark_set_param(m, "t2_btn", "1");
     run(m, 2 * FPM, 0, NULL);
     assert(tstate(m, 1) == MK_PLAY);
@@ -830,11 +915,11 @@ static void test_grid_and_trim(void) {
     /* trim: eighth grid again — shorten t2 (8 eighths per measure) */
     mark_set_param(m, "rec_grid", "2");
     uint32_t full = tlen(m, 1);
-    uint32_t units_full = full / 11025;
+    uint32_t units_full = full / FP8;
     mark_set_param(m, "t2_trim", "-1");
-    assert(tlen(m, 1) == full - 11025);
+    assert(tlen(m, 1) == full - FP8);
     mark_set_param(m, "t2_trim", "-1");
-    assert(tlen(m, 1) == full - 2 * 11025);
+    assert(tlen(m, 1) == full - 2 * FP8);
     /* re-lengthen past full clamps at full */
     mark_set_param(m, "t2_trim", "3");
     assert(tlen(m, 1) == full);
@@ -854,16 +939,16 @@ static void test_len16_and_16th_grid(void) {
     /* 16th grid: one unit = 5512.5 frames at 120 BPM */
     mark_set_param(m, "rec_grid", "3");
     mark_set_param(m, "t1_btn", "1");
-    run(m, 84000, 0, NULL);                  /* ~15.2 sixteenths */
+    run(m, AT_SR(84000), 0, NULL);                  /* ~15.2 sixteenths */
     mark_set_param(m, "t1_btn", "1");
     run(m, FPM, 0, NULL);
     assert(tstate(m, 0) == MK_PLAY);
     uint32_t l15 = tlen(m, 0);
-    assert(l15 == (uint32_t)(15.0 * 88200.0 / 16.0 + 0.5));
+    assert(l15 == (uint32_t)(15.0 * (double)FPM / 16.0 + 0.5));
 
     /* step-button length set: 5 -> a 5/16 loop; 16 caps at full */
     mark_set_param(m, "t1_len16", "5");
-    assert(tlen(m, 0) == (uint32_t)(5.0 * 88200.0 / 16.0 + 0.5));
+    assert(tlen(m, 0) == (uint32_t)(5.0 * (double)FPM / 16.0 + 0.5));
     char buf[64];
     gp_str(m, "tlen16", buf, sizeof(buf));
     assert(strncmp(buf, "5,", 2) == 0);
@@ -884,7 +969,7 @@ static void test_trim_session_roundtrip(void) {
     mark_set_param(m, "session_dir", dir);
 
     mark_set_param(m, "t1_btn", "1");
-    run(m, 2 * FPM - 1000, 0, NULL);
+    run(m, 2 * FPM - AT_SR(1000), 0, NULL);
     mark_set_param(m, "t1_btn", "1");
     run(m, 2000, 0, NULL);
     assert(tlen(m, 0) == 2 * FPM);
@@ -892,18 +977,105 @@ static void test_trim_session_roundtrip(void) {
     /* trim to 13 eighths, save, wipe, load: trim AND full length survive */
     mark_set_param(m, "rec_grid", "2");
     mark_set_param(m, "t1_trim", "-3");
-    assert(tlen(m, 0) == 13 * 11025);
+    assert(tlen(m, 0) == 13 * FP8);
     mark_set_param(m, "save_session", "1");
     wait_io(m);
     mark_set_param(m, "t1_clear", "1");
     mark_set_param(m, "load_session", "1");
     wait_io(m);
-    assert(tlen(m, 0) == 13 * 11025);
+    assert(tlen(m, 0) == 13 * FP8);
     mark_set_param(m, "t1_trim", "3");      /* re-lengthen: audio was kept */
     assert(tlen(m, 0) == 2 * FPM);
 
     mark_destroy(m);
     printf("ok: trim survives session round-trip\n");
+}
+
+/* ---- mark_process_multi: one jack per track ---------------------- */
+
+/* Distinct amplitude band per track, so a crossed route is unmissable:
+ * track 0 lands near 1000, track 1 near 2000, track 2 near 3000. */
+static int16_t msig(int track, uint64_t k) {
+    return (int16_t)(1000 * (track + 1) + (int)(k % 7) * 13);
+}
+
+/* Drive mark_process_multi for n frames. mode 0 = per-track signal,
+ * 1 = silence. If cap is non-NULL the LAST block of each track's output is
+ * copied into cap[track][...]. */
+static void run_multi(mark_t *m, uint32_t n, int mode,
+                      int16_t cap[MARK_TRACKS][BLOCK]) {
+    static int16_t inb[MARK_TRACKS][BLOCK], outb[MARK_TRACKS][BLOCK];
+    const int16_t *inp[MARK_TRACKS];
+    int16_t *outp[MARK_TRACKS];
+    for (int i = 0; i < MARK_TRACKS; i++) { inp[i] = inb[i]; outp[i] = outb[i]; }
+
+    uint32_t done = 0;
+    while (done < n) {
+        int c = n - done > BLOCK ? BLOCK : (int)(n - done);
+        for (int i = 0; i < MARK_TRACKS; i++)
+            for (int f = 0; f < c; f++)
+                inb[i][f] = mode == 0 ? msig(i, g_in_frame + (uint64_t)f) : 0;
+        mark_process_multi(m, inp, outp, c);
+        if (cap)
+            for (int i = 0; i < MARK_TRACKS; i++)
+                memcpy(cap[i], outb[i], (size_t)c * sizeof(int16_t));
+        g_in_frame += (uint64_t)c;
+        done += (uint32_t)c;
+    }
+}
+
+static void test_process_multi(void) {
+    mark_t *m = mark_create(&host);
+    assert(m);
+    g_in_frame = 0;
+    mark_set_param(m, "quantize", "0");
+    mark_set_param(m, "monitor", "0");
+    mark_set_param(m, "master", "100");
+    mark_set_param(m, "t1_level", "100");
+    mark_set_param(m, "t2_level", "100");
+
+    /* Record tracks 1 and 2 at once, each from its OWN input jack. */
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t2_btn", "1");
+    run_multi(m, FPM, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    mark_set_param(m, "t2_btn", "1");
+    assert(tstate(m, 0) == MK_PLAY);
+    assert(tstate(m, 1) == MK_PLAY);
+
+    /* Play into silence, long enough for the per-track gain ramp to settle. */
+    int16_t cap[MARK_TRACKS][BLOCK];
+    run_multi(m, 8000, 1, cap);
+
+    /* Each output must carry ONLY its own track's band. Crossed routing or a
+     * shared mix bus would put ~3000 (the sum) on both, or the wrong band on
+     * each; either fails here. */
+    int lo0 = 32767, hi0 = -32768, lo1 = 32767, hi1 = -32768;
+    for (int f = 0; f < BLOCK; f++) {
+        if (cap[0][f] < lo0) lo0 = cap[0][f];
+        if (cap[0][f] > hi0) hi0 = cap[0][f];
+        if (cap[1][f] < lo1) lo1 = cap[1][f];
+        if (cap[1][f] > hi1) hi1 = cap[1][f];
+    }
+    assert(lo0 > 900  && hi0 < 1200);   /* track 1's band, alone */
+    assert(lo1 > 1900 && hi1 < 2200);   /* track 2's band, alone */
+
+    /* A track that never recorded must be silent on its own jack. */
+    for (int f = 0; f < BLOCK; f++) assert(cap[2][f] == 0);
+
+    /* Monitor in multi mode passes each track's OWN input through. */
+    mark_set_param(m, "monitor", "1");
+    run_multi(m, BLOCK * 4, 0, cap);
+    int seen0 = 0, seen2 = 0;
+    for (int f = 0; f < BLOCK; f++) {
+        if (cap[0][f] > 1500) seen0 = 1;             /* t1 loop + own dry */
+        if (cap[2][f] > 2900 && cap[2][f] < 3200) seen2 = 1; /* dry only */
+    }
+    assert(seen0);
+    assert(seen2);
+
+    mark_destroy(m);
+    printf("ok: process_multi per-track in/out isolation\n");
 }
 
 static void test_cc_control(void) {
@@ -962,8 +1134,49 @@ static void test_cc_control(void) {
     printf("ok: midi cc control\n");
 }
 
+/* The Daisy Patch case: a host with no tempo, no clock, nothing playing.
+ * The 120 BPM placeholder is not a tempo, so the first loop must come out
+ * free-length -- and it must still anchor the grid, so the second track
+ * quantizes to it exactly as it would to a clocked bar. */
+static void test_no_tempo_first_loop_free(void) {
+    host_api_v1_t bare = host;
+    bare.get_bpm = NULL;
+    mark_t *m = mark_create(&bare);
+    assert(m);
+    g_in_frame = 0;
+
+    uint32_t odd = AT_SR(70000);   /* no multiple of any 120 BPM unit */
+    mark_set_param(m, "t1_btn", "1");
+    assert(tstate(m, 0) == MK_REC);
+    run(m, odd, 0, NULL);
+    mark_set_param(m, "t1_btn", "1");
+    run(m, BLOCK, 0, NULL);
+    assert(tstate(m, 0) == MK_PLAY);
+    uint32_t len = tlen(m, 0);
+    assert(len >= odd && len <= odd + BLOCK);   /* what was played, not a bar */
+
+    /* the free loop is now the grid: track 2 starts on its boundary and a
+     * ~1.4-loop take rounds to exactly one loop */
+    mark_set_param(m, "t2_btn", "1");
+    int started = 0;
+    for (uint32_t scan = 0; scan < len + 2 * BLOCK && !started; scan += BLOCK) {
+        run(m, BLOCK, 0, NULL);
+        if (tstate(m, 1) == MK_REC) started = 1;
+    }
+    assert(started);
+    run(m, (uint64_t)(len * 1.4), 0, NULL);
+    mark_set_param(m, "t2_btn", "1");
+    run(m, BLOCK, 0, NULL);
+    assert(tstate(m, 1) == MK_PLAY);
+    assert(tlen(m, 1) == len);
+
+    mark_destroy(m);
+    printf("ok: no host tempo -> first loop free-length, still anchors grid\n");
+}
+
 int main(void) {
     test_record_quantize();
+    test_no_tempo_first_loop_free();
     test_second_track_aligned();
     test_overdub_undo_redo();
     test_reverse_oneshot();
@@ -971,6 +1184,7 @@ int main(void) {
     test_state_blob();
     test_monitor();
     test_clocked_grid();
+    test_clocked_loop_length();
     test_single_mode();
     test_undo_capture_ownership();
     test_track_fx();
@@ -982,6 +1196,7 @@ int main(void) {
     test_trim_session_roundtrip();
     test_len16_and_16th_grid();
     test_cc_control();
+    test_process_multi();
     printf("all mark sim tests passed\n");
     return 0;
 }
