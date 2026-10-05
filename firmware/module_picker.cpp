@@ -144,11 +144,18 @@ void draw_progress(int pct)
 
 void wait_release(DaisyPatch &hw)
 {
-    /* Debounce runs inside ProcessAllControls; keep it fed while waiting. */
+    /* Debounce runs inside ProcessAllControls; keep it fed while waiting.
+     * "Released" = Pressed() false for 20 ms straight, not for one pass:
+     * libDaisy reports a press's RisingEdge one 1 ms update before Pressed()
+     * turns true, and a contact bounce drops Pressed() for up to 8 ms while
+     * the knob is still held (2026-10-03, push-and-turn on hardware). */
+    uint32_t up_since = System::GetNow();
     for(;;)
     {
         hw.ProcessAllControls();
-        if(!hw.encoder.Pressed()) return;
+        uint32_t now = System::GetNow();
+        if(hw.encoder.Pressed()) up_since = now;
+        else if(now - up_since >= 20u) return;
         System::Delay(1);
     }
 }
