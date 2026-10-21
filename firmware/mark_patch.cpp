@@ -275,13 +275,20 @@ static void track_key(char *out, size_t n, int track, const char *suffix)
  * here holds until its knob next moves (last touched wins); in cvmode 0 the
  * menu is the only level control.
  */
-enum { MI_MASTER = 0, MI_QNT, MI_GRID, MI_CVMODE, MI_RATIO, MI_CLKMODE, MI_MODS, M_GLOBALS };
+/* "play" (Tim, 2026-10-03): the encoder's performance gestures -- tap = all
+ * start/stop, hold = undo/redo -- happen only with the cursor on this first
+ * row, where the module starts. On every other row a click selects it for
+ * editing ('*'), a turn changes it, a click lets go; a click on "mods" opens
+ * the module picker. Push-and-turn never worked on his Patch: the switch
+ * opens while the knob turns. */
+enum { MI_PLAY = 0, MI_MASTER, MI_QNT, MI_GRID, MI_CVMODE, MI_RATIO, MI_CLKMODE, MI_MODS, M_GLOBALS };
 #define M_COUNT   (M_GLOBALS + MARK_TRACKS)
 #define M_VISIBLE 5
 
-static const char *const GLOBAL_LABEL[M_GLOBALS] = { "mast", "qnt", "grid", "cvmd", "rat", "clk", "mods" };
-static const char *const GLOBAL_KEY[M_GLOBALS]   = { "master", "quantize", "rec_grid", NULL, NULL, NULL, NULL };
-static const int         GLOBAL_HI[M_GLOBALS]    = { 200, 1, 3, 1, 2, 2, 0 };
+static const char *const GLOBAL_LABEL[M_GLOBALS] = { "play", "mast", "qnt", "grid", "cvmd", "rat", "clk", "mods" };
+static const char *const GLOBAL_KEY[M_GLOBALS]   = { NULL, "master", "quantize", "rec_grid", NULL, NULL, NULL, NULL };
+static const int         GLOBAL_HI[M_GLOBALS]    = { 0, 200, 1, 3, 1, 2, 2, 0 };
+static bool g_editing;   /* a non-play row is selected: turns edit it */
 
 static int g_ratio_sel = 1, g_mode_sel = 2;
 static const char *const RATIO_NAME[3] = { "/2", "=1", "x2" };
@@ -313,6 +320,7 @@ static int menu_get(int item)
         case MI_CVMODE:  return g_cvmode;
         case MI_RATIO:   return g_ratio_sel;
         case MI_CLKMODE: return g_mode_sel;
+        case MI_PLAY:
         case MI_MODS:    return 0;
         default: break;
     }
@@ -327,6 +335,7 @@ static void menu_value(int item, char *out, size_t n)
     if(item == MI_RATIO)        snprintf(out, n, "%s", RATIO_NAME[g_ratio_sel]);
     else if(item == MI_CLKMODE) snprintf(out, n, "%s", MODE_NAME[g_mode_sel]);
     else if(item == MI_MODS)    snprintf(out, n, "%s", "...");
+    else if(item == MI_PLAY)    out[0] = '\0';
     else                        snprintf(out, n, "%d", menu_get(item));
 }
 
@@ -359,11 +368,8 @@ static void menu_edit(int inc)
                 break;
             case MI_RATIO:   g_ratio_sel = v; apply_clock(); break;
             case MI_CLKMODE: g_mode_sel  = v; apply_clock(); break;
-            case MI_MODS:
-                /* Modal: returns when the user backs out, never if a module
-                 * was loaded. The caller marks this press as spent. */
-                picker::run(hw);
-                break;
+            case MI_PLAY:
+            case MI_MODS:    break; /* nothing to turn; a click on mods opens the picker */
             default:         set_int(GLOBAL_KEY[item], v); break;
         }
     }
@@ -399,13 +405,17 @@ static void encoder(void)
         enc_held   = false;
     }
 
+    /* A press is read from libDaisy's edges, never Pressed(): RisingEdge
+     * comes one 1 ms update before Pressed(), and a bounce drops Pressed()
+     * for up to 8 ms (found 2026-10-03). A turn during a press makes it not a
+     * click / not a tap. */
     int inc = hw.encoder.Increment();
     if(inc)
     {
-        if(enc_down && hw.encoder.Pressed())
+        if(enc_down) enc_turned = true;
+        if(g_editing)
         {
             menu_edit(inc);
-            enc_turned = true;
         }
         else
         {
@@ -415,12 +425,19 @@ static void encoder(void)
         }
     }
 
-    /* On "mods" a press only ever opens the picker (push-and-turn, the same
-     * gesture on every Patch module), so a slow turn cannot undo or toggle
-     * the transport on the way. */
-    if(g_menu_sel == MI_MODS)
+    /* Settings rows: click selects / lets go; on "mods" it opens the picker.
+     * No transport or undo fires off the play row. */
+    if(g_menu_sel != MI_PLAY)
     {
-        if(!hw.encoder.Pressed()) enc_down = false; /* no all_btn on release */
+        if(hw.encoder.FallingEdge())
+        {
+            bool click = enc_down && !enc_turned;
+            enc_down   = false;
+            if(click && g_menu_sel == MI_MODS)
+                picker::run(hw); /* modal; returns only if the user backs out */
+            else if(click)
+                g_editing = !g_editing;
+        }
         return;
     }
 
@@ -431,7 +448,7 @@ static void encoder(void)
         enc_held = true;
     }
 
-    if(enc_down && !hw.encoder.Pressed())
+    if(enc_down && hw.encoder.FallingEdge())
     {
         enc_down = false;
         if(!enc_turned && !enc_held) mark_set_param(M, "all_btn", "1");
@@ -622,7 +639,7 @@ static void draw(void)
         menu_label(item, label, sizeof(label));
         menu_value(item, val, sizeof(val));
         snprintf(line, sizeof(line), "%c%-4s %4s",
-                 item == g_menu_sel ? '>' : ' ', label, val);
+                 item == g_menu_sel ? (g_editing ? '*' : '>') : ' ', label, val);
         hw.display.SetCursor(MENU_X, 16 + row * 10);
         hw.display.WriteString(line, Font_6x8, true);
     }
