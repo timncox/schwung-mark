@@ -98,12 +98,18 @@ bool fail(FIL *f, char *err, size_t err_len, const char *why)
 
 /* ---- display ------------------------------------------------------------ */
 
-void draw_list(DaisyPatch &hw, const picker::List &list, int sel, const char *status)
+void draw_list(DaisyPatch &hw, const picker::List &list, int sel, const char *folder,
+               const char *status)
 {
     char line[32];
     hw.display.Fill(false);
 
-    snprintf(line, sizeof(line), "%-8s %s", "MODULES", status);
+    /* Inside a folder the header names it, so "back" reads as "up". */
+    char title[picker::NAME_LEN + 1];
+    snprintf(title, sizeof(title), "%s", folder[0] ? folder : "MODULES");
+    for(char *c = title; *c; c++)
+        if(*c >= 'a' && *c <= 'z') *c = (char)(*c - 'a' + 'A');
+    snprintf(line, sizeof(line), "%-8s %s", title, status);
     hw.display.SetCursor(0, 0);
     hw.display.WriteString(line, Font_6x8, true);
 
@@ -116,6 +122,8 @@ void draw_list(DaisyPatch &hw, const picker::List &list, int sel, const char *st
         if(item > list.count) break;
         if(item == 0)
             snprintf(line, sizeof(line), "%c back", sel == 0 ? '>' : ' ');
+        else if(list.dir[item - 1])
+            snprintf(line, sizeof(line), "%c %s/", sel == item ? '>' : ' ', list.name[item - 1]);
         else
             snprintf(line, sizeof(line), "%c %-9s %3luk", sel == item ? '>' : ' ',
                      list.name[item - 1],
@@ -163,13 +171,16 @@ void wait_release(DaisyPatch &hw)
 
 namespace picker
 {
-bool scan(List &out)
+bool scan(List &out, const char *folder)
 {
     out.count = 0;
     if(!mount()) return false;
 
-    char path[24];
-    snprintf(path, sizeof(path), "%smodules", g_fsi->GetSDPath());
+    char path[40];
+    if(folder[0])
+        snprintf(path, sizeof(path), "%smodules/%s", g_fsi->GetSDPath(), folder);
+    else
+        snprintf(path, sizeof(path), "%smodules", g_fsi->GetSDPath());
     memset(&g_dir, 0, sizeof(g_dir));
     if(f_opendir(&g_dir, path) != FR_OK) return false;
 
@@ -177,45 +188,70 @@ bool scan(List &out)
     {
         memset(&g_fno, 0, sizeof(g_fno));
         if(f_readdir(&g_dir, &g_fno) != FR_OK || g_fno.fname[0] == '\0') break;
-        if(g_fno.fattrib & (AM_DIR | AM_HID)) continue;
+        if(g_fno.fattrib & AM_HID) continue;
         /* macOS writes an AppleDouble "._name.bin" next to every file it
          * copies to FAT. Those end in .bin too; the vector-table check would
-         * refuse them, but they should not be on the list at all. */
+         * refuse them, but they should not be on the list at all. The same
+         * test drops ".Trashes"-style folders. */
         if(g_fno.fname[0] == '.') continue;
-        const char *fn = g_fno.fname;
-        size_t      L  = strlen(fn);
-        if(L < 5 || strcasecmp(fn + L - 4, ".bin") != 0) continue;
-        if(L - 4 > (size_t)NAME_LEN - 1) continue;   /* name too long to reopen: skip */
+        const char *fn  = g_fno.fname;
+        size_t      L   = strlen(fn);
+        bool        dir = (g_fno.fattrib & AM_DIR) != 0;
+        if(dir)
+        {
+            /* One level of folders: none are listed inside a folder. */
+            if(folder[0] || L > (size_t)NAME_LEN - 1) continue;
+        }
+        else
+        {
+            if(L < 5 || strcasecmp(fn + L - 4, ".bin") != 0) continue;
+            L -= 4;
+            if(L > (size_t)NAME_LEN - 1) continue;   /* name too long to reopen: skip */
+        }
         if(out.count >= MAX_MODULES) break;
-        memcpy(out.name[out.count], fn, L - 4);
-        out.name[out.count][L - 4] = '\0';
-        out.size[out.count]        = (uint32_t)g_fno.fsize;
+        memcpy(out.name[out.count], fn, L);
+        out.name[out.count][L] = '\0';
+        out.size[out.count]    = dir ? 0 : (uint32_t)g_fno.fsize;
+        out.dir[out.count]     = dir;
         out.count++;
     }
     f_closedir(&g_dir);
 
-    /* Alphabetical, so the list is stable across cards and rescans. */
+    /* Modules A-Z, then folders A-Z, so the list is stable across cards and
+     * rescans and the cursor still opens on a module. */
     for(int i = 1; i < out.count; i++)
-        for(int j = i; j > 0 && strcasecmp(out.name[j - 1], out.name[j]) > 0; j--)
+        for(int j = i; j > 0
+                       && (out.dir[j - 1] != out.dir[j]
+                               ? out.dir[j - 1]
+                               : strcasecmp(out.name[j - 1], out.name[j]) > 0);
+            j--)
         {
             char     tn[NAME_LEN];
             uint32_t ts;
+            bool     td;
             memcpy(tn, out.name[j], NAME_LEN);
             ts = out.size[j];
+            td = out.dir[j];
             memcpy(out.name[j], out.name[j - 1], NAME_LEN);
             out.size[j] = out.size[j - 1];
+            out.dir[j]  = out.dir[j - 1];
             memcpy(out.name[j - 1], tn, NAME_LEN);
             out.size[j - 1] = ts;
+            out.dir[j - 1]  = td;
         }
     return true;
 }
 
-bool load(DaisyPatch &hw, const char *name, void (*progress)(int pct), char *err, size_t err_len)
+bool load(DaisyPatch &hw, const char *folder, const char *name, void (*progress)(int pct),
+          char *err, size_t err_len)
 {
     if(!mount()) return fail(nullptr, err, err_len, "no card");
 
-    char path[48];
-    snprintf(path, sizeof(path), "%smodules/%s.bin", g_fsi->GetSDPath(), name);
+    char path[64];
+    if(folder[0])
+        snprintf(path, sizeof(path), "%smodules/%s/%s.bin", g_fsi->GetSDPath(), folder, name);
+    else
+        snprintf(path, sizeof(path), "%smodules/%s.bin", g_fsi->GetSDPath(), name);
     memset(&g_fil, 0, sizeof(g_fil));
     if(f_open(&g_fil, path, FA_READ) != FR_OK) return fail(nullptr, err, err_len, "open failed");
 
@@ -294,7 +330,8 @@ void run(DaisyPatch &hw)
     wait_release(hw);
 
     List list;
-    bool have = scan(list);
+    char folder[NAME_LEN] = "";   /* "" = /modules; else one of its sub-folders */
+    bool have = scan(list, folder);
     char status[16];
     snprintf(status, sizeof(status), "%s",
              have ? (list.count ? "" : "empty") : (g_fsi ? "no folder" : "no card"));
@@ -318,13 +355,28 @@ void run(DaisyPatch &hw)
 
         if(hw.encoder.RisingEdge())
         {
-            if(sel == 0) break;
+            if(sel == 0 && !folder[0]) break;
+            if(sel == 0 || list.dir[sel - 1])
+            {
+                /* Into a folder (cursor on its first module), or "back" out
+                 * of one (cursor back on the folder it came from). */
+                char from[NAME_LEN];
+                snprintf(from, sizeof(from), "%s", folder);
+                snprintf(folder, sizeof(folder), "%s", sel == 0 ? "" : list.name[sel - 1]);
+                wait_release(hw);
+                have = scan(list, folder);
+                snprintf(status, sizeof(status), "%s", have ? (list.count ? "" : "empty") : "no folder");
+                sel = list.count ? 1 : 0;
+                for(int i = 0; from[0] && i < list.count; i++)
+                    if(list.dir[i] && !strcasecmp(list.name[i], from)) sel = i + 1;
+                continue;
+            }
             char err[16];
-            if(!load(hw, list.name[sel - 1], draw_progress, err, sizeof(err)))
+            if(!load(hw, folder, list.name[sel - 1], draw_progress, err, sizeof(err)))
             {
                 snprintf(status, sizeof(status), "%s", err);
                 wait_release(hw);
-                have = scan(list);
+                have = scan(list, folder);
                 if(sel > list.count) sel = list.count;
             }
         }
@@ -332,7 +384,7 @@ void run(DaisyPatch &hw)
         uint32_t now = System::GetNow();
         if(now - last_draw >= 50u)
         {
-            draw_list(hw, list, sel, status);
+            draw_list(hw, list, sel, folder, status);
             last_draw = now;
         }
     }
