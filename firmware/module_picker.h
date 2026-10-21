@@ -27,7 +27,7 @@
 
 namespace picker
 {
-constexpr int MAX_MODULES = 8;
+constexpr int MAX_MODULES = 32;
 constexpr int NAME_LEN    = 12;   /* "smack" fits; 8.3-safe names are the convention */
 
 struct List
