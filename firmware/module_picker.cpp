@@ -44,6 +44,8 @@ alignas(32) DSY_SDRAM_BSS FIL     g_fil;
 alignas(32) DSY_SDRAM_BSS DIR     g_dir;
 alignas(32) DSY_SDRAM_BSS FILINFO g_fno;
 alignas(32) DSY_SDRAM_BSS uint8_t g_chunk[CHUNK];
+alignas(32) DSY_SDRAM_BSS FIL     g_logfil;     /* log_line's own file, never g_fil */
+alignas(32) DSY_SDRAM_BSS char    g_logbuf[128];
 
 SdmmcHandler    g_sd;
 FatFSInterface *g_fsi;   /* non-null while mounted */
@@ -312,6 +314,26 @@ bool load(DaisyPatch &hw, const char *folder, const char *name, void (*progress)
      * build, where there is no bootloader to return to. */
     System::ResetToBootloader(System::BootloaderMode::DAISY_SKIP_TIMEOUT);
     return fail(nullptr, err, err_len, "no bootloader");
+}
+
+bool log_line(const char *name, const char *line)
+{
+    if(!mount()) return false;
+
+    char path[40];
+    snprintf(path, sizeof(path), "%slogs", g_fsi->GetSDPath());
+    f_mkdir(path); /* FR_EXIST after the first time; anything worse shows at f_open */
+    snprintf(path, sizeof(path), "%slogs/%s.csv", g_fsi->GetSDPath(), name);
+    memset(&g_logfil, 0, sizeof(g_logfil));
+    if(f_open(&g_logfil, path, FA_WRITE | FA_OPEN_APPEND) != FR_OK) return false;
+
+    int n = snprintf(g_logbuf, sizeof(g_logbuf), "%lu,%s\n", (unsigned long)System::GetNow(), line);
+    if(n < 0) n = 0;
+    if(n > (int)sizeof(g_logbuf) - 1) n = (int)sizeof(g_logbuf) - 1;
+    UINT    bw = 0;
+    FRESULT r  = f_write(&g_logfil, g_logbuf, (UINT)n, &bw);
+    f_close(&g_logfil);   /* close = sync: the line is on the card now */
+    return r == FR_OK && bw == (UINT)n;
 }
 
 void run(DaisyPatch &hw)

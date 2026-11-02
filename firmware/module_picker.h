@@ -50,6 +50,14 @@ bool scan(List &out, const char *folder = "");
 bool load(daisy::DaisyPatch &hw, const char *folder, const char *name,
           void (*progress)(int pct), char *err, size_t err_len);
 
+/* Optional SD log (2026-11-02): append "<ms since boot>,<line>" to
+ * /logs/<name>.csv. Main loop only -- never from the audio callback, an SD
+ * write can take milliseconds. Opens, appends and closes on every call, so no
+ * file is held open when the picker unmounts to load a module. Rate-limit the
+ * calls (seconds, not milliseconds). false = no card or a write error; a
+ * module should carry on regardless. */
+bool log_line(const char *name, const char *line);
+
 /* The modal screen: turn to choose, press to load (or open a folder), "back"
  * to leave a folder or return. Owns
  * the encoder and display until it returns; audio keeps running underneath.
